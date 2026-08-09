@@ -11,12 +11,11 @@ local function star_count(s)
 	return n
 end
 
--- Split "workspace/seg" -> ws, seg. Returns nil if the key has extra slashes.
 local function split_key(key)
 	if type(key) ~= "string" then
 		return nil, nil
 	end
-	return key:match("^([^/]+)/([^/]+)$")
+	return key:match("^([^/]+)/(.+)$")
 end
 
 local function normalize_path(path)
@@ -26,9 +25,8 @@ local function normalize_path(path)
 	return vim.fn.fnamemodify(path, ":p")
 end
 
--- Turn a seg like "proj-*-v*" into a Lua pattern with one capture per `*`.
-local function seg_to_pattern(seg)
-	local escaped = seg:gsub(LUA_PATTERN_SPECIALS, "%%%0"):gsub("%*", "([^/]+)")
+local function project_path_to_pattern(project_path)
+	local escaped = project_path:gsub(LUA_PATTERN_SPECIALS, "%%%0"):gsub("%*", "([^/]+)")
 	return "^" .. escaped .. "$"
 end
 
@@ -67,11 +65,11 @@ function M.validate_repo_paths(repo_paths)
 		if type(key) ~= "string" or type(value) ~= "string" then
 			return false, "repo_paths keys and values must be strings"
 		end
-		local _, seg = split_key(key)
-		if seg == nil then
-			return false, string.format("invalid key '%s' (expected workspace/repo or workspace/<pattern with *>)", key)
+		local _, project_path = split_key(key)
+		if project_path == nil then
+			return false, string.format("invalid key '%s' (expected workspace/project-path or workspace/<pattern with *>)", key)
 		end
-		if star_count(seg) ~= star_count(value) then
+		if star_count(project_path) ~= star_count(value) then
 			return false, string.format("wildcard parity mismatch for '%s' → '%s'", key, value)
 		end
 	end
@@ -92,9 +90,9 @@ function M.resolve_repo_path(repo_paths, repo_name, opts)
 		return nil, err
 	end
 
-	local workspace, repo = repo_name:match("^([^/]+)/([^/]+)$")
+	local workspace, project_path = split_key(repo_name)
 	if not workspace then
-		return nil, "invalid repository identifier (expected workspace/repo)"
+		return nil, "invalid repository identifier (expected workspace/project-path)"
 	end
 
 	-- Exact match wins over any wildcard.
@@ -103,15 +101,15 @@ function M.resolve_repo_path(repo_paths, repo_name, opts)
 	if type(resolved) ~= "string" or resolved == "" then
 		local best
 		for key, value in pairs(repo_paths) do
-			local ws, seg = split_key(key)
-			if ws == workspace and seg and seg:find("*", 1, true) and type(value) == "string" and value ~= "" then
-				local captures = { repo:match(seg_to_pattern(seg)) }
+			local ws, mapped_project_path = split_key(key)
+			if ws == workspace and mapped_project_path and mapped_project_path:find("*", 1, true) and type(value) == "string" and value ~= "" then
+				local captures = { project_path:match(project_path_to_pattern(mapped_project_path)) }
 				if captures[1] then
-					local stars = star_count(seg)
+					local stars = star_count(mapped_project_path)
 					local candidate = {
 						key = key,
 						stars = stars,
-						lit = #seg - stars,
+						lit = #mapped_project_path - stars,
 						value = apply_captures(value, captures),
 					}
 					if not best or more_specific(candidate, best) then

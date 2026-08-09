@@ -6,6 +6,7 @@ describe("repo_paths", function()
 			local ok = checkout.validate_repo_paths({
 				["ws/*"] = "~/code/*",
 				["ws/repo"] = "~/code/special",
+				["ws/group/*"] = "~/code/*",
 			})
 
 			assert.is_true(ok)
@@ -74,6 +75,25 @@ describe("repo_paths", function()
 				{ require_git = false, require_existing = false }
 			)
 			assert.is_truthy(path:find("/code/foo/v2$"))
+		end)
+
+		it("resolves a nested project wildcard", function()
+			local path = checkout.resolve_repo_path(
+				{ ["hubble-sg/platform/*"] = "~/workspace/project/hubble/*" },
+				"hubble-sg/platform/platform_web",
+				{ require_git = false, require_existing = false }
+			)
+			assert.is_truthy(path:find("/hubble/platform_web$"))
+		end)
+
+		it("does not match nested projects with a single-segment wildcard", function()
+			local path, err = checkout.resolve_repo_path(
+				{ ["ws/*"] = "~/code/*" },
+				"ws/group/repo",
+				{ require_git = false, require_existing = false }
+			)
+			assert.is_nil(path)
+			assert.is_truthy(err)
 		end)
 
 		it("does not match across workspaces", function()
