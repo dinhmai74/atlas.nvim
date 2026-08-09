@@ -55,31 +55,91 @@ local STATIC_AUTOCOMPLETE_DATA = {
 		{
 			value = "assignee",
 			displayName = "assignee",
-			operators = { "in", "was in", "is", "is not", "was not in", "changed", "!=", "=", "was not", "not in", "was" },
+			operators = {
+				"in",
+				"was in",
+				"is",
+				"is not",
+				"was not in",
+				"changed",
+				"!=",
+				"=",
+				"was not",
+				"not in",
+				"was",
+			},
 			types = { "com.atlassian.jira.user.ApplicationUser" },
 		},
 		{
 			value = "project",
 			displayName = "project",
-			operators = { "=", "!=", "in", "not in", "is", "is not", "was", "was in", "was not", "was not in", "changed" },
+			operators = {
+				"=",
+				"!=",
+				"in",
+				"not in",
+				"is",
+				"is not",
+				"was",
+				"was in",
+				"was not",
+				"was not in",
+				"changed",
+			},
 			types = { "com.atlassian.jira.project.Project" },
 		},
 		{
 			value = "reporter",
 			displayName = "reporter",
-			operators = { "=", "!=", "in", "not in", "is", "is not", "was", "was in", "was not", "was not in", "changed" },
+			operators = {
+				"=",
+				"!=",
+				"in",
+				"not in",
+				"is",
+				"is not",
+				"was",
+				"was in",
+				"was not",
+				"was not in",
+				"changed",
+			},
 			types = { "com.atlassian.jira.user.ApplicationUser" },
 		},
 		{
 			value = "status",
 			displayName = "status",
-			operators = { "=", "!=", "in", "not in", "is", "is not", "was", "was in", "was not", "was not in", "changed" },
+			operators = {
+				"=",
+				"!=",
+				"in",
+				"not in",
+				"is",
+				"is not",
+				"was",
+				"was in",
+				"was not",
+				"was not in",
+				"changed",
+			},
 			types = { "com.atlassian.jira.issue.status.Status" },
 		},
 		{
 			value = "priority",
 			displayName = "priority",
-			operators = { "=", "!=", "in", "not in", "is", "is not", "was", "was in", "was not", "was not in", "changed" },
+			operators = {
+				"=",
+				"!=",
+				"in",
+				"not in",
+				"is",
+				"is not",
+				"was",
+				"was in",
+				"was not",
+				"was not in",
+				"changed",
+			},
 			types = { "com.atlassian.jira.issue.priority.Priority" },
 		},
 		{
@@ -431,7 +491,7 @@ function M.complete_cmdline(arglead, cmdline, cursorpos)
 		local static_fields, static_field_lookup = {}, {}
 		local static_functions = {}
 		local static_operators_by_field = {}
-		local fields, fields_by_key, functions = build_autocomplete_index(STATIC_AUTOCOMPLETE_DATA)
+		local fields, _, functions = build_autocomplete_index(STATIC_AUTOCOMPLETE_DATA)
 
 		for _, field in ipairs(fields) do
 			local candidate = field_completion(field.value)

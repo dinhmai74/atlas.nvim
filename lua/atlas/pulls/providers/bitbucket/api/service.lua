@@ -15,7 +15,12 @@ end
 
 ---@return string, string, string|nil
 function M.get_auth()
-	local bb = (config.options and config.options.pulls and config.options.pulls.providers and config.options.pulls.providers.bitbucket) or {}
+	local bb = (
+		config.options
+		and config.options.pulls
+		and config.options.pulls.providers
+		and config.options.pulls.providers.bitbucket
+	) or {}
 	local user = tostring(bb.user or "")
 	local token = tostring(bb.token or "")
 
@@ -55,7 +60,10 @@ end
 
 ---@return number
 function M.cache_ttl()
-	local bb = config.options and config.options.pulls and config.options.pulls.providers and config.options.pulls.providers.bitbucket
+	local bb = config.options
+		and config.options.pulls
+		and config.options.pulls.providers
+		and config.options.pulls.providers.bitbucket
 	return ((bb and bb.cache_ttl) or 300)
 end
 
@@ -164,6 +172,47 @@ function M.request(method, url, headers, body, callback, ctx)
 
 		callback(result, nil)
 	end)
+end
+
+---@param url string
+---@param on_done fun(result: { values: table[] }|nil, err: string|nil)
+---@return { cancel: fun() }
+function M.fetch_all_values(url, on_done)
+	local values = {}
+	local current
+	local cancelled = false
+
+	local function fetch_page(page_url)
+		if cancelled then
+			return
+		end
+		current = M.request("GET", page_url, nil, nil, function(result, err)
+			if cancelled then
+				return
+			end
+			if err then
+				on_done(nil, err)
+				return
+			end
+			vim.list_extend(values, result.values or {})
+			local next_url = type(result.next) == "string" and result.next or ""
+			if next_url == "" then
+				on_done({ values = values }, nil)
+				return
+			end
+			fetch_page(next_url)
+		end)
+	end
+
+	fetch_page(url)
+	return {
+		cancel = function()
+			cancelled = true
+			if current then
+				current.cancel()
+			end
+		end,
+	}
 end
 
 ---@param method string "GET"|"POST"|"PUT"|"DELETE"

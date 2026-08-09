@@ -4,7 +4,6 @@ local service = require("atlas.pulls.providers.bitbucket.api.service")
 local mapper = require("atlas.pulls.providers.bitbucket.api.mapper")
 local cache = require("atlas.core.cache")
 local logger = require("atlas.core.logger")
-local http = require("atlas.core.http")
 local state = require("atlas.pulls.providers.bitbucket.state")
 
 ---@param link any
@@ -50,7 +49,7 @@ end
 
 ---@param workspace string
 ---@param repo string
----@param opts { user: string, token: string, cache_ttl: number, force: boolean, pagelen: number|nil, statuses: string[]|nil }
+---@param opts { cache_ttl: number, force: boolean, pagelen: number|nil, statuses: string[]|nil }
 ---@param on_done fun(prs: PullRequest[], err: string|nil)
 ---@return { job_id: integer, cancel: fun() }|nil
 local function fetch_pullrequests_single(workspace, repo, opts, on_done)
@@ -65,11 +64,6 @@ local function fetch_pullrequests_single(workspace, repo, opts, on_done)
 		end
 	end
 
-	logger.loginfo("Fetching pull requests", {
-		workspace = workspace,
-		repo = repo,
-	})
-
 	local statuses = opts.statuses or { state.pr_state }
 	local state_params = {}
 	for _, s in ipairs(statuses) do
@@ -82,37 +76,9 @@ local function fetch_pullrequests_single(workspace, repo, opts, on_done)
 		table.concat(state_params, "&"),
 		tonumber(opts.pagelen) or 50
 	)
-	local user, token, _ = service.get_auth()
-	local headers = service.build_headers(user, token)
-
-	return http.curl_request("GET", service.url(endpoint), headers, nil, function(result, err)
+	return service.request("GET", endpoint, nil, nil, function(result, err)
 		if err then
-			logger.logerror("Bitbucket PR fetch failed", {
-				workspace = workspace,
-				repo = repo,
-				error = err,
-			})
 			on_done({}, err)
-			return
-		end
-
-		if type(result) ~= "table" then
-			logger.logerror("Bitbucket PR fetch invalid response", {
-				workspace = workspace,
-				repo = repo,
-			})
-			on_done({}, "Bitbucket response is not a JSON object")
-			return
-		end
-
-		local api_err = service.api_error_message(result)
-		if api_err then
-			logger.logerror("Bitbucket PR fetch API error", {
-				workspace = workspace,
-				repo = repo,
-				error = api_err,
-			})
-			on_done({}, api_err)
 			return
 		end
 
@@ -126,7 +92,7 @@ local function fetch_pullrequests_single(workspace, repo, opts, on_done)
 		})
 
 		on_done(normalized, nil)
-	end)
+	end, { action = "Fetching pull requests", workspace = workspace, repo = repo })
 end
 
 ---@param view_repos AtlasBitbucketRepoRef[]
@@ -144,10 +110,9 @@ function M.fetch_pullrequests(view_repos, opts, on_done)
 	})
 
 	local ttl = service.cache_ttl()
-	local user, token, auth_err = service.get_auth()
+	local _, _, auth_err = service.get_auth()
 	if auth_err then
 		logger.logerror("Bitbucket auth missing", { error = auth_err })
-		vim.notify("Atlas Bitbucket: " .. auth_err, vim.log.levels.ERROR)
 		on_done({}, { tostring(auth_err) })
 		return nil
 	end
@@ -200,8 +165,6 @@ function M.fetch_pullrequests(view_repos, opts, on_done)
 
 	for _, repo in ipairs(view_repos) do
 		local handle = fetch_pullrequests_single(repo.workspace, repo.repo, {
-			user = user,
-			token = token,
 			cache_ttl = ttl,
 			force = opts.force_load,
 			pagelen = opts.pagelen,
@@ -217,16 +180,19 @@ function M.fetch_pullrequests(view_repos, opts, on_done)
 	}
 end
 
----@param workspace string
----@param repo string
----@param pr_id string|number
+---@param pr PullRequestRef
 ---@param opts? { force_load?: boolean }
 ---@param on_done fun(detail: PullRequest|nil, err: string|nil)
 ---@return { job_id: integer, cancel: fun() }|nil
-function M.fetch_pullrequest(workspace, repo, pr_id, opts, on_done)
+function M.fetch_pullrequest(pr, opts, on_done)
 	opts = opts or {}
+	local workspace, repo = pr.repo_full_name:match("^([^/]+)/(.+)$")
+	if workspace == nil or repo == nil then
+		on_done(nil, "PR missing workspace/repo info")
+		return nil
+	end
 
-	local key = string.format("bitbucket:pr:detail:%s/%s/%s", workspace, repo, tostring(pr_id))
+	local key = string.format("bitbucket:pr:detail:%s/%s/%s", workspace, repo, tostring(pr.id))
 	if opts.force_load ~= true then
 		local cached, ok = service.get_cache(key)
 		if ok then
@@ -235,7 +201,7 @@ function M.fetch_pullrequest(workspace, repo, pr_id, opts, on_done)
 		end
 	end
 
-	local endpoint = string.format("/repositories/%s/%s/pullrequests/%s", workspace, repo, tostring(pr_id))
+	local endpoint = string.format("/repositories/%s/%s/pullrequests/%s", workspace, repo, tostring(pr.id))
 	return service.request("GET", endpoint, nil, nil, function(result, err)
 		if err then
 			on_done(nil, err)
@@ -249,6 +215,28 @@ function M.fetch_pullrequest(workspace, repo, pr_id, opts, on_done)
 		end
 		service.set_cache(key, prs[1], service.cache_ttl())
 		on_done(prs[1], nil)
+	end)
+end
+
+---@param pr PullRequest
+---@param title string
+---@param on_done fun(ok: boolean, err: string|nil)
+---@return { job_id: integer, cancel: fun() }|nil
+function M.update_title(pr, title, on_done)
+	local url = pr_link(pr, "self")
+	if url == "" then
+		on_done(false, "No pull request URL available")
+		return nil
+	end
+
+	local body = vim.json.encode({ title = title })
+	return service.request("PUT", url, nil, body, function(_, err)
+		if err then
+			on_done(false, err)
+			return
+		end
+		service.clear_cache()
+		on_done(true, nil)
 	end)
 end
 
@@ -336,6 +324,18 @@ end
 ---@param pr PullRequest
 ---@param on_done fun(result: table|nil, err: string|nil)
 ---@return { job_id: integer, cancel: fun() }|nil
+function M.unapprove(pr, on_done)
+	local approve_url = pr_link(pr, "approve")
+	if approve_url == "" then
+		on_done(nil, "No approve URL available")
+		return nil
+	end
+	return service.request("DELETE", approve_url, nil, nil, on_done)
+end
+
+---@param pr PullRequest
+---@param on_done fun(result: table|nil, err: string|nil)
+---@return { job_id: integer, cancel: fun() }|nil
 function M.request_changes(pr, on_done)
 	local request_changes_url = pr_link(pr, "request_changes")
 	if request_changes_url == "" then
@@ -343,6 +343,26 @@ function M.request_changes(pr, on_done)
 		return nil
 	end
 	return service.request("POST", request_changes_url, nil, nil, on_done)
+end
+
+---@param pr PullRequest
+---@param body string
+---@param on_done fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.submit_review(pr, body, on_done)
+	--TODO: How to resolve those pending comments tho ?
+	if vim.trim(body) == "" then
+		on_done(false, "Review comment cannot be empty")
+		return nil
+	end
+
+	return require("atlas.pulls.providers.bitbucket.api.comments").add_comment(pr, body, nil, function(comment, err)
+		if err or not comment then
+			on_done(false, err or "Bitbucket did not return the review comment")
+			return
+		end
+		on_done(true, nil)
+	end)
 end
 
 ---@param pr PullRequest
@@ -389,39 +409,6 @@ function M.fetch_reviewers(pr, _opts, on_done)
 end
 
 ---@param pr PullRequest
----@param on_done fun(builds: PullsBuild[]|nil, err: string|nil)
----@return { cancel: fun() }|nil
-function M.fetch_builds(pr, on_done)
-	local raw = pr._raw
-	local statuses_url = tostring((raw.links or {}).statuses or "")
-	if statuses_url == "" then
-		on_done({}, nil)
-		return nil
-	end
-
-	return service.request("GET", statuses_url, nil, nil, function(result, err)
-		if err then
-			on_done(nil, err)
-			return
-		end
-
-		---@type PullsBuild[]
-		local builds = {}
-		for _, item in ipairs((result or {}).values or {}) do
-			local b = type(item) == "table" and item or {}
-			table.insert(builds, {
-				name = tostring(b.name or b.key or ""),
-				state = tostring(b.state or ""):upper(),
-				url = tostring(b.url or ""),
-				key = tostring(b.key or ""),
-			})
-		end
-
-		on_done(builds, nil)
-	end)
-end
-
----@param pr PullRequest
 ---@param _opts { force_refresh: boolean|nil }|nil
 ---@param on_done fun(entries: PullsActivityEntry[]|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
@@ -433,7 +420,7 @@ function M.fetch_activity(pr, _opts, on_done)
 		return nil
 	end
 
-	return service.request("GET", activity_url, nil, nil, function(result, err)
+	return service.fetch_all_values(activity_url, function(result, err)
 		if err then
 			on_done(nil, err)
 			return
@@ -542,43 +529,6 @@ function M.fetch_diff(pr, _opts, on_done)
 	end)
 end
 
----@param statuses_url string
----@param opts { force_refresh: boolean|nil }|nil
----@param on_done fun(status: string|nil, url: string|nil, err: string|nil)
----@return { cancel: fun() }|nil
-function M.fetch_commit_status(statuses_url, opts, on_done)
-	if type(statuses_url) ~= "string" or statuses_url == "" then
-		on_done("unknown", nil, nil)
-		return nil
-	end
-
-	local force = (opts or {}).force_refresh == true
-	local sep = statuses_url:find("?") and "&" or "?"
-	local url = string.format("%s%spagelen=%d", statuses_url, sep, 30)
-	local key = "bitbucket:commit:statuses:" .. url
-	if not force then
-		local cached, ok = service.get_cache(key)
-		if ok then
-			local entries = (cached or {}).values or cached or {}
-			local agg_status, first_url = M._aggregate_statuses(entries)
-			on_done(agg_status, first_url, nil)
-			return nil
-		end
-	end
-
-	return service.request("GET", url, nil, nil, function(result, err)
-		if err then
-			on_done(nil, nil, err)
-			return
-		end
-
-		service.set_cache(key, result, service.cache_ttl())
-		local values = (result or {}).values or {}
-		local agg_status, first_url = M._aggregate_statuses(values)
-		on_done(agg_status, first_url, nil)
-	end)
-end
-
 ---@param opts PullsCreatePROpts
 ---@param on_done fun(result: PullsCreatePRResult|nil, err: string|nil)
 ---@return { job_id: integer, cancel: fun() }|nil
@@ -684,50 +634,6 @@ function M.fetch_default_reviewers(opts, on_done)
 
 		on_done(items, nil)
 	end)
-end
-
----@param values table[]
----@return string status
----@return string|nil url
-function M._aggregate_statuses(values)
-	if #values == 0 then
-		return "unknown", nil
-	end
-
-	local has_failed = false
-	local has_inprogress = false
-	local has_stopped = false
-	local has_success = false
-	local first_url = nil
-
-	for _, item in ipairs(values) do
-		local s = tostring(item.state or ""):upper()
-		if not first_url and item.url and item.url ~= "" then
-			first_url = tostring(item.url)
-		end
-		if s == "FAILED" then
-			has_failed = true
-		elseif s == "INPROGRESS" then
-			has_inprogress = true
-		elseif s == "STOPPED" then
-			has_stopped = true
-		elseif s == "SUCCESSFUL" then
-			has_success = true
-		end
-	end
-
-	local status = "unknown"
-	if has_failed then
-		status = "failed"
-	elseif has_inprogress then
-		status = "inprogress"
-	elseif has_stopped then
-		status = "stopped"
-	elseif has_success then
-		status = "successful"
-	end
-
-	return status, first_url
 end
 
 return M

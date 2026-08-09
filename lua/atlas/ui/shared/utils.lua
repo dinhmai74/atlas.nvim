@@ -1,9 +1,81 @@
-local M = {}
+local M = {
+	window = {},
+	buffer = {},
+	tab = {},
+}
 
 local _cached_version = nil
 
+---@alias AtlasUIHighlight { line: integer, start_col: integer, end_col: integer, hl_group: string }|{ line: integer, line_hl_group: string }
+
+-- Window
+
+---@param win integer|nil
+---@return boolean
+function M.window.valid(win)
+	return win ~= nil and vim.api.nvim_win_is_valid(win)
+end
+
+---@param anchor integer
+---@param split_cmd string
+---@param buf integer
+---@param apply_opts fun(win: integer)
+---@return integer
+function M.window.create(anchor, split_cmd, buf, apply_opts)
+	local prev = vim.api.nvim_get_current_win()
+	vim.api.nvim_set_current_win(anchor)
+	vim.cmd(split_cmd)
+	local win = vim.api.nvim_get_current_win()
+	vim.api.nvim_win_set_buf(win, buf)
+	apply_opts(win)
+	if M.window.valid(prev) then
+		vim.api.nvim_set_current_win(prev)
+	end
+	return win
+end
+
+-- Buffer
+
+---@param buf integer|nil
+---@return boolean
+function M.buffer.valid(buf)
+	return buf ~= nil and vim.api.nvim_buf_is_valid(buf)
+end
+
+---@param name string
+---@param filetype string
+---@return integer
+function M.buffer.create(name, filetype)
+	local buf = vim.api.nvim_create_buf(false, true)
+	vim.api.nvim_buf_set_name(buf, name)
+	vim.api.nvim_set_option_value("buflisted", false, { buf = buf })
+	vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
+	vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
+	vim.api.nvim_set_option_value("bufhidden", "hide", { buf = buf })
+	vim.api.nvim_set_option_value("filetype", filetype, { buf = buf })
+	vim.api.nvim_set_option_value("syntax", "OFF", { buf = buf })
+	pcall(vim.treesitter.stop, buf)
+	vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+	return buf
+end
+
+---@param buf integer|nil
+function M.buffer.delete(buf)
+	if M.buffer.valid(buf) then
+		pcall(vim.api.nvim_buf_delete, buf, { force = true })
+	end
+end
+
+-- Tab
+
+---@param tab integer|nil
+---@return boolean
+function M.tab.valid(tab)
+	return tab ~= nil and vim.api.nvim_tabpage_is_valid(tab)
+end
+
 ---@param lines string[]
----@param spans table[]
+---@param spans AtlasUIHighlight[]
 ---@param text string
 ---@param hl_group string|nil
 ---@param padding integer|nil
@@ -21,13 +93,14 @@ function M.push(lines, spans, text, hl_group, padding)
 	end
 end
 
+---@param lines string[]
+---@param spans AtlasUIHighlight[]
+---@param block { lines: string[], highlights: AtlasUIHighlight[]|nil }
 function M.append_block(lines, spans, block)
 	local base = #lines
-	for _, line in ipairs(block.lines or {}) do
-		table.insert(lines, line)
-	end
+	vim.list_extend(lines, block.lines or {})
 	for _, span in ipairs(block.highlights or {}) do
-		if type(span) == "table" and span.line_hl_group ~= nil then
+		if span.line_hl_group ~= nil then
 			table.insert(spans, {
 				line = base + span.line,
 				line_hl_group = span.line_hl_group,
@@ -293,7 +366,8 @@ function M.virtual_lines(lines, spans)
 	for index, line in ipairs(lines) do
 		local line_spans = starts[index] or {}
 		table.sort(line_spans, function(left, right)
-			return left.start_col < right.start_col
+			return left.start_col == right.start_col and left.end_col < right.end_col
+				or left.start_col < right.start_col
 		end)
 		local chunks, col = {}, 0
 		for _, span in ipairs(line_spans) do

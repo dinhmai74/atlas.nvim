@@ -1,7 +1,8 @@
 local M = {}
 
-local footer = require("atlas.ui.components.footer")
+local statusline = require("atlas.ui.statusline")
 local checkout = require("atlas.core.git.checkout")
+local md_editor = require("atlas.ui.popups.editor")
 
 ---@class PullsActionResult
 ---@field changed_pr boolean
@@ -15,37 +16,67 @@ end
 ---@param pr PullRequest
 function M.copy_id(pr)
 	vim.fn.setreg("+", tostring(pr.id))
-	footer.notify("success", string.format("Copied #%s to clipboard", tostring(pr.id)), 1200)
+	statusline.notify("success", string.format("Copied #%s to clipboard", tostring(pr.id)), 1200)
 end
 
 ---@param pr PullRequest
 function M.copy_url(pr)
 	local url = pr.link and pr.link.html
 	if url == nil or url == "" then
-		footer.notify("warn", "No URL available")
+		statusline.notify("warn", "No URL available")
 		return
 	end
 	vim.fn.setreg("+", url)
-	footer.notify("success", "Copied URL to clipboard", 1200)
+	statusline.notify("success", "Copied URL to clipboard", 1200)
 end
 
 ---@param pr PullRequest
 function M.open_in_browser(pr)
 	local url = pr.link and pr.link.html
 	if url == nil or url == "" then
-		footer.notify("warn", "No URL available")
+		statusline.notify("warn", "No URL available")
 		return
 	end
 	vim.ui.open(url)
-	footer.notify("info", "Opened in browser")
+	statusline.notify("info", "Opened in browser")
+end
+
+---@param pr PullRequest
+---@param update_title fun(pr: PullRequest, title: string, on_done: fun(ok: boolean, err: string|nil))
+---@param on_done fun(ok: boolean)
+function M.edit_title(pr, update_title, on_done)
+	md_editor.open({
+		key = "pr-title-edit-" .. tostring(pr.id),
+		title = " Edit Title ",
+		width_ratio = 0.5,
+		height_ratio = 0.12,
+		initial_text = pr.title or "",
+		on_save = function(text)
+			local title = text and vim.trim(text) or ""
+			if title == "" or title == pr.title then
+				on_done(false)
+				return
+			end
+			statusline.notify("loading", "Updating title...")
+			update_title(pr, title, function(ok, err)
+				if err or ok == false then
+					statusline.notify("error", "Title update failed: " .. tostring(err or "Unknown error"))
+					on_done(false)
+					return
+				end
+				pr.title = title
+				statusline.notify("success", "Title updated", 1200)
+				on_done(true)
+			end)
+		end,
+	})
 end
 
 ---@param pr PullRequest
 ---@param buf integer
 function M.show_details(pr, buf)
-	local helper = require("atlas.pulls.ui.main.helper")
 	local info_popup = require("atlas.ui.popups.info")
-	local lines, highlights = helper.pr_popup_content(pr)
+	local lines, highlights = require("atlas.pulls.ui.popup").content(pr)
 	info_popup.show({
 		lines = lines,
 		highlights = highlights,
@@ -53,36 +84,64 @@ function M.show_details(pr, buf)
 	})
 end
 
-local PROVIDER_ACTIONS_MODULES = {
-	github = "atlas.pulls.providers.github.actions",
-	gitlab = "atlas.pulls.providers.gitlab.actions",
-	bitbucket = "atlas.pulls.providers.bitbucket.actions",
-}
+---@param pr PullRequest
+---@param on_done fun(result: PullsActionResult|nil, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.open_pipelines(pr, on_done)
+	local p = provider()
+	if p == nil or p.capabilities.pipelines == nil then
+		local err = "Pipelines are not supported by this provider"
+		statusline.notify("warn", err)
+		on_done(nil, err)
+		return nil
+	end
+
+	require("atlas.pulls.ui.pipelines").open(pr)
+	local message = "Opened Pipelines"
+	statusline.notify("success", message, 1200)
+	on_done({ changed_pr = false, message = message }, nil)
+	return nil
+end
+
+---@class PullsRunActionOptions
+---@field source "main"|"panel"|"diff"|nil
+---@field current_user PullsUser|nil
+---@field notify fun(level: "loading"|"success"|"info"|"warn"|"error", message: string, duration: integer|nil)|nil
 
 ---@param pr PullRequest
 ---@param action_id string
----@param source "main"|"panel"|nil
+---@return boolean
+function M.is_action_available(pr, action_id)
+	local provider_module = require("atlas.providers").load(pr.provider, "pulls")
+	local actions = provider_module and provider_module.capabilities.actions
+	if actions == nil then
+		return false
+	end
+	return actions.is_available(action_id, { pr = pr, source = nil })
+end
+
+---@param pr PullRequest
+---@param action_id string
+---@param opts PullsRunActionOptions|nil
 ---@param on_done fun(result: PullsActionResult|nil, err: string|nil)|nil
-function M.run_action(pr, action_id, source, on_done)
-	local p = provider()
-	local mod_path = p and PROVIDER_ACTIONS_MODULES[p.id]
-	if not mod_path then
+function M.run_action(pr, action_id, opts, on_done)
+	opts = opts or {}
+	local provider_module = require("atlas.providers").load(pr.provider, "pulls")
+	local actions = provider_module and provider_module.capabilities.actions
+	if not actions then
 		if on_done then
 			on_done(nil, "Provider does not support actions")
 		end
 		return
 	end
-	local ok, mod = pcall(require, mod_path)
-	if not ok or type(mod) ~= "table" or type(mod.run) ~= "function" then
-		if on_done then
-			on_done(nil, "Provider actions module unavailable")
-		end
-		return
-	end
-	mod.run(action_id, { pr = pr, source = source }, function(result, err)
-		if result ~= nil and result.changed_pr then
-			local controller = require("atlas.pulls.ui.main.controller")
-			controller.refresh_pr(pr)
+	actions.run(action_id, {
+		pr = pr,
+		source = opts.source,
+		current_user = opts.current_user,
+		notify = opts.notify,
+	}, function(result, err)
+		if opts.source ~= nil and opts.source ~= "diff" and result ~= nil and result.changed_pr then
+			require("atlas.pulls.ui.main.controller").refresh_pr(pr)
 		end
 		if on_done then
 			on_done(result, err)
@@ -95,25 +154,29 @@ end
 ---@param on_done fun(result: PullsActionResult|nil)|nil
 function M.open_actions(pr, source, on_done)
 	local p = provider()
-	if not p or not p.open_actions then
+	local actions = p and p.capabilities.actions
+	if not actions then
 		return
 	end
-	p.open_actions(pr, source, function(result)
-		if result ~= nil and result.changed_pr then
-			local controller = require("atlas.pulls.ui.main.controller")
-			controller.refresh_pr(pr)
+	actions.open(
+		{ pr = pr, source = source, current_user = require("atlas.pulls.state").current_user },
+		function(result)
+			if result ~= nil and result.changed_pr then
+				local controller = require("atlas.pulls.ui.main.controller")
+				controller.refresh_pr(pr)
+			end
+			if on_done then
+				on_done(result)
+			end
 		end
-		if on_done then
-			on_done(result)
-		end
-	end)
+	)
 end
 
 ---@param opts PullsDiffOpenOptions
 ---@param on_done fun(err: string|nil)|nil
 ---@return { cancel: fun() }|nil
 function M.open_diff_range(opts, on_done)
-	return require("atlas.pulls.diff").open(opts, on_done)
+	return require("atlas.pulls.diff").open_range(opts, on_done)
 end
 
 ---@param value string
@@ -131,21 +194,21 @@ function M.open_diff(pr)
 		current_user = pulls_state.current_user,
 	}, function(err, level)
 		if err then
-			footer.notify(level or "error", "Unable to open diff: " .. tostring(err))
+			statusline.notify(level or "error", "Unable to open diff: " .. tostring(err))
 		end
 	end)
 end
 
 ---@param pr PullRequest
 function M.checkout(pr)
-	footer.notify("loading", string.format("Checking out PR #%s", tostring(pr.id or "")))
+	statusline.notify("loading", string.format("Checking out PR #%s", tostring(pr.id or "")))
 	checkout.checkout_pr(pr, function(_, err)
 		vim.schedule(function()
 			if err then
-				footer.notify("error", string.format("Checkout failed: %s", tostring(err)))
+				statusline.notify("error", string.format("Checkout failed: %s", tostring(err)))
 				return
 			end
-			footer.notify("success", string.format("Checked out PR #%s", tostring(pr.id or "")))
+			statusline.notify("success", string.format("Checked out PR #%s", tostring(pr.id or "")))
 		end)
 	end)
 end
@@ -163,10 +226,11 @@ end
 
 function M.search()
 	local p = provider()
-	if not p or not p.search then
+	local search = p and p.capabilities.search
+	if not search then
 		return
 	end
-	p.search()
+	search()
 end
 
 return M

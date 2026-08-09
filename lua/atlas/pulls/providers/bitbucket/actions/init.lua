@@ -2,13 +2,22 @@ local M = {}
 
 local registry = require("atlas.pulls.providers.bitbucket.actions.registry")
 local logger = require("atlas.core.logger")
-local footer = require("atlas.ui.components.footer")
+local statusline = require("atlas.ui.statusline")
 
 ---@alias BitbucketActionId
 ---| "merge"
----| "approve"
+---| "toggle_approval"
 ---| "request_changes"
+---| "edit_title"
 ---| "search"
+
+---@param id BitbucketActionId|string
+---@param ctx BitbucketActionContext
+---@return boolean
+function M.is_available(id, ctx)
+	local action = registry.find(id)
+	return action ~= nil and action.is_available(ctx) == true
+end
 
 ---@param id BitbucketActionId|string
 ---@param ctx BitbucketActionContext
@@ -27,7 +36,8 @@ function M.run(id, ctx, on_done)
 	if not available then
 		local err = tostring(available_err or string.format("Action is not available: %s", tostring(id)))
 		logger.logwarn("bitbucket.action.unavailable", { action_id = tostring(id), source = ctx.source, error = err })
-		footer.notify("warn", err)
+		local notify = ctx.notify or statusline.notify
+		notify("warn", err)
 		on_done(nil, err)
 		return
 	end

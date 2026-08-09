@@ -1,109 +1,72 @@
 local M = {}
 
-local function notify(level, msg)
-	vim.notify("[Atlas] " .. tostring(msg), level)
-end
-
-local function notify_error(msg)
-	notify(vim.log.levels.ERROR, msg)
-end
+local notify = require("atlas.core.notify")
+local providers = require("atlas.providers")
 
 ---@class AtlasCreateIssueChoice
----@field id "github"|"jira"|"gitlab"
 ---@field label string
+---@field provider IssuesProvider
 
 ---@return AtlasCreateIssueChoice[]
 local function build_choices()
-	local config = require("atlas.config").options or {}
 	local choices = {}
-
-	local issues_providers = (config.issues and config.issues.providers) or {}
-	if issues_providers.github then
-		local gh = require("atlas.issues.providers.github")
-		if type(gh.create_issue) == "function" then
-			table.insert(choices, { id = "github", label = "GitHub" })
+	for _, provider_config in ipairs(providers.configured("issues")) do
+		local provider = providers.load(provider_config.id, "issues")
+		if provider and provider.capabilities.create_issue then
+			table.insert(choices, { label = provider_config.name, provider = provider })
 		end
-	end
-
-	if issues_providers.gitlab then
-		local gl = require("atlas.issues.providers.gitlab")
-		if type(gl.create_issue) == "function" then
-			table.insert(choices, { id = "gitlab", label = "GitLab" })
-		end
-	end
-
-	if issues_providers.jira then
-		table.insert(choices, { id = "jira", label = "Jira" })
 	end
 
 	return choices
 end
 
----@param choice AtlasCreateIssueChoice
-local function dispatch(choice)
-	if choice.id == "jira" then
-		local actions = require("atlas.issues.providers.jira.actions")
-		actions.run("create_issue", {}, function(_, err)
-			if err then
-				notify_error("Jira create issue failed: " .. tostring(err))
-			end
-		end)
-		return
-	end
-
+---@param provider_id string
+---@param open fun(opts: table)
+---@param repo_field string
+function M.from_repository(provider_id, open, repo_field)
 	local git_branch = require("atlas.core.git")
 	local root, root_err = git_branch.repo_root(nil)
 	if not root then
-		notify_error(root_err or "Not in a git repository")
+		notify.error(root_err or "Not in a git repository")
 		return
 	end
 
 	local remote_url, remote_err = git_branch.remote_url(root, "origin")
 	if not remote_url then
-		notify_error(remote_err or "No origin remote configured")
+		notify.error(remote_err or "No origin remote configured")
 		return
 	end
 
 	local info, parse_err = git_branch.parse_remote_url(remote_url)
 	if not info then
-		notify_error(parse_err or "Could not parse remote URL")
+		notify.error(parse_err or "Could not parse remote URL")
 		return
 	end
 
-	if info.provider ~= choice.id then
-		notify_error(
+	if info.provider ~= provider_id then
+		notify.error(
 			string.format(
 				"Current repo is on %s but you picked %s; switch into the right clone first",
 				info.provider,
-				choice.id
+				provider_id
 			)
 		)
 		return
 	end
 
-	if choice.id == "github" then
-		require("atlas.issues.create.github.issue").open({ repo_slug = info.slug })
-		return
-	end
-
-	if choice.id == "gitlab" then
-		require("atlas.issues.create.gitlab.issue").open({ project_path = info.slug })
-		return
-	end
-
-	notify_error("Unsupported issue provider: " .. choice.id)
+	open({ [repo_field] = info.slug })
 end
 
 function M.start()
 	local choices = build_choices()
 
 	if #choices == 0 then
-		notify_error("No issue-capable provider is configured")
+		notify.error("No issue-capable provider is configured")
 		return
 	end
 
 	if #choices == 1 then
-		dispatch(choices[1])
+		choices[1].provider.capabilities.create_issue()
 		return
 	end
 
@@ -116,7 +79,7 @@ function M.start()
 		if idx == nil then
 			return
 		end
-		dispatch(choices[idx])
+		choices[idx].provider.capabilities.create_issue()
 	end)
 end
 

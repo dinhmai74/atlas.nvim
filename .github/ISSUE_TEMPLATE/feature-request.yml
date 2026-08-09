@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest an improvement or new capability for Atlas.nvim
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Atlas.nvim. Describe the feature and why it would be useful.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have read the documentation and confirmed this functionality is not already available.
+          required: true
+        - label: I have searched both open and closed issues for an existing request.
+          required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Feature description
+      description: Describe the feature you would like and the use case it would support.
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add screenshots, links, or any other relevant context.

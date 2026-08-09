@@ -1,6 +1,6 @@
 local M = {}
 
-local footer = require("atlas.ui.components.footer")
+local statusline = require("atlas.ui.statusline")
 local help = require("atlas.ui.popups.help")
 local resolver = require("atlas.core.keymaps")
 local utils = require("atlas.ui.shared.utils")
@@ -49,55 +49,62 @@ function M.register(buf)
 	local nav = require("atlas.pulls.ui.panel.repo.navigation")
 	local general = {
 		{
-			key = "j",
+			key = "o",
+			desc = "Close repo panel",
+			opts = { nowait = true, silent = true },
+			callback = function()
+				require("atlas.ui.layout").toggle_detail()
+			end,
+		},
+	}
+
+	utils.insert_if(
+		general,
+		item("ui.next_item", {
 			desc = "Next selectable item",
 			opts = { nowait = true, silent = true },
 			hidden = true,
 			callback = function()
 				nav.move_cursor("down")
 			end,
-		},
-		{
-			key = "k",
+		})
+	)
+
+	utils.insert_if(
+		general,
+		item("ui.previous_item", {
 			desc = "Previous selectable item",
 			opts = { nowait = true, silent = true },
 			hidden = true,
 			callback = function()
 				nav.move_cursor("up")
 			end,
-		},
-		{
-			key = "gg",
+		})
+	)
+
+	utils.insert_if(
+		general,
+		item("ui.first_item", {
 			desc = "First selectable item",
 			opts = { nowait = true, silent = true },
 			hidden = true,
 			callback = function()
 				nav.focus_first()
 			end,
-		},
-		{
-			key = "G",
+		})
+	)
+
+	utils.insert_if(
+		general,
+		item("ui.last_item", {
 			desc = "Last selectable item",
 			opts = { nowait = true, silent = true },
 			hidden = true,
 			callback = function()
 				nav.focus_last()
 			end,
-		},
-		{
-			key = "o",
-			desc = "Close repo panel",
-			opts = { nowait = true, silent = true },
-			callback = function()
-				local layout_mod = require("atlas.ui.layout")
-				local ui_st = require("atlas.ui.state")
-				layout_mod.toggle_detail()
-				if ui_st.on_panel_close then
-					ui_st.on_panel_close()
-				end
-			end,
-		},
-	}
+		})
+	)
 
 	utils.insert_if(
 		general,
@@ -171,12 +178,7 @@ function M.register(buf)
 				if help.is_open() then
 					return
 				end
-				local layout_mod = require("atlas.ui.layout")
-				local ui_st = require("atlas.ui.state")
-				layout_mod.toggle_detail()
-				if ui_st.on_panel_close then
-					ui_st.on_panel_close()
-				end
+				require("atlas.ui.layout").toggle_detail()
 			end,
 		})
 	)
@@ -208,24 +210,24 @@ function M.open_current_line()
 
 	local url = repo_url(repo)
 	if url == nil or url == "" then
-		footer.notify("warn", "No repository URL available")
+		statusline.notify("warn", "No repository URL available")
 		return false
 	end
 	vim.ui.open(url)
-	footer.notify("info", "Opened repository in browser")
+	statusline.notify("info", "Opened repository in browser")
 	return true
 end
 
 ---@param buf integer
 function M.remove(buf)
 	local general_items = {
-		{ key = "j" },
-		{ key = "k" },
-		{ key = "gg" },
-		{ key = "G" },
 		{ key = "o" },
 	}
 
+	utils.insert_if(general_items, remove_item("ui.next_item"))
+	utils.insert_if(general_items, remove_item("ui.previous_item"))
+	utils.insert_if(general_items, remove_item("ui.first_item"))
+	utils.insert_if(general_items, remove_item("ui.last_item"))
 	utils.insert_if(general_items, remove_item("ui.refresh"))
 	utils.insert_if(general_items, remove_item("ui.open_in_browser"))
 	utils.insert_if(general_items, remove_item("ui.next_panel_tab"))

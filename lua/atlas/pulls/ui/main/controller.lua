@@ -1,8 +1,7 @@
 local M = {}
 
-local footer = require("atlas.ui.components.footer")
-local spinner = require("atlas.ui.popups.spinner")
-local status_spinner = require("atlas.ui.components.spinner")
+local statusline = require("atlas.ui.statusline")
+local spinner = require("atlas.ui.components.spinner")
 local state = require("atlas.pulls.state")
 local layout = require("atlas.ui.layout")
 local helper = require("atlas.pulls.ui.main.helper")
@@ -23,13 +22,18 @@ local function render_if_active()
 	require("atlas.pulls.ui.main").render()
 end
 
-local refresh_status_spinner = status_spinner.create({
+local loading_spinner = spinner.create({
 	interval_ms = 120,
 	on_tick = function(frame)
 		state.reload_spinner_frame = frame
 		render_if_active()
 	end,
 })
+
+local function stop_loading_spinner()
+	loading_spinner:stop()
+	state.reload_spinner_frame = "⠋"
+end
 
 ---@return boolean
 local function has_reloading_prs()
@@ -41,17 +45,24 @@ local function has_reloading_prs()
 	return false
 end
 
+local function sync_loading_spinner()
+	if state.is_loading or has_reloading_prs() then
+		if not loading_spinner:is_running() then
+			loading_spinner:start()
+		end
+		state.reload_spinner_frame = loading_spinner:current_frame()
+	else
+		stop_loading_spinner()
+	end
+end
+
 ---@param repo_id string
 ---@param pr_id string|number
 local function begin_pr_reload(repo_id, pr_id)
 	local key = state.reload_key(repo_id, pr_id)
 	state.reloading_pr_keys[key] = (tonumber(state.reloading_pr_keys[key]) or 0) + 1
 
-	if not refresh_status_spinner:is_running() then
-		refresh_status_spinner:start()
-	end
-
-	state.reload_spinner_frame = refresh_status_spinner:current_frame()
+	sync_loading_spinner()
 	render_if_active()
 end
 
@@ -66,10 +77,7 @@ local function end_pr_reload(repo_id, pr_id)
 		state.reloading_pr_keys[key] = nil
 	end
 
-	if not has_reloading_prs() then
-		refresh_status_spinner:stop()
-		state.reload_spinner_frame = "⠋"
-	end
+	sync_loading_spinner()
 
 	render_if_active()
 end
@@ -84,9 +92,8 @@ local function cancel_pr_reload_handles()
 end
 
 local function reset_reload_state()
-	refresh_status_spinner:stop()
+	stop_loading_spinner()
 	state.reloading_pr_keys = {}
-	state.reload_spinner_frame = "⠋"
 end
 
 local function cancel_active_requests()
@@ -116,7 +123,7 @@ local function get_current_user(on_done)
 		on_done("no provider")
 		return
 	end
-	provider.fetch_user(function(user, err)
+	provider.capabilities.core.fetch_user(function(user, err)
 		if err ~= nil then
 			on_done(tostring(err))
 			return
@@ -137,17 +144,17 @@ local function load_active_view(opts, on_done)
 		on_done()
 		return
 	end
+	local core = provider.capabilities.core
 
 	local target_view = state.active_view
 	if target_view == nil then
-		footer.notify("error", "No active view selected")
+		statusline.notify("error", "No active view selected")
 		on_done()
 		return
 	end
 
 	if target_view._kind == "bookmarks" then
 		cancel_active_requests()
-		spinner.stop()
 		state.is_loading = false
 		state.error = nil
 		state.pulls = nil
@@ -165,8 +172,8 @@ local function load_active_view(opts, on_done)
 
 	state.is_loading = true
 	state.error = nil
-	footer.notify("loading", "Loading pull requests...")
-	spinner.start("Loading pull requests...")
+	sync_loading_spinner()
+	statusline.notify("loading", "Loading pull requests...")
 	render_if_active()
 
 	---@return boolean
@@ -187,6 +194,7 @@ local function load_active_view(opts, on_done)
 			return
 		end
 		state.is_loading = false
+		sync_loading_spinner()
 		state.current_view = state.active_view
 
 		local first_err = nil
@@ -202,20 +210,18 @@ local function load_active_view(opts, on_done)
 			if has_groups then
 				state.error = nil
 				state.pulls = groups
-				footer.notify("warn", string.format("Some repositories failed: %s", tostring(first_err)))
+				statusline.notify("warn", string.format("Some repositories failed: %s", tostring(first_err)))
 			else
 				state.error = tostring(first_err)
 				state.pulls = {}
-				footer.notify("error", string.format("Failed to fetch pull requests: %s", tostring(first_err)))
+				statusline.notify("error", string.format("Failed to fetch pull requests: %s", tostring(first_err)))
 			end
 		else
 			state.error = nil
 			state.pulls = groups or {}
-			footer.notify("success", "Pull requests loaded", 1200)
+			statusline.notify("success", "Pull requests loaded", 1200)
 		end
 
-		footer.set_items(helper.build_footer_items(state.pulls, state.current_user))
-		spinner.stop()
 		render_if_active()
 		on_done()
 	end
@@ -224,7 +230,7 @@ local function load_active_view(opts, on_done)
 		if is_stale_request() then
 			return
 		end
-		active_pullrequests_handle = provider.fetch_pullrequests(
+		active_pullrequests_handle = core.fetch_pullrequests(
 			target_view,
 			{ force_load = opts.force_load == true },
 			function(groups, err)
@@ -240,9 +246,8 @@ local function load_active_view(opts, on_done)
 				return
 			end
 			if user_err then
-				footer.notify("warn", string.format("Failed to fetch current user: %s", tostring(user_err)))
+				statusline.notify("warn", string.format("Failed to fetch current user: %s", tostring(user_err)))
 			else
-				footer.set_items(helper.build_footer_items(state.pulls or {}, state.current_user))
 				render_if_active()
 			end
 			fetch_pull_requests()
@@ -268,14 +273,15 @@ function M.refresh_pr(pr, on_done)
 	on_done = on_done or function() end
 
 	if pr == nil or pr.id == nil then
-		footer.notify("warn", "No PR selected")
+		statusline.notify("warn", "No PR selected")
 		on_done()
 		return
 	end
 
 	local provider = state.provider
-	if provider == nil or provider.fetch_pullrequest == nil then
-		footer.notify("warn", "Provider does not support single PR refresh")
+	local core = provider and provider.capabilities.core
+	if core == nil or core.fetch_pullrequest == nil then
+		statusline.notify("warn", "Provider does not support single PR refresh")
 		on_done()
 		return
 	end
@@ -283,7 +289,7 @@ function M.refresh_pr(pr, on_done)
 	local pr_id = pr.id
 	local repo_id = tostring(pr.repo_full_name or "")
 
-	footer.notify("loading", string.format("Reloading PR #%s...", tostring(pr_id)))
+	statusline.notify("loading", string.format("Reloading PR #%s...", tostring(pr_id)))
 	begin_pr_reload(repo_id, pr_id)
 
 	local panel = require("atlas.pulls.ui.panel")
@@ -302,7 +308,7 @@ function M.refresh_pr(pr, on_done)
 	end
 
 	local reload_handle = nil
-	reload_handle = provider.fetch_pullrequest(pr, { force_load = true }, function(fetched_pr, err)
+	reload_handle = core.fetch_pullrequest(pr, { force_load = true }, function(fetched_pr, err)
 		for i = #active_pr_reload_handles, 1, -1 do
 			if active_pr_reload_handles[i] == reload_handle then
 				table.remove(active_pr_reload_handles, i)
@@ -312,7 +318,7 @@ function M.refresh_pr(pr, on_done)
 
 		if err ~= nil or fetched_pr == nil then
 			end_pr_reload(repo_id, pr_id)
-			footer.notify("error", tostring(err or "Failed to reload PR"))
+			statusline.notify("error", tostring(err or "Failed to reload PR"))
 			on_done()
 			return
 		end
@@ -341,7 +347,7 @@ function M.refresh_pr(pr, on_done)
 			panel.on_select(fetched_pr, nil)
 		end
 
-		footer.notify("success", string.format("Reloaded PR #%s", tostring(pr_id)), 1200)
+		statusline.notify("success", string.format("Reloaded PR #%s", tostring(pr_id)), 1200)
 		on_done()
 	end)
 	table.insert(active_pr_reload_handles, reload_handle)
@@ -362,6 +368,7 @@ function M.run_bookmark(name, value)
 	if provider == nil then
 		return
 	end
+	local core = provider.capabilities.core
 	local view = { name = name, layout = "compact" }
 	if type(value) == "string" then
 		view.search = value
@@ -375,23 +382,24 @@ function M.run_bookmark(name, value)
 	state.is_loading = true
 	state.error = nil
 	state.pulls = nil
-	footer.notify("loading", "Running query...")
+	sync_loading_spinner()
+	statusline.notify("loading", "Running query...")
 	render_if_active()
 
-	active_pullrequests_handle = provider.fetch_pullrequests(view, { force_load = false }, function(groups, err)
+	active_pullrequests_handle = core.fetch_pullrequests(view, { force_load = false }, function(groups, err)
 		active_pullrequests_handle = nil
 		state.is_loading = false
+		sync_loading_spinner()
 		local first_err = type(err) == "table" and err[1] or err
 		if first_err and (groups == nil or #groups == 0) then
 			state.error = tostring(first_err)
 			state.pulls = {}
-			footer.notify("error", string.format("Query failed: %s", state.error))
+			statusline.notify("error", string.format("Query failed: %s", state.error))
 		else
 			state.error = nil
 			state.pulls = groups or {}
-			footer.notify("success", "Pull requests loaded", 1200)
+			statusline.notify("success", "Pull requests loaded", 1200)
 		end
-		footer.set_items(helper.build_footer_items(state.pulls, state.current_user))
 		render_if_active()
 	end)
 end
@@ -406,7 +414,7 @@ function M.toggle_status_filter(status)
 		end
 	end
 	if state.status_filters[status] and active_count <= 1 then
-		footer.notify("warn", "At least one status filter must remain active")
+		statusline.notify("warn", "At least one status filter must remain active")
 		return
 	end
 
@@ -414,6 +422,12 @@ function M.toggle_status_filter(status)
 	load_active_view({ force_load = true }, function()
 		navigation.focus_first_item()
 	end)
+end
+
+function M.dispose()
+	state.latest_request_tokens = {}
+	state.is_loading = false
+	cancel_active_requests()
 end
 
 return M

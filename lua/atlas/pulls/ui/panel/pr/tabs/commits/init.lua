@@ -5,7 +5,7 @@ local utils = require("atlas.ui.shared.utils")
 local icons = require("atlas.ui.shared.icons")
 local spinner = require("atlas.ui.components.spinner")
 local threads = require("atlas.ui.components.threadsv2")
-local footer = require("atlas.ui.components.footer")
+local statusline = require("atlas.ui.statusline")
 local state = require("atlas.pulls.ui.panel.pr.tabs.commits.state")
 
 local PADDING_X = 1
@@ -71,12 +71,12 @@ local function to_thread_item(commit, width)
 	local when = utils.relative_time(commit.date)
 	local content = author .. " · " .. when
 
-	-- Build status
-	local build_state = state.status_by_hash[commit.hash]
-	if build_state == "loading" then
-		content = content .. " · " .. icons.pulls_status("inprogress") .. " builds"
-	elseif build_state ~= nil and build_state ~= "unknown" then
-		content = content .. " · " .. icons.pulls_status(build_state) .. " " .. status_label(build_state)
+	-- Pipeline status
+	local pipeline_state = state.status_by_hash[commit.hash]
+	if pipeline_state == "loading" then
+		content = content .. " · " .. icons.pulls_status("inprogress") .. " pipelines"
+	elseif pipeline_state ~= nil and pipeline_state ~= "unknown" then
+		content = content .. " · " .. icons.pulls_status(pipeline_state) .. " " .. status_label(pipeline_state)
 	end
 
 	-- Truncate message to leave room for hash + icon + gaps
@@ -95,11 +95,11 @@ local function to_thread_item(commit, width)
 		right_text = hash,
 		content = content,
 		meta = {
-			build_state = build_state,
+			pipeline_state = pipeline_state,
 		},
 		line_map = {
 			commit = commit,
-			build_url = state.url_by_hash[commit.hash],
+			pipeline_url = state.url_by_hash[commit.hash],
 		},
 	}
 end
@@ -115,6 +115,8 @@ function M.on_select(pr, _repo, refresh, opts)
 	if not provider then
 		return
 	end
+	local core = provider.capabilities.core
+	local pipelines = provider.capabilities.pipelines
 
 	local force_refresh = opts.force_refresh == true
 	local should_fetch = force_refresh
@@ -127,30 +129,30 @@ function M.on_select(pr, _repo, refresh, opts)
 		state.reset()
 	end
 
-	if should_fetch and provider.fetch_commits then
+	if should_fetch and core.fetch_commits then
 		local pr_id = tostring(pr.id or "")
 		state.commits = "loading"
-		footer.notify("loading", string.format("Loading commits for #%s...", pr_id))
-		track(provider.fetch_commits(pr, opts, function(commits, err)
+		statusline.notify("loading", string.format("Loading commits for #%s...", pr_id))
+		track(core.fetch_commits(pr, opts, function(commits, err)
 			if err then
 				state.commits = err
-				footer.notify("error", string.format("Failed to load commits for #%s", pr_id))
+				statusline.notify("error", string.format("Failed to load commits for #%s", pr_id))
 				refresh()
 				return
 			end
 
 			state.commits = commits or {}
-			footer.notify("success", string.format("Commits loaded for #%s", pr_id), 1200)
+			statusline.notify("success", string.format("Commits loaded for #%s", pr_id), 1200)
 
-			-- Fetch build statuses for the first N commits
-			if provider.fetch_commit_status and type(state.commits) == "table" then
+			-- Fetch pipeline statuses for the first N commits
+			if pipelines and pipelines.fetch_commit_status and type(state.commits) == "table" then
 				local count = math.min(MAX_STATUS_COMMITS, #state.commits)
 				for i = 1, count do
 					local commit = state.commits[i]
 					local hash = tostring(commit.hash or "")
 					if hash ~= "" then
 						state.status_by_hash[hash] = "loading"
-						track(provider.fetch_commit_status(pr, commit, opts, function(status, url, status_err)
+						track(pipelines.fetch_commit_status(commit, opts, function(status, url, status_err)
 							if status_err then
 								state.status_by_hash[hash] = "unknown"
 							else
@@ -213,16 +215,16 @@ function M.render(_pr, width)
 		end,
 		content_hl = function(item, row, _)
 			local out = { { start_col = 0, end_col = #row, hl_group = "AtlasTextMuted" } }
-			local build_state = type(item.meta) == "table" and tostring(item.meta.build_state or "") or ""
+			local pipeline_state = type(item.meta) == "table" and tostring(item.meta.pipeline_state or "") or ""
 
-			if build_state ~= "" and build_state ~= "unknown" and build_state ~= "loading" then
-				local marker = icons.pulls_status(build_state) .. " " .. status_label(build_state)
+			if pipeline_state ~= "" and pipeline_state ~= "unknown" and pipeline_state ~= "loading" then
+				local marker = icons.pulls_status(pipeline_state) .. " " .. status_label(pipeline_state)
 				local start_col, end_col = row:find(marker, 1, true)
 				if start_col ~= nil and end_col ~= nil then
 					table.insert(out, {
 						start_col = start_col - 1,
 						end_col = end_col,
-						hl_group = status_hl(build_state),
+						hl_group = status_hl(pipeline_state),
 					})
 				end
 			end
@@ -250,7 +252,7 @@ end
 ---@param entry table
 ---@return boolean|nil
 function M.on_enter(_pr, entry)
-	local url = entry.build_url
+	local url = entry.pipeline_url
 	if url and url ~= "" then
 		vim.ui.open(url)
 		return true

@@ -3,6 +3,7 @@ local M = {}
 local explorer = require("atlas.pulls.diff.atlas.explorer")
 local help = require("atlas.ui.popups.help")
 local resolver = require("atlas.core.keymaps")
+local review_keymaps = require("atlas.pulls.diff.shared.keymaps")
 
 ---@param action AtlasKeymapActionId
 ---@param map_item AtlasHelpKeyItem
@@ -46,11 +47,8 @@ end
 ---@field toggle_file_reviewed fun()
 ---@field toggle_panel fun()
 ---@field toggle_commits fun()
----@field select_file fun(index: integer)
----@field refresh fun()
----@field open_item fun(buf: integer)
----@field add_note fun(buf: integer)
----@field jump_note fun(direction: 1|-1)
+---@field toggle_review_panel fun()
+---@field select_file fun(index: integer, focus_diff: boolean|nil)
 ---@field show_commit fun()
 
 ---@param session AtlasNativeDiffSession
@@ -63,7 +61,7 @@ function M.register(session, actions)
 	local navigation = {}
 	add(
 		navigation,
-		item("pulls.review.previous_hunk", {
+		item("pulls.review.diff.previous_hunk", {
 			desc = "Previous diff hunk",
 			index = 1,
 			callback = run(function()
@@ -74,7 +72,7 @@ function M.register(session, actions)
 	)
 	add(
 		navigation,
-		item("pulls.review.next_hunk", {
+		item("pulls.review.diff.next_hunk", {
 			desc = "Next diff hunk",
 			index = 2,
 			callback = run(function()
@@ -85,7 +83,7 @@ function M.register(session, actions)
 	)
 	add(
 		navigation,
-		item("pulls.review.previous_file", {
+		item("pulls.review.explorer.previous_file", {
 			desc = "Previous file",
 			index = 3,
 			callback = run(function()
@@ -96,7 +94,7 @@ function M.register(session, actions)
 	)
 	add(
 		navigation,
-		item("pulls.review.next_file", {
+		item("pulls.review.explorer.next_file", {
 			desc = "Next file",
 			index = 4,
 			callback = run(function()
@@ -110,15 +108,14 @@ function M.register(session, actions)
 		session.commits_panel.buf,
 		session.left.buf,
 		session.right.buf,
-		session.footer.buf,
 	}) do
 		local general_actions = {}
 		add(
 			general_actions,
 			item("ui.close", {
-				desc = "Close diff",
+				desc = buf == session.commits_panel.buf and "Close commits" or "Close diff",
 				index = 1,
-				callback = run(actions.close),
+				callback = run(buf == session.commits_panel.buf and actions.toggle_commits or actions.close),
 				opts = { silent = true, nowait = true },
 			})
 		)
@@ -146,7 +143,7 @@ function M.register(session, actions)
 			general_actions,
 			item("ui.refresh_view", {
 				desc = review_enabled and "Reload pull request diff" or "Reload diff",
-				index = 5,
+				index = 6,
 				callback = run(actions.reload),
 				opts = { silent = true, nowait = true },
 			})
@@ -154,10 +151,21 @@ function M.register(session, actions)
 		if #session.commits > 0 then
 			add(
 				general_actions,
-				item("pulls.review.toggle_commits", {
+				item("pulls.review.explorer.toggle_commits", {
 					desc = "Toggle commits",
 					index = 4,
 					callback = run(actions.toggle_commits),
+					opts = { silent = true, nowait = true },
+				})
+			)
+		end
+		if review_enabled then
+			add(
+				general_actions,
+				item("pulls.review.diff.toggle_review_panel", {
+					desc = "Toggle review panel",
+					index = 5,
+					callback = run(actions.toggle_review_panel),
 					opts = { silent = true, nowait = true },
 				})
 			)
@@ -167,7 +175,7 @@ function M.register(session, actions)
 				general_actions,
 				item("ui.show_details", {
 					desc = "Show details",
-					index = 8,
+					index = 9,
 					callback = run(actions.show_commit),
 					opts = { silent = true, nowait = true },
 				})
@@ -175,38 +183,27 @@ function M.register(session, actions)
 		end
 		add(
 			general_actions,
-			item("pulls.review.toggle_compact", {
+			item("pulls.review.diff.toggle_compact", {
 				desc = "Toggle full / compact",
-				index = 6,
+				index = 7,
 				callback = run(actions.toggle_compact),
 				opts = { silent = true, nowait = true },
 			})
 		)
 		add(
 			general_actions,
-			item("pulls.review.toggle_layout", {
+			item("pulls.review.diff.toggle_layout", {
 				desc = "Toggle side-by-side / inline",
-				index = 7,
+				index = 8,
 				callback = run(actions.toggle_layout),
 				opts = { silent = true, nowait = true },
 			})
 		)
 		local review_actions = {}
-		if review_enabled then
-			add(
-				review_actions,
-				item("ui.refresh", {
-					desc = "Refresh review",
-					index = 1,
-					callback = run(actions.refresh),
-					opts = { silent = true, nowait = true },
-				})
-			)
-		end
 		if review_enabled and buf ~= session.commits_panel.buf then
 			add(
 				review_actions,
-				item("pulls.review.toggle_file_reviewed", {
+				item("pulls.review.explorer.toggle_file_reviewed", {
 					desc = "Toggle file reviewed",
 					index = 2,
 					callback = run(actions.toggle_file_reviewed),
@@ -214,65 +211,16 @@ function M.register(session, actions)
 				})
 			)
 		end
-		if review_enabled and (buf == session.left.buf or buf == session.right.buf) then
-			add(
-				review_actions,
-				item("pulls.review.view_thread", {
-					desc = "Open comment or note",
-					index = 3,
-					callback = run(function()
-						actions.open_item(buf)
-					end),
-					opts = { silent = true, nowait = true },
-				})
-			)
-			if buf == session.right.buf then
-				add(
-					review_actions,
-					item("pulls.review.add_note", {
-						desc = "Add local note",
-						index = 4,
-						callback = run(function()
-							actions.add_note(buf)
-						end),
-						opts = { silent = true, nowait = true },
-					})
-				)
-			end
-			local note_navigation = {}
-			add(
-				note_navigation,
-				item("pulls.review.previous_note", {
-					desc = "Previous local note",
-					index = 7,
-					callback = run(function()
-						actions.jump_note(-1)
-					end),
-					opts = { silent = true, nowait = true },
-				})
-			)
-			add(
-				note_navigation,
-				item("pulls.review.next_note", {
-					desc = "Next local note",
-					index = 8,
-					callback = run(function()
-						actions.jump_note(1)
-					end),
-					opts = { silent = true, nowait = true },
-				})
-			)
-			help.register("Navigation", note_navigation, { index = 120, buffer = buf })
-		end
 		help.register("General", general_actions, { index = 90, buffer = buf })
 		help.register("Review", review_actions, { index = 110, buffer = buf })
 		help.register("Navigation", navigation, { index = 120, buffer = buf })
 	end
 
-	local explorer_actions = {
-		{
-			key = { "<CR>", "l" },
-			desc = "Open changed file",
+	local explorer_actions = {}
+	add(
+		explorer_actions,
+		item("pulls.review.explorer.focus_file", {
+			desc = "Show changed file",
 			index = 1,
 			callback = run(function()
 				local index = explorer.open_at_cursor(session)
@@ -281,49 +229,72 @@ function M.register(session, actions)
 				end
 			end),
 			opts = { silent = true, nowait = true },
-		},
-	}
+		})
+	)
+	add(
+		explorer_actions,
+		item("pulls.review.explorer.open_file", {
+			desc = "Open changed file",
+			index = 2,
+			callback = run(function()
+				local index = explorer.open_at_cursor(session)
+				if index then
+					actions.select_file(index, true)
+				end
+			end),
+			opts = { silent = true, nowait = true },
+		})
+	)
 	add(
 		explorer_actions,
 		item("ui.show_details", {
 			desc = "Show file path / item",
-			index = 2,
+			index = 3,
 			callback = run(function()
 				explorer.show_path(session)
 			end),
 			opts = { silent = true, nowait = true },
 		})
 	)
-	if session.explorer.grouped then
-		add(
-			explorer_actions,
-			item("ui.toggle_fold", {
-				desc = "Toggle folder",
-				index = 3,
-				callback = run(function()
-					explorer.toggle_folder(session)
-				end),
-				opts = { silent = true, nowait = true },
-			})
-		)
-		add(
-			explorer_actions,
-			item("ui.toggle_all_folds", {
-				desc = "Toggle all folders",
-				index = 4,
-				callback = run(function()
-					explorer.toggle_all_folders(session)
-				end),
-				opts = { silent = true, nowait = true },
-			})
-		)
-	end
+	add(
+		explorer_actions,
+		item("pulls.review.explorer.toggle_grouping", {
+			desc = "Toggle grouped / plain files",
+			index = 3,
+			callback = run(function()
+				explorer.toggle_grouping(session)
+			end),
+			opts = { silent = true, nowait = true },
+		})
+	)
+	add(
+		explorer_actions,
+		item("ui.toggle_fold", {
+			desc = "Toggle folder",
+			index = 4,
+			callback = run(function()
+				explorer.toggle_folder(session)
+			end),
+			opts = { silent = true, nowait = true },
+		})
+	)
+	add(
+		explorer_actions,
+		item("ui.toggle_all_folds", {
+			desc = "Toggle all folders",
+			index = 5,
+			callback = run(function()
+				explorer.toggle_all_folders(session)
+			end),
+			opts = { silent = true, nowait = true },
+		})
+	)
 	if not review_enabled then
 		add(
 			explorer_actions,
-			item("pulls.review.toggle_file_reviewed", {
+			item("pulls.review.explorer.toggle_file_reviewed", {
 				desc = "Toggle file reviewed",
-				index = 5,
+				index = 6,
 				callback = run(actions.toggle_file_reviewed),
 				opts = { silent = true, nowait = true },
 			})
@@ -338,164 +309,31 @@ function M.register_review(session, actions)
 	local run = function(callback)
 		return guard(actions.active, callback)
 	end
-	for _, buf in ipairs({ session.panel.buf, session.left.buf, session.right.buf }) do
-		local review_actions = {}
-		local navigation = {}
-		if buf == session.panel.buf then
-			if actions.toggle_task then
+	for _, buf in ipairs({
+		session.panel.buf,
+		session.commits_panel.buf,
+		session.left.buf,
+		session.right.buf,
+		session.review_panel and session.review_panel.buf,
+	}) do
+		local groups = review_keymaps.groups(session, actions, buf, {
+			include_actions = buf ~= session.commits_panel.buf,
+			include_task = buf == session.panel.buf,
+		})
+		for _, group in ipairs(groups) do
+			local items = {}
+			for _, definition in ipairs(group.items) do
 				add(
-					review_actions,
-					item("pulls.review.toggle_resolved", {
-						desc = "Toggle task completion",
-						index = 11,
-						callback = run(actions.toggle_task),
+					items,
+					item(definition.action, {
+						desc = definition.desc,
+						index = definition.index,
+						callback = run(definition.callback),
 						opts = { silent = true, nowait = true },
 					})
 				)
 			end
-		else
-			add(
-				review_actions,
-				item("pulls.review.toggle_resolved", {
-					desc = "Toggle resolved",
-					index = 11,
-					callback = run(function()
-						actions.toggle_resolved(buf)
-					end),
-					opts = { silent = true, nowait = true },
-				})
-			)
-			add(
-				review_actions,
-				item("pulls.review.add_pending_comment", {
-					desc = "Add pending inline comment",
-					index = 12,
-					callback = run(function()
-						actions.add_comment(buf, true)
-					end),
-					opts = { silent = true, nowait = true },
-				})
-			)
-			add(
-				review_actions,
-				item("pulls.review.add_comment", {
-					desc = "Add inline comment",
-					index = 13,
-					callback = run(function()
-						actions.add_comment(buf, false)
-					end),
-					opts = { silent = true, nowait = true },
-				})
-			)
-			add(
-				review_actions,
-				item("ui.toggle_fold", {
-					desc = "Toggle review thread",
-					index = 14,
-					callback = run(function()
-						if not actions.toggle_thread(buf) then
-							pcall(vim.cmd.normal, { "za", bang = true })
-						end
-					end),
-					opts = { silent = true, nowait = true },
-				})
-			)
-			add(
-				review_actions,
-				item("ui.toggle_all_folds", {
-					desc = "Toggle all review threads",
-					index = 15,
-					callback = run(function()
-						if not actions.toggle_all_threads() then
-							pcall(vim.cmd.normal, { "zA", bang = true })
-						end
-					end),
-					opts = { silent = true, nowait = true },
-				})
-			)
-			add(
-				navigation,
-				item("pulls.review.next_comment", {
-					desc = "Next review comment",
-					index = 6,
-					callback = run(function()
-						actions.jump_comment(buf, 1)
-					end),
-					opts = { silent = true, nowait = true },
-				})
-			)
-			add(
-				navigation,
-				item("pulls.review.previous_comment", {
-					desc = "Previous review comment",
-					index = 5,
-					callback = run(function()
-						actions.jump_comment(buf, -1)
-					end),
-					opts = { silent = true, nowait = true },
-				})
-			)
-		end
-		add(
-			review_actions,
-			item("ui.open_in_browser", {
-				desc = "Open pull request in browser",
-				index = 16,
-				callback = run(actions.open_in_browser),
-				opts = { silent = true, nowait = true },
-			})
-		)
-		help.register("Review", review_actions, { index = 110, buffer = buf })
-		help.register("Navigation", navigation, { index = 120, buffer = buf })
-	end
-end
-
-local REVIEW_PANEL_ACTIONS = {
-	"pulls.review.toggle_resolved",
-	"ui.open_in_browser",
-}
-
-local REVIEW_CONTENT_ACTIONS = {
-	"pulls.review.toggle_resolved",
-	"pulls.review.add_pending_comment",
-	"pulls.review.add_comment",
-	"ui.toggle_fold",
-	"ui.toggle_all_folds",
-	"ui.open_in_browser",
-}
-
-local REVIEW_NAVIGATION_ACTIONS = {
-	"pulls.review.next_comment",
-	"pulls.review.previous_comment",
-}
-
----@param action AtlasKeymapActionId
----@return AtlasHelpKeyItem|nil
-local function remove_item(action)
-	local keys = resolver.resolve(action)
-	if not keys then
-		return nil
-	end
-	return { key = #keys == 1 and keys[1] or keys, desc = "" }
-end
-
----@param session AtlasNativeDiffSession
-function M.unregister_review(session)
-	for _, buf in ipairs({ session.panel.buf, session.left.buf, session.right.buf }) do
-		if vim.api.nvim_buf_is_valid(buf) then
-			local actions = buf == session.panel.buf and REVIEW_PANEL_ACTIONS or REVIEW_CONTENT_ACTIONS
-			local items = {}
-			for _, action in ipairs(actions) do
-				add(items, remove_item(action))
-			end
-			help.remove("Review", items, { buffer = buf })
-			if buf ~= session.panel.buf then
-				local navigation = {}
-				for _, action in ipairs(REVIEW_NAVIGATION_ACTIONS) do
-					add(navigation, remove_item(action))
-				end
-				help.remove("Navigation", navigation, { buffer = buf })
-			end
+			help.register(group.name, items, { index = group.index, buffer = buf })
 		end
 	end
 end

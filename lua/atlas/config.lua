@@ -2,9 +2,6 @@
 
 ---@alias AtlasKeymapValue string|string[]|false|nil
 
----@alias AtlasPullsProviderId "bitbucket"|"github"|"gitlab"
----@alias AtlasIssuesProviderId "jira"|"github"|"gitlab"
-
 -- Pulls Provider Config
 
 ---@class AtlasPullsViewConfig
@@ -16,6 +13,7 @@
 ---@field name string
 ---@field key string|nil
 ---@field layout "plain"|"compact"|nil
+---@field search string|nil
 
 ---@class AtlasPullsRepoConfig
 ---@field settings table<string, AtlasPullsRepoSettings>|nil
@@ -36,9 +34,11 @@
 ---@alias AtlasPullsDiffOpenCommand "AtlasDiff"|"DiffviewOpen"|"CodeDiff"
 
 ---@class AtlasPullsDiffConfig
----@field open_cmd AtlasPullsDiffOpenCommand|nil
+---@field open_cmd AtlasPullsDiffOpenCommand|string|nil
 ---@field layout "side-by-side"|"inline"|nil
 ---@field compact boolean|nil
+---@field compact_context_lines integer|nil
+---@field show_review_panel boolean|nil
 ---@field explorer AtlasPullsDiffExplorerConfig|nil
 
 ---@class AtlasPullsCustomActionContext
@@ -54,15 +54,8 @@
 
 -- Configs
 
----@class AtlasPullsProviders
----@field bitbucket AtlasBitbucketConfig|nil
----@field github AtlasGitHubConfig|nil
----@field gitlab AtlasGitLabPullsConfig|nil
-
----@class AtlasIssuesProviders
----@field jira AtlasJiraIssuesConfig|nil
----@field github AtlasGitHubIssuesConfig|nil
----@field gitlab AtlasGitLabIssuesConfig|nil
+---@alias AtlasPullsProviders table<string, AtlasBitbucketConfig|AtlasGitHubConfig|AtlasGitLabPullsConfig|table>
+---@alias AtlasIssuesProviders table<string, AtlasJiraIssuesConfig|AtlasGitHubIssuesConfig|AtlasGitLabIssuesConfig|table>
 
 ---@class AtlasPullsConfig
 ---@field repo_config AtlasPullsRepoConfig|nil
@@ -89,23 +82,29 @@
 -- Config
 
 ---@class AtlasConfig
+---@field global_statusline boolean|nil Set one statusline across all windows (default: true)
 ---@field pulls AtlasPullsConfig|nil
 ---@field issues AtlasIssuesConfig|nil
 ---@field keymaps AtlasKeymapsConfig|nil  -- see core/keymaps.lua for type
 
 local M = {}
 
+local notify = require("atlas.core.notify")
+
 ---@type AtlasConfig
 M.options = {
+	global_statusline = true,
 	pulls = {
 		diff = {
 			open_cmd = "AtlasDiff",
-			layout = "side-by-side",
+			layout = "inline",
 			compact = true,
+			compact_context_lines = 3,
+			show_review_panel = false,
 			explorer = {
 				grouped = true,
 				hidden = false,
-				show_commits = true,
+				show_commits = false,
 				width = 40,
 				initial_focus = "explorer",
 				ignore = { ".git/**", ".jj/**" },
@@ -115,6 +114,11 @@ M.options = {
 	issues = nil,
 	keymaps = {
 		ui = {
+			next_item = "j",
+			previous_item = "k",
+			first_item = "gg",
+			last_item = "G",
+			submit = "<C-s>",
 			help = "g?",
 			close = "q",
 			toggle_panel = "p",
@@ -131,39 +135,54 @@ M.options = {
 			refresh_view = "R",
 			open_actions = "A",
 			open_in_browser = "gx",
+			copy_id = "y",
 			copy_url = "Y",
 			show_details = "K",
 			search = "?",
 		},
 		pulls = {
-			copy_id = "y",
 			open_diff = "gd",
 			checkout = "gc",
+			edit_title = "T",
 			review = {
-				toggle_layout = "t",
-				toggle_compact = "f",
-				next_hunk = "]h",
-				previous_hunk = "[h",
-				next_file = { "]f", "<Tab>" },
-				previous_file = { "[f", "<S-Tab>" },
-				toggle_file_reviewed = "-",
-				toggle_commits = "gC",
-				next_comment = "]c",
-				previous_comment = "[c",
-				next_note = "]n",
-				previous_note = "[n",
-				view_thread = "K",
-				add_pending_comment = "c",
-				add_comment = "C",
-				add_note = "n",
-				toggle_resolved = "x",
+				toggle_approval = "ga",
+				request_changes = "gr",
+				submit_review = "gs",
+				explorer = {
+					focus_file = "<CR>",
+					open_file = "l",
+					next_file = { "]f", "<Tab>" },
+					previous_file = { "[f", "<S-Tab>" },
+					toggle_grouping = "T",
+					toggle_file_reviewed = "-",
+					toggle_commits = "gC",
+				},
+				diff = {
+					toggle_layout = "t",
+					toggle_compact = "u",
+					next_hunk = "]h",
+					previous_hunk = "[h",
+					toggle_review_panel = "gR",
+					next_comment = "]c",
+					previous_comment = "[c",
+					next_note = "]n",
+					previous_note = "[n",
+					add_comment = "c",
+					submit_comment = "C",
+					edit_comment = "e",
+					delete = "dd",
+					add_note = "<leader>n",
+					add_task = "T",
+					toggle_resolved = "x",
+				},
 			},
-			filter_status_open = "gpo",
-			filter_status_merged = "gpm",
-			filter_status_declined = "gpd",
+			filters = {
+				open = "gpo",
+				merged = "gpm",
+				declined = "gpd",
+			},
 		},
 		issues = {
-			copy_key = "y",
 			transition_issue = "gs",
 			change_assignee = "ga",
 			change_reporter = "gr",
@@ -194,11 +213,8 @@ local function register_commands()
 	vim.api.nvim_create_user_command("AtlasClearCache", function()
 		require("atlas.core.cache").clear_all()
 		require("atlas.core.memory_cache").clear_all()
-		vim.notify("Atlas cache cleared", vim.log.levels.INFO)
+		notify.info("Cache cleared")
 	end, { desc = "Clear Atlas disk and memory cache" })
-
-	local pulls_providers = { "bitbucket", "github", "gitlab" }
-	local issues_providers = { "jira", "github", "gitlab" }
 
 	vim.api.nvim_create_user_command("AtlasPulls", function(opts)
 		local provider_id = opts.fargs[1] and opts.fargs[1]:lower() or nil
@@ -209,7 +225,7 @@ local function register_commands()
 		complete = function(arglead)
 			return vim.tbl_filter(function(p)
 				return p:find(arglead, 1, true) == 1
-			end, pulls_providers)
+			end, require("atlas.providers").ids("pulls"))
 		end,
 	})
 
@@ -222,7 +238,7 @@ local function register_commands()
 		complete = function(arglead)
 			return vim.tbl_filter(function(p)
 				return p:find(arglead, 1, true) == 1
-			end, issues_providers)
+			end, require("atlas.providers").ids("issues"))
 		end,
 	})
 
@@ -275,6 +291,9 @@ end
 function M.setup(opts)
 	local resolved = opts or {}
 	M.options = vim.tbl_deep_extend("force", M.options, resolved)
+	if M.options.global_statusline ~= false then
+		vim.opt.laststatus = 3
+	end
 	register_commands()
 end
 

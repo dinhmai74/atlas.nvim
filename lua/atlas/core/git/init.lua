@@ -94,6 +94,18 @@ function M.rev_exists(root, rev)
 end
 
 ---@param root string
+---@param revision string
+---@return string|nil
+function M.resolve_revision(root, revision)
+	local res = vim.system(
+		{ "git", "-C", root, "rev-parse", "--verify", "--end-of-options", revision .. "^{commit}" },
+		{ text = true }
+	):wait()
+	local hash = trim(res.stdout)
+	return res.code == 0 and hash ~= "" and hash or nil
+end
+
+---@param root string
 ---@param base string
 ---@param head string
 ---@return string|nil base_revision
@@ -122,10 +134,14 @@ end
 ---@param root string
 ---@param base string
 ---@param head string
----@return string
+---@return string|nil range
+---@return string|nil err
 function M.commit_range(root, base, head)
-	local base_revision, head_revision = M.diff_revisions(root, base, head)
-	return base_revision and (base_revision .. ".." .. head_revision) or head
+	local base_revision, head_revision, err = M.diff_revisions(root, base, head)
+	if not base_revision or not head_revision then
+		return nil, err
+	end
+	return base_revision .. ".." .. head_revision
 end
 
 ---@param root string
@@ -192,7 +208,7 @@ end
 
 ---@class AtlasGitRemoteInfo
 ---@field host string -- e.g. "github.com" / "bitbucket.org" / "gitlab.com"
----@field provider "github"|"bitbucket"|"gitlab"|"unknown"
+---@field provider string
 ---@field slug string -- "owner/repo" or nested "group/subgroup/repo" (without .git)
 ---@field owner string
 ---@field repo string
@@ -227,14 +243,7 @@ function M.parse_remote_url(url)
 		return nil, string.format("Could not parse owner/repo from: %s", url)
 	end
 
-	local provider = "unknown"
-	if host:find("github") then
-		provider = "github"
-	elseif host:find("bitbucket") then
-		provider = "bitbucket"
-	elseif host:find("gitlab") then
-		provider = "gitlab"
-	end
+	local provider = require("atlas.providers.resolve").provider_for_host(host) or "unknown"
 
 	return {
 		host = host,
@@ -245,6 +254,15 @@ function M.parse_remote_url(url)
 		url = url,
 	},
 		nil
+end
+
+---@param cwd string|nil
+---@return AtlasGitRemoteInfo|nil
+function M.local_repository(cwd)
+	local root = M.repo_root(cwd)
+	local remote_url = root and M.remote_url(root, "origin") or nil
+	local info = remote_url and M.parse_remote_url(remote_url) or nil
+	return info and info.provider ~= "unknown" and info or nil
 end
 
 ---@param root string
@@ -322,14 +340,12 @@ end
 
 ---@param root string
 ---@param remote string
----@param branches string[]
+---@param refs string[]
 ---@param on_done fun(ok: boolean, err: string|nil)
 ---@return { cancel: fun() }
-function M.fetch_branches(root, remote, branches, on_done)
-	local args = { "fetch", remote }
-	for _, branch in ipairs(branches) do
-		table.insert(args, branch)
-	end
+function M.fetch_refs(root, remote, refs, on_done)
+	local args = { "fetch", "--no-tags", remote }
+	vim.list_extend(args, refs)
 
 	return M.run(args, { cwd = root, text = true }, function(res)
 		if res.code ~= 0 then
@@ -359,14 +375,6 @@ function M.checkout_branch(root, branch, on_done)
 		end
 		on_done(true, nil)
 	end)
-end
-
----@param root string
----@param branch string
----@param remote string
----@param on_done fun(ok: boolean, err: string|nil)
-function M.checkout_remote_branch(root, branch, remote, on_done)
-	return M.checkout_new_branch(root, branch, remote .. "/" .. branch, on_done)
 end
 
 ---@param root string

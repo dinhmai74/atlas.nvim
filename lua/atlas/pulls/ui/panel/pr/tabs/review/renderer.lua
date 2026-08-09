@@ -70,7 +70,7 @@ end
 ---@param width integer
 ---@param current_user PullsUser|nil
 local function emit_tasks(lines, spans, line_map, tasks, width, current_user)
-	local toggle_keys = keymaps.resolve("pulls.review.toggle_resolved")
+	local toggle_keys = keymaps.resolve("pulls.review.diff.toggle_resolved")
 	local provider = require("atlas.pulls.state").provider
 	local padding = string.rep(" ", PADDING_X)
 
@@ -103,8 +103,13 @@ local function emit_tasks(lines, spans, line_map, tasks, width, current_user)
 
 		local checkbox = resolved and "[x]" or "[ ]"
 		local timestamp = utils.relative_time(task.created_on)
+		local marker, marker_hl = review_threads.status_marker(task)
+		local title_suffix = timestamp
+		if marker ~= "" then
+			title_suffix = title_suffix ~= "" and (title_suffix .. "  " .. marker) or marker
+		end
 		local title_prefix = padding .. checkbox .. " "
-		local title_line = task_row(title_prefix, title, timestamp, width)
+		local title_line = task_row(title_prefix, title, title_suffix, width)
 		table.insert(lines, title_line)
 		line_map[#lines] = { kind = "header", comment = task, entity_kind = "task" }
 		table.insert(spans, {
@@ -113,13 +118,21 @@ local function emit_tasks(lines, spans, line_map, tasks, width, current_user)
 			end_col = #padding + #checkbox,
 			hl_group = resolved and "AtlasTextPositive" or "AtlasTextMuted",
 		})
-		if timestamp ~= "" then
+		if title_suffix ~= "" then
 			table.insert(spans, {
 				line = #lines - 1,
-				start_col = #title_line - #timestamp,
+				start_col = #title_line - #title_suffix,
 				end_col = #title_line,
 				hl_group = "AtlasTextMuted",
 			})
+			if marker ~= "" then
+				table.insert(spans, {
+					line = #lines - 1,
+					start_col = #title_line - #marker,
+					end_col = #title_line,
+					hl_group = marker_hl,
+				})
+			end
 		end
 
 		local creator = author_name(task.author)
@@ -162,17 +175,20 @@ end
 ---@param width integer
 ---@param current_user PullsUser|nil
 local function emit_thread_box(lines, spans, line_map, nodes, width, current_user)
-	local inner = math.max(1, width - (PADDING_X * 2) - 2)
-	local toggle_keys = keymaps.resolve("pulls.review.toggle_resolved")
-	local t_lines, t_spans, t_map = review_threads.render_threads(nodes, inner, {
+	local inner = math.max(1, width - (PADDING_X * 2) - 4)
+	local toggle_keys = keymaps.resolve("pulls.review.diff.toggle_resolved")
+	local provider = require("atlas.pulls.state").provider
+	local comments = provider and provider.capabilities.comments
+	local t_lines, t_spans, t_map = review_threads.render(nodes, inner, {
 		expanded = function(root)
 			return state.is_thread_expanded(root)
 		end,
 		can_action = function(action, comment)
-			return review_actions.is_available(action, comment, current_user, require("atlas.pulls.state").provider)
+			return review_actions.is_available(action, comment, current_user, provider)
 		end,
-		padding_x = PADDING_X,
+		padding_x = 0,
 		toggle_resolved_key = toggle_keys and table.concat(toggle_keys, " / ") or nil,
+		reaction_options = comments and comments.reaction_options,
 	})
 	local mark_line = #lines
 	local result = box.render({ { lines = t_lines, spans = t_spans, line_map = t_map } }, {
@@ -184,16 +200,23 @@ local function emit_thread_box(lines, spans, line_map, nodes, width, current_use
 	utils.append_block(lines, spans, { lines = result.lines, highlights = result.highlights })
 end
 
+---@class CommentsHunkBucket
+---@field hunk DiffHunk
+---@field threads_by_anchor table<string, { threads: AtlasReviewThreadNode[], current_user: PullsUser|nil }>
+
+---@param hunk DiffHunk
+---@return string
+local function hunk_key(hunk)
+	return string.format("%s|%s", tostring(hunk.new_start or 0), tostring(hunk.old_start or 0))
+end
+
 ---@param lines string[]
 ---@param spans table[]
 ---@param line_map table<integer, table>
 ---@param width integer
 ---@param file_path string
----@param hunk DiffHunk
----@param threads_by_anchor table<string, { side: string, line: integer, threads: table[] }>
----@return boolean collapsed
-local function emit_hunk_with_comments(lines, spans, line_map, width, file_path, hunk, threads_by_anchor)
-	local collapsed = state.collapsed_hunks[diff.hunk_key({ path = file_path }, hunk)] == true
+---@param buckets CommentsHunkBucket[]
+local function emit_file_with_comments(lines, spans, line_map, width, file_path, buckets)
 	local function count(node)
 		local total = 1
 		for _, child in ipairs(node.children or {}) do
@@ -201,20 +224,28 @@ local function emit_hunk_with_comments(lines, spans, line_map, width, file_path,
 		end
 		return total
 	end
-	local total = 0
-	for _, anchor in pairs(threads_by_anchor) do
-		for _, node in ipairs(anchor.threads or {}) do
-			total = total + count(node)
+
+	local file = { path = file_path, status = "modified", hunks = {} }
+	local totals = {}
+	local buckets_by_key = {}
+	for _, bucket in ipairs(buckets) do
+		table.insert(file.hunks, bucket.hunk)
+		buckets_by_key[diff.hunk_key(file, bucket.hunk)] = bucket
+		local total = 0
+		for _, anchor in pairs(bucket.threads_by_anchor) do
+			for _, node in ipairs(anchor.threads or {}) do
+				total = total + count(node)
+			end
 		end
+		totals[hunk_key(bucket.hunk)] = total
 	end
 
-	local cb_lines, cb_spans, cb_map = diff.hunks({
-		{ path = file_path, status = "modified", hunks = { hunk } },
-	}, {
+	local cb_lines, cb_spans, cb_map = diff.hunks({ file }, {
 		max_width = width,
 		padding_x = PADDING_X,
 		collapsed_hunks = state.collapsed_hunks,
-		hunk_footer = function()
+		hunk_footer = function(_, hunk)
+			local total = totals[hunk_key(hunk)] or 0
 			if total == 0 then
 				return nil
 			end
@@ -233,39 +264,45 @@ local function emit_hunk_with_comments(lines, spans, line_map, width, file_path,
 		table.insert(list, s)
 	end
 
+	local current_bucket
 	for i, text in ipairs(cb_lines) do
 		table.insert(lines, text)
 		local out_line = #lines - 1
 		for _, s in ipairs(spans_by_cb_line[i - 1] or {}) do
-			table.insert(spans, {
-				line = out_line,
-				start_col = s.start_col,
-				end_col = s.end_col,
-				hl_group = s.hl_group,
-			})
+			s.line = out_line
+			table.insert(spans, s)
 		end
 		local entry = cb_map and cb_map[i] or nil
 		if entry then
 			line_map[#lines] = entry
 		end
 
-		if entry and entry.kind == "hunk_line" and entry.path == file_path and entry.line ~= nil then
+		if entry and entry.kind == "hunk_header" then
+			current_bucket = buckets_by_key[entry.hunk_key]
+		elseif entry and entry.kind == "hunk_line" and entry.path == file_path and entry.line ~= nil then
 			local anchor_key = string.format("%s:%s", entry.side or "new", tostring(entry.line))
-			local anchor = threads_by_anchor[anchor_key]
+			local anchor = current_bucket and current_bucket.threads_by_anchor[anchor_key]
 			if anchor then
 				entry.thread_roots = {}
 				for _, thread in ipairs(anchor.threads) do
 					table.insert(entry.thread_roots, thread.comment)
 				end
 				emit_thread_box(lines, spans, line_map, anchor.threads, width, anchor.current_user)
-				threads_by_anchor[anchor_key] = nil
+				current_bucket.threads_by_anchor[anchor_key] = nil
 			end
 		end
 	end
-	return collapsed
+
+	for _, bucket in ipairs(buckets) do
+		if state.collapsed_hunks[diff.hunk_key(file, bucket.hunk)] ~= true then
+			for _, anchor in pairs(bucket.threads_by_anchor) do
+				emit_thread_box(lines, spans, line_map, anchor.threads, width, anchor.current_user)
+			end
+		end
+	end
 end
 
----@param pr PullRequest
+---@param _pr PullRequest
 ---@param width integer
 ---@param comments PullsComment[]|"loading"|string|nil
 ---@param tasks PullsComment[]|"loading"|string|nil
@@ -319,26 +356,11 @@ function M.render(_pr, width, comments, tasks)
 
 	local roots = review_threads.group_comments(comments, type(tasks) == "table" and tasks or nil)
 
-	---@class CommentsHunkBucket
-	---@field hunk DiffHunk
-	---@field threads_by_anchor table<string, CommentsThreadAnchor>
-
-	---@class CommentsThreadAnchor
-	---@field side string
-	---@field line integer
-	---@field threads table[]
-	---@field current_user PullsUser|nil
-
 	local general_roots = {}
 	---@type table<string, { path: string, hunks: table<string, CommentsHunkBucket>, hunk_order: string[] }>
 	local file_buckets = {}
 	---@type string[]
 	local file_order = {}
-
-	---@param hunk DiffHunk
-	local function hunk_key(hunk)
-		return string.format("%s|%s", tostring(hunk.new_start or 0), tostring(hunk.old_start or 0))
-	end
 
 	for _, thread in ipairs(roots) do
 		local c = thread.comment
@@ -361,11 +383,11 @@ function M.render(_pr, width, comments, tasks)
 				hb.hunk = c.inline_hunk
 			end
 			local side = c.inline.to ~= nil and "new" or "old"
-			local line = c.inline.to or c.inline.from
+			local line = c.inline_hunk_anchor or c.inline.to or c.inline.from
 			local akey = string.format("%s:%s", side, tostring(line or ""))
 			local anchor = hb.threads_by_anchor[akey]
 			if anchor == nil then
-				anchor = { side = side, line = line, threads = {}, current_user = current_user }
+				anchor = { threads = {}, current_user = current_user }
 				hb.threads_by_anchor[akey] = anchor
 			end
 			table.insert(anchor.threads, thread)
@@ -387,18 +409,12 @@ function M.render(_pr, width, comments, tasks)
 
 		for _, path in ipairs(file_order) do
 			local file = file_buckets[path]
+			local buckets = {}
 			for _, hkey in ipairs(file.hunk_order) do
-				local hb = file.hunks[hkey]
-				local collapsed =
-					emit_hunk_with_comments(lines, spans, line_map, max_width, path, hb.hunk, hb.threads_by_anchor)
-				if not collapsed then
-					-- orphans (didnt match any rendered line)
-					for _, anchor in pairs(hb.threads_by_anchor) do
-						emit_thread_box(lines, spans, line_map, anchor.threads, max_width, current_user)
-					end
-				end
-				table.insert(lines, "")
+				table.insert(buckets, file.hunks[hkey])
 			end
+			emit_file_with_comments(lines, spans, line_map, max_width, path, buckets)
+			table.insert(lines, "")
 		end
 	end
 

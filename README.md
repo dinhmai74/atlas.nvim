@@ -1,6 +1,6 @@
 [![Neovim](https://img.shields.io/badge/Neovim-0.10+-blue.svg)](https://neovim.io/)
 [![Version](https://img.shields.io/github/v/tag/emrearmagan/atlas.nvim.svg)](https://github.com/emrearmagan/atlas.nvim/tags)
-[![Tests](https://github.com/emrearmagan/atlas.nvim/actions/workflows/main.yml/badge.svg)](https://github.com/emrearmagan/atlas.nvim/actions/workflows/main.yml)
+[![CI](https://github.com/emrearmagan/atlas.nvim/actions/workflows/ci.yml/badge.svg)](https://github.com/emrearmagan/atlas.nvim/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/emrearmagan/atlas.nvim?style=flat-square&color=blue)](LICENSE)
 
 # Atlas.nvim
@@ -18,8 +18,8 @@ A Neovim plugin for managing GitHub/Bitbucket/GitLab PRs and Jira/GitHub/GitLab 
 </p>
 
 <p align="center">
-  <img width="49%" alt="AtlasDiff" src="https://github.com/user-attachments/assets/47e1f9c6-38a5-4bac-90fd-46ae69b7dffc">
-  <img width="49%" alt="Atlas UI" src="https://github.com/user-attachments/assets/9716c643-bae0-427b-a2bd-f5a809dca6cc">
+  <img width="49%" alt="AtlasDiff" src="https://github.com/user-attachments/assets/d6de618b-0eef-4546-b33d-f21ad3bc4fc3">
+  <img width="49%" alt="Atlas UI" src="https://github.com/user-attachments/assets/8b570bb3-d073-4ab0-99fc-2d9179e173cd">
 </p>
 
 ## Table of Contents
@@ -28,21 +28,29 @@ A Neovim plugin for managing GitHub/Bitbucket/GitLab PRs and Jira/GitHub/GitLab 
   - [Using lazy.nvim](#using-lazynvim)
   - [Using packer.nvim](#using-packernvim)
 - [Requirements](#requirements)
+- [Configuration](#configuration)
 - [Commands](#commands)
 - [Pulls](#pulls)
   - [Configuration](#pulls-configuration)
     - [GitHub](#github)
     - [Bitbucket](#bitbucket)
     - [GitLab](#gitlab)
-  - [Review Pulls](#review-pulls)
-  - [Create Pulls](#create-pulls)
 - [Issues](#issues)
   - [Configuration](#issue-configuration)
     - [Jira](#jira)
     - [GitHub](#github-issues)
     - [GitLab](#gitlab-issues)
+- [Features](#features)
+  - [Review Pull Requests](#review-pull-requests)
+  - [View Pipelines](#view-pipelines)
+  - [Create Pull Requests](#create-pull-requests)
   - [Create Issues](#create-issues)
+  - [Notifications](#notifications)
+  - [Bookmarks](#bookmarks)
+  - [Custom Actions](#custom-actions)
+- [Events](#events)
 - [Keymaps](#keymaps)
+- [Contributing](#contributing)
 
 ## Installation
 
@@ -55,30 +63,10 @@ A Neovim plugin for managing GitHub/Bitbucket/GitLab PRs and Jira/GitHub/GitLab 
     "nvim-tree/nvim-web-devicons", -- optional but recommended
     "MeanderingProgrammer/render-markdown.nvim", -- optional but recommended
     "esmuellert/codediff.nvim", -- optional (PullRequest diff)
-    "sindrets/diffview.nvim", -- optional (PullRequest diff - alternative)
+    "sindrets/diffview.nvim", -- optional; or "dlyongemallo/diffview-plus.nvim"
   },
-  opts = {
-    pulls = {
-      providers = {
-        ---@type AtlasBitbucketConfig
-        bitbucket = {}, -- See configuration below
-        ---@type AtlasGitHubConfig
-        github = {},    -- See configuration below
-        ---@type AtlasGitLabPullsConfig
-        gitlab = {},    -- See configuration below
-      },
-    },
-    issues = {
-      providers = {
-        ---@type AtlasJiraIssuesConfig
-        jira = {},   -- See configuration below
-        ---@type AtlasGitHubIssuesConfig
-        github = {}, -- See configuration below
-        ---@type AtlasGitLabIssuesConfig
-        gitlab = {}, -- See configuration below
-      },
-    },
-  },
+  -- See Configuration below
+  opts = {},
 }
 ```
 
@@ -88,28 +76,8 @@ A Neovim plugin for managing GitHub/Bitbucket/GitLab PRs and Jira/GitHub/GitLab 
 use {
   "emrearmagan/atlas.nvim",
   config = function()
-    require("atlas").setup({
-      pulls = {
-        providers = {
-          ---@type AtlasBitbucketConfig
-          bitbucket = {}, -- See configuration below
-          ---@type AtlasGitHubConfig
-          github = {},    -- See configuration below
-          ---@type AtlasGitLabPullsConfig
-          gitlab = {},    -- See configuration below
-        },
-      },
-      issues = {
-        providers = {
-          ---@type AtlasJiraIssuesConfig
-          jira = {},   -- See configuration below
-          ---@type AtlasGitHubIssuesConfig
-          github = {}, -- See configuration below
-          ---@type AtlasGitLabIssuesConfig
-          gitlab = {}, -- See configuration below
-        },
-      },
-    })
+    -- See Configuration below
+    require("atlas").setup({})
   end
 }
 ```
@@ -132,6 +100,40 @@ use {
 >
 > I have also not tested with self-hosted GitLab instances, but in theory it should work. If it doesn't, feel free to open an issue. If it does work, please remove this note :)
 
+## Configuration
+
+```lua
+{
+  -- Too lazy to manage a statusline per split? Same. Make it global.
+  global_statusline = true,
+
+  pulls = {
+    -- See Pulls Configuration below.
+    providers = {
+      ---@type AtlasBitbucketConfig
+      bitbucket = {},
+      ---@type AtlasGitHubConfig
+      github = {},
+      ---@type AtlasGitLabPullsConfig
+      gitlab = {},
+    },
+  },
+  issues = {
+    -- See Issue Configuration below.
+    providers = {
+      ---@type AtlasJiraIssuesConfig
+      jira = {},
+      ---@type AtlasGitHubIssuesConfig
+      github = {},
+      ---@type AtlasGitLabIssuesConfig
+      gitlab = {},
+    },
+  },
+}
+```
+
+Set `global_statusline = false` to leave Neovim's `laststatus` option unchanged.
+
 ## Commands
 
 - `:AtlasIssues [provider]` - Open Atlas issues domain
@@ -140,7 +142,7 @@ use {
 - `:AtlasNotes` - Inspect local review notes across pull requests
 - `:AtlasCreatePR` - Create a pull request from the current branch
 - `:AtlasCreateIssue` - Create an issue (GitHub / GitLab / Jira)
-- `:AtlasSearch [provider]` - Pick a configured provider and prompt its search
+- `:AtlasSearch [provider]` - Search configured pull-request and issue providers
 - `:AtlasOpen <target>` - Open a provider URL, Jira key, repository reference, or PR/issue number
 - `:AtlasClearCache` - Clear Atlas disk and memory cache
 - `:AtlasLogs` - Toggle Atlas logs
@@ -154,14 +156,18 @@ Use `:AtlasPulls [provider]` to browse and manage pull requests from GitHub, Bit
 ```lua
 pulls = {
   diff = {
-    -- Command must support explicit <base>...<head> Git revisions.
-    open_cmd = "AtlasDiff", -- default; can be replaced with "DiffviewOpen" / "CodeDiff".
-    layout = "side-by-side", -- "side-by-side" or "inline" for AtlasDiff.
+    -- Any command that accepts explicit <base>...<head> Git revisions.
+    open_cmd = "AtlasDiff", -- default; for example "DiffviewOpen" or "CodeDiff".
+
+    -- AtlasDiff options; external viewers use their own configuration.
+    layout = "inline", -- "inline" or "side-by-side".
     compact = true, -- Start with only changed hunks and surrounding context visible.
+    compact_context_lines = 3, -- Context lines shown around hunks in compact mode.
+    show_review_panel = false, -- Set true to show comments and notes when AtlasDiff opens.
     explorer = {
       grouped = true, -- Group changed files by directory.
       hidden = false,
-      show_commits = true, -- Initially show commits below changed files.
+      show_commits = false, -- Set true to show commits below changed files initially.
       width = 40,
       initial_focus = "explorer", -- "explorer" or "diff".
       ignore = { ".git/**", ".jj/**" },
@@ -184,10 +190,10 @@ pulls = {
 },
 ```
 
-#### GitHub
+<a id="github"></a>
 
 <details>
-<summary><strong>Configuration</strong></summary>
+<summary><strong>GitHub</strong></summary>
 
 ```lua
 pulls = {
@@ -231,14 +237,14 @@ pulls = {
 },
 ```
 
-<img alt="GitHub pull requests" src="https://github.com/user-attachments/assets/9716c643-bae0-427b-a2bd-f5a809dca6cc">
+<img alt="GitHub pull requests" src="https://github.com/user-attachments/assets/8b570bb3-d073-4ab0-99fc-2d9179e173cd">
 
 </details>
 
-#### Bitbucket
+<a id="bitbucket"></a>
 
 <details>
-<summary><strong>Configuration</strong></summary>
+<summary><strong>Bitbucket</strong></summary>
 
 ```lua
 pulls = {
@@ -284,10 +290,10 @@ pulls = {
 
 </details>
 
-#### GitLab
+<a id="gitlab"></a>
 
 <details>
-<summary><strong>Configuration</strong></summary>
+<summary><strong>GitLab</strong></summary>
 
 Auth uses a [Personal Access Token](https://docs.gitlab.com/ee/user/profile/personal_access_tokens.html) with the `api` scope. Set `base_url` to `https://gitlab.com` or your self-hosted instance.
 
@@ -343,118 +349,6 @@ pulls = {
 
 </details>
 
-### Review Pulls
-
-<details>
-<summary><strong>Details</strong></summary>
-
-Press the configured `pulls.open_diff` key (`gd` by default) on a pull request to start a review.
-
-<p align="center">
-  <img alt="AtlasDiff review" src="https://github.com/user-attachments/assets/47e1f9c6-38a5-4bac-90fd-46ae69b7dffc">
-</p>
-
-- See pending, resolved, and outdated provider threads at their diff locations.
-- Review provider tasks and GitHub checklists alongside the comments they belong to.
-- Add, reply to, edit, delete, resolve, or reopen comments when supported.
-
-> [!NOTE]
-> **Alternative viewers:** CodeDiff can display Atlas comment and task overlays, but the integration relies on CodeDiff internals and may break after upstream changes. I used it from my dotfiles for a while before moving it into Atlas. Diffview remains available as a plain diff viewer without Atlas review overlays since i dont use that plugin.
-
-#### Local notes
-
-Local notes let you leave something on a diff without posting it to the pull request. Each note is attached to a file and line and can be an `ISSUE`, `SUGGESTION`, `NOTE`, or `PRAISE`. If that line changes, Atlas shows the note as outdated. If the location no longer exists, Atlas removes it. `:AtlasNotes` lists your notes across all pull requests.
-
-For scripts, use `bin/atlas-notes`. Notes added there appear in AtlasDiff and `:AtlasNotes`:
-
-```sh
-./bin/atlas-notes add \
-  --target https://github.com/owner/repository/pull/123 \
-  --file lua/review_queue.lua --line 19 \
-  --context "local item = queue[index]" \
-  --type suggestion --body "Should this be a bool?"
-```
-
-My dotfiles include a [Pi extension that wraps this script](https://github.com/emrearmagan/dotfiles/blob/main/config/pi/extensions/atlas-notes.ts) so review agents can list and add notes.
-
-</details>
-
-### Create Pulls
-
-<details>
-<summary><strong>Details</strong></summary>
-
-Run `:AtlasCreatePR` on the branch you want to submit. The current branch is used as the source and the repository's default branch as the target. The latest commit supplies the initial title. A configured pull request template supplies the description; without one, Atlas builds it from the branch commits.
-
-Before creating the pull request, you can change the target branch, reviewers, and draft state. The commits and diffstat are shown below the editor, and the diff can be previewed from there.
-
-<p align="center">
-  <img alt="Create pull request" src="https://github.com/user-attachments/assets/bac9afe8-042b-4b0c-8037-86f828694b13">
-</p>
-
-</details>
-
-### Custom Actions
-
-<details>
-<summary><strong>Example</strong></summary>
-
-You can add custom PR actions under `pulls.custom_actions`.
-
-Context type:
-
-```lua
----@class AtlasPullsCustomActionContext
----@field repo_path string|nil
----@field pr PullRequest
-```
-
-Example:
-
-```lua
-pulls = {
-  repo_config = {
-    paths = {
-      ["your-workspace/*"] = "~/code/repos/*",
-    },
-    settings = {},
-  },
-  custom_actions = {
-    {
-      id = "open_tmux_window",
-      label = "Open repo in tmux window",
-      confirmation = true, -- present a confirmation prompt before running the action
-      ---@param pr PullRequest
-      ---@param ctx AtlasPullsCustomActionContext
-      ---@param done fun(ok: boolean|nil, message: string|nil)
-      run = function(_, ctx, done)
-        if not ctx.repo_path then
-          done(false, "No repo path")
-          return
-        end
-
-        vim.system({ "tmux", "new-window", "-c", ctx.repo_path }, { text = true }, function(res)
-          vim.schedule(function()
-            if res.code ~= 0 then
-              done(false, "Failed to open tmux window")
-              return
-            end
-            done(true, "Opened tmux window")
-          end)
-        end)
-      end,
-    },
-  },
-  providers = {
-    ...,
-  },
-}
-```
-
-![CleanShot2026-03-31at20 08 06-ezgif com-video-to-gif-converter](https://github.com/user-attachments/assets/a8ca355b-09e2-428c-b3fb-3280fd161110)
-
-</details>
-
 ## Issues
 
 Use `:AtlasIssues [provider]` to browse and manage Jira, GitHub, and GitLab issues.
@@ -469,10 +363,10 @@ issues = {
 }
 ```
 
-#### Jira
+<a id="jira"></a>
 
 <details>
-<summary><strong>Configuration</strong></summary>
+<summary><strong>Jira</strong></summary>
 
 > [!NOTE]
 > If you're only looking for Jira support, check out https://github.com/letieu/jira.nvim. This plugin was the main inspiration for this project.
@@ -550,10 +444,10 @@ issues = {
 
 </details>
 
-#### GitHub Issues
+<a id="github-issues"></a>
 
 <details>
-<summary><strong>Configuration</strong></summary>
+<summary><strong>GitHub Issues</strong></summary>
 
 ```lua
 issues = {
@@ -598,10 +492,10 @@ issues = {
 
 </details>
 
-#### GitLab Issues
+<a id="gitlab-issues"></a>
 
 <details>
-<summary><strong>Configuration</strong></summary>
+<summary><strong>GitLab Issues</strong></summary>
 
 Auth uses a [Personal Access Token](https://docs.gitlab.com/ee/user/profile/personal_access_tokens.html) with the `api` scope. Set `base_url` to `https://gitlab.com` or your self-hosted instance.
 
@@ -653,39 +547,141 @@ issues = {
 
 </details>
 
+## Features
+
+Atlas keeps the pull request and issue workflows you use throughout the day inside Neovim.
+
+### Review Pull Requests
+
+<img width="100%" alt="AtlasDiff review" src="https://github.com/user-attachments/assets/d6de618b-0eef-4546-b33d-f21ad3bc4fc3">
+
+Press the configured `pulls.open_diff` key (`gd` by default) on a pull request to start a review.
+
+- See pending, resolved, and outdated provider threads at their diff locations.
+- Review provider tasks and GitHub checklists alongside the comments they belong to.
+- Add, reply to, edit, delete, resolve, or reopen comments when supported.
+- Browse provider comments and local notes in AtlasDiff's bottom list; use `za` to expand an item.
+- Submit pending comments with an optional review summary when supported.
+
+> [!NOTE]
+> **Alternative viewers:** CodeDiff, [Diffview](https://github.com/sindrets/diffview.nvim), and [Diffview-plus](https://github.com/dlyongemallo/diffview-plus.nvim) can display Atlas comment, task, and local-note overlays, but their integrations rely on plugin internals and may break after upstream changes.
+
+#### Local notes
+
+<img align="left" width="54%" hspace="16" vspace="8" alt="Local review notes" src="https://github.com/user-attachments/assets/8652d731-b57f-45f8-896e-d62d0ec8d7f4">
+
+Local notes let you leave something on a diff without posting it to the pull request. Each note is attached to a file and line and can be an `ISSUE`, `SUGGESTION`, `NOTE`, or `PRAISE`. Diff views mark notes as outdated when their saved line changes.
+
+<br clear="both">
+
+For scripts, use `bin/atlas-notes`. Notes added there appear in AtlasDiff, CodeDiff, Diffview, Diffview-plus, and `:AtlasNotes`:
+
+```sh
+./bin/atlas-notes add \
+  --target https://github.com/owner/repository/pull/123 \
+  --file lua/review_queue.lua --line 19 \
+  --context "local item = queue[index]" \
+  --type suggestion --body "Should this be a bool?"
+```
+
+My dotfiles include a [Pi extension that wraps this script](https://github.com/emrearmagan/dotfiles/blob/main/config/pi/extensions/atlas-notes.ts) so review agents can list and add notes.
+
+### View Pipelines
+
+<img align="left" width="54%" hspace="16" vspace="8" alt="View pipelines" src="https://github.com/user-attachments/assets/c625c4e8-b1ad-4772-b46b-24718ba6fbb7">
+
+View pipelines and their jobs, inspect their status, and read job logs directly in Atlas. Retry failed pipelines or jobs and cancel work that is still running.
+
+<br clear="both">
+
+### Create Pull Requests
+
+<img align="right" width="54%" hspace="16" vspace="8" alt="Create pull request" src="https://github.com/user-attachments/assets/d6335c66-35f7-4495-b83a-53819d7ec7d5">
+
+`:AtlasCreatePR` opens the pull request form for the current branch. The newest commit supplies the title. Atlas first reads the configured `pr_template`, or `.github/pull_request_template.md` by default.
+
+Without a template, Atlas groups conventional commits into sections, recognizes leading Jira keys such as `[JIRA-123]`, links commit hashes and issue references, collects references under **Related**, and appends the diffstat. If no commits use a conventional prefix, it uses a linked plain commit list instead.
+
+Edit the title and description, choose the target branch and reviewers, set the draft state, or preview commits and diffstat before submitting.
+
+<br clear="both">
+
 ### Create Issues
 
-<details>
-<summary><strong>Details</strong></summary>
+<img align="left" width="54%" hspace="16" vspace="8" alt="Create issue" src="https://github.com/user-attachments/assets/8f3b06d8-763d-4e0f-ab93-9c3754065ca3">
 
 `:AtlasCreateIssue` opens the creation flow for the configured issue providers. GitHub and GitLab use the current repository, while Jira uses the configured instance. The forms support Markdown descriptions and provider-specific fields such as labels, assignees, milestones, and Jira issue types.
 
 GitHub, GitLab, and Jira can apply a saved Markdown template or save the current description as a new one. Templates are shared between providers and stored under Neovim's data directory.
 
-<p align="center">
-  <img alt="Create issue" src="https://github.com/user-attachments/assets/b10962ee-d76f-4b79-982e-4d328b0a5153">
-</p>
+<br clear="both">
 
-</details>
+### Notifications
+
+<img align="right" width="54%" hspace="16" vspace="8" alt="Notifications" src="https://github.com/user-attachments/assets/117b5ad7-3840-4487-bd91-f2f9bf213428">
+
+Open GitHub and GitLab notifications inside Atlas, refresh them, open the related item, and mark notifications as read or done without leaving Neovim.
+
+Keep the work that needs your attention visible.
+
+<br clear="both">
+
+### Bookmarks
+
+<img align="left" width="54%" hspace="16" vspace="8" alt="Bookmarks" src="https://github.com/user-attachments/assets/f008d6af-dfc6-4b65-8af1-94cd6ce9fc99">
+
+Turn frequently used GitHub and GitLab searches or Jira JQL into named shortcuts. Use bookmarks for review queues, recurring project views, and the searches you return to throughout the day.
+
+Bookmarks appear alongside your configured views, keeping important queries one action away.
+
+<br clear="both">
 
 ### Custom Actions
 
+<img align="right" width="54%" hspace="16" vspace="8" alt="Atlas custom action" src="https://github.com/user-attachments/assets/a8ca355b-09e2-428c-b3fb-3280fd161110">
+
+Add project-specific actions to pull requests and issues. Custom actions receive the current item and provider context, making it possible to call local scripts, open repositories in tmux, copy branch names, or connect Atlas to your own tooling.
+
+<br clear="both">
+
 <details>
-<summary><strong>Example</strong></summary>
-
-You can add custom issue actions under `issues.custom_actions`.
-
-Context type:
+<summary><strong>Configuration</strong></summary>
 
 ```lua
----@class AtlasIssuesCustomActionContext
----@field issue Issue|nil
----@field user IssueUser|nil
-```
+pulls = {
+  repo_config = {
+    paths = {
+      ["your-workspace/*"] = "~/code/repos/*",
+    },
+    settings = {},
+  },
+  custom_actions = {
+    {
+      id = "open_tmux_window",
+      label = "Open repo in tmux window",
+      confirmation = true,
+      ---@param pr PullRequest
+      ---@param ctx AtlasPullsCustomActionContext
+      ---@param done fun(ok: boolean|nil, message: string|nil)
+      run = function(_, ctx, done)
+        if not ctx.repo_path then
+          done(false, "No repo path")
+          return
+        end
 
-Example:
-
-```lua
+        vim.system({ "tmux", "new-window", "-c", ctx.repo_path }, { text = true }, function(res)
+          vim.schedule(function()
+            if res.code ~= 0 then
+              done(false, "Failed to open tmux window")
+              return
+            end
+            done(true, "Opened tmux window")
+          end)
+        end)
+      end,
+    },
+  },
+},
 issues = {
   custom_actions = {
     {
@@ -701,10 +697,18 @@ issues = {
       end,
     },
   },
-}
+},
 ```
 
 </details>
+
+## Events
+
+Atlas emits these `User` events after the corresponding cleanup or setup has completed:
+
+- `AtlasUIClosed` for the main pulls/issues dashboard.
+- `AtlasDiffOpened` and `AtlasDiffClosed` for the native AtlasDiff view.
+- `AtlasReviewAttached` and `AtlasReviewDetached` for Atlas review overlays in AtlasDiff, CodeDiff, and Diffview.
 
 ## Keymaps
 
@@ -713,9 +717,14 @@ Set an action to `false` to disable it, or set it to a list to add aliases.
 ```lua
 keymaps = {
   ui = {
-    help = "g?",
+    next_item = "j",
+    previous_item = "k",
+    first_item = "gg",
+    last_item = "G",
+    submit = "<C-s>",
+    help = "g?", -- { "g?", "<leader>?" } would add aliases
     close = "q", -- false would disable it
-    toggle_panel = "p", -- { "p", "k" } would add aliases
+    toggle_panel = "p",
     toggle_fold = "za",
     toggle_all_folds = "zA",
     previous_panel_tab = "<S-Tab>",
@@ -729,12 +738,12 @@ keymaps = {
     refresh_view = "R",
     open_actions = "A",
     open_in_browser = "gx",
+    copy_id = "y",
     copy_url = "Y",
     show_details = "K",
     search = "?",
   },
   issues = {
-    copy_key = "y",
     transition_issue = "gs",
     change_assignee = "ga",
     change_reporter = "gr",
@@ -742,34 +751,53 @@ keymaps = {
     create_issue = "c",
   },
   pulls = {
-    copy_id = "y",
     open_diff = "gd",
     checkout = "gc",
+    edit_title = "T",
     review = {
-      toggle_layout = "t",
-      toggle_compact = "f",
-      next_hunk = "]h",
-      previous_hunk = "[h",
-      next_file = { "]f", "<Tab>" },
-      previous_file = { "[f", "<S-Tab>" },
-      toggle_file_reviewed = "-",
-      toggle_commits = "gC",
-      next_comment = "]c",
-      previous_comment = "[c",
-      next_note = "]n",
-      previous_note = "[n",
-      view_thread = "K",
-      add_pending_comment = "c",
-      add_comment = "C",
-      add_note = "n",
-      toggle_resolved = "x",
+      toggle_approval = "ga",
+      request_changes = "gr",
+      submit_review = "gs",
+      explorer = {
+        focus_file = "<CR>",
+        open_file = "l",
+        next_file = { "]f", "<Tab>" },
+        previous_file = { "[f", "<S-Tab>" },
+        toggle_grouping = "T",
+        toggle_file_reviewed = "-",
+        toggle_commits = "gC",
+      },
+      diff = {
+        toggle_layout = "t",
+        toggle_compact = "u",
+        next_hunk = "]h",
+        previous_hunk = "[h",
+        toggle_review_panel = "gR",
+        next_comment = "]c",
+        previous_comment = "[c",
+        next_note = "]n",
+        previous_note = "[n",
+        add_comment = "c",
+        submit_comment = "C",
+        edit_comment = "e",
+        delete = "dd",
+        add_note = "<leader>n",
+        add_task = "T",
+        toggle_resolved = "x",
+      },
     },
-    filter_status_open = "gpo",
-    filter_status_merged = "gpm",
-    filter_status_declined = "gpd",
+    filters = {
+      open = "gpo",
+      merged = "gpm",
+      declined = "gpd",
+    },
   },
 },
 ```
+
+## Contributing
+
+Contributions are welcome! If you'd like to contribute, please open an [issue](https://github.com/emrearmagan/atlas.nvim/issues) or [pull request](https://github.com/emrearmagan/atlas.nvim/pulls) on GitHub. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Contributors ✨
 
@@ -787,6 +815,11 @@ Thanks go to these wonderful people ([emoji key](https://allcontributors.org/emo
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/eertmanhidde"><img src="https://avatars.githubusercontent.com/u/45388384?v=4?s=100" width="100px;" alt="hiddederidder"/><br /><sub><b>hiddederidder</b></sub></a><br /><a href="#code-eertmanhidde" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/xamcost"><img src="https://avatars.githubusercontent.com/u/24434420?v=4?s=100" width="100px;" alt="Xamcost"/><br /><sub><b>Xamcost</b></sub></a><br /><a href="#code-xamcost" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/niklastreml"><img src="https://avatars.githubusercontent.com/u/27763017?v=4?s=100" width="100px;" alt="Niklas Treml"/><br /><sub><b>Niklas Treml</b></sub></a><br /><a href="#code-niklastreml" title="Code">💻</a> <a href="#bug-niklastreml" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/TheNoeTrevino"><img src="https://avatars.githubusercontent.com/u/144077737?v=4?s=100" width="100px;" alt="Noe Trevino"/><br /><sub><b>Noe Trevino</b></sub></a><br /><a href="#code-TheNoeTrevino" title="Code">💻</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://nuagir.com"><img src="https://avatars.githubusercontent.com/u/35815402?v=4?s=100" width="100px;" alt="Jean-Frederic Mainville"/><br /><sub><b>Jean-Frederic Mainville</b></sub></a><br /><a href="#code-jfmainville" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/23andreas"><img src="https://avatars.githubusercontent.com/u/12485755?v=4?s=100" width="100px;" alt="23andreas"/><br /><sub><b>23andreas</b></sub></a><br /><a href="#code-23andreas" title="Code">💻</a></td>
     </tr>
   </tbody>
 </table>

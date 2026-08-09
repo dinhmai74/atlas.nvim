@@ -7,8 +7,22 @@ local header = require("atlas.ui.components.header")
 local icons = require("atlas.ui.shared.icons")
 local navbar = require("atlas.ui.components.navbar")
 local table_tree = require("atlas.ui.components.table_tree")
+local ui_utils = require("atlas.ui.utils")
 local utils = require("atlas.ui.shared.utils")
-local footer = require("atlas.ui.components.footer")
+local statusline = require("atlas.ui.statusline")
+
+---@param lines string[]
+---@param text string
+---@param width integer
+---@param height integer
+local function append_centered_loading(lines, text, width, height)
+	local available_height = math.max(1, height - #lines)
+	for _ = 1, math.max(0, math.floor((available_height - 1) / 2)) do
+		table.insert(lines, "")
+	end
+	local centered = ui_utils.center_text(text, width)
+	table.insert(lines, centered)
+end
 
 ---@param lines string[]
 ---@param spans table[]
@@ -101,14 +115,18 @@ local function render_header(lines, spans, width)
 	local title = state.provider and state.provider.name or "Atlas"
 	local hl_group = state.provider and state.provider.hl_group or "Title"
 
-	utils.append_block(lines, spans, header.render({
-		width = width,
-		icon = icon,
-		title = title,
-		hl_group = hl_group,
-	}))
+	utils.append_block(
+		lines,
+		spans,
+		header.render({
+			width = width,
+			icon = icon,
+			title = title,
+			hl_group = hl_group,
+		})
+	)
 
-	local views = state.provider and state.provider.views and state.provider.views() or {}
+	local views = state.provider and state.provider.capabilities.core.views() or {}
 	local nav_source = {}
 	for _, v in ipairs(views or {}) do
 		table.insert(nav_source, v)
@@ -147,7 +165,7 @@ local function render_header(lines, spans, width)
 
 	table.insert(actions, { label = "|", hl_group = "AtlasTextMuted" })
 
-	if state.provider and state.provider.fetch_notifications then
+	if state.provider and state.provider.capabilities.notifications then
 		local notif_state = require("atlas.ui.notifications.state")
 		local icons_mod = require("atlas.ui.shared.icons")
 		local count = notif_state.unread_count or 0
@@ -167,12 +185,16 @@ local function render_header(lines, spans, width)
 		hl_group = "AtlasTextMuted",
 	})
 
-	utils.append_block(lines, spans, navbar.render({
-		width = width,
-		items = nav_items,
-		actions = actions,
-		active_hl = state.provider and state.provider.hl_group or "Title",
-	}))
+	utils.append_block(
+		lines,
+		spans,
+		navbar.render({
+			width = width,
+			items = nav_items,
+			actions = actions,
+			active_hl = state.provider and state.provider.hl_group or "Title",
+		})
+	)
 end
 
 ---@param opts { width: integer, height: integer }
@@ -180,6 +202,8 @@ end
 function M.render(opts)
 	local lines, spans = {}, {}
 	local line_map = {}
+	local loading_text = string.format("%s Loading...", state.reload_spinner_frame or "⠋")
+	statusline.set_items(helper.build_statusline_items(state.pulls, state.current_user))
 
 	render_header(lines, spans, opts.width)
 	table.insert(lines, "")
@@ -201,12 +225,13 @@ function M.render(opts)
 			})
 		elseif state.is_loading then
 			table.insert(lines, "")
-			table.insert(lines, "Loading...")
+			append_centered_loading(lines, loading_text, opts.width, opts.height)
 		elseif state.pulls and #state.pulls > 0 then
 			table.insert(lines, "")
 			local body_lines, body_spans, body_map
-			if state.provider and state.provider.render then
-				local result = state.provider.render(state.pulls, "plain", { width = opts.width })
+			local ui = state.provider and state.provider.capabilities.ui
+			if ui and ui.render then
+				local result = ui.render(state.pulls, "plain", { width = opts.width })
 				body_lines, body_spans, body_map = result.lines, result.spans, result.line_map
 			else
 				body_lines, body_spans, body_map = build_plain_singleline_content(opts, state.pulls)
@@ -233,14 +258,15 @@ function M.render(opts)
 			},
 		})
 	elseif state.is_loading then
-		table.insert(lines, "Loading...")
+		append_centered_loading(lines, loading_text, opts.width, opts.height)
 	else
 		local layout = state.active_view and state.active_view.layout or "compact"
 		local groups = state.pulls or {}
 		local body_lines, body_spans, body_map
 
-		if state.provider and state.provider.render then
-			local result = state.provider.render(groups, layout, { width = opts.width })
+		local ui = state.provider and state.provider.capabilities.ui
+		if ui and ui.render then
+			local result = ui.render(groups, layout, { width = opts.width })
 			body_lines, body_spans, body_map = result.lines, result.spans, result.line_map
 		elseif layout == "plain" then
 			body_lines, body_spans, body_map = build_plain_singleline_content(opts, groups)
@@ -253,8 +279,6 @@ function M.render(opts)
 		for lnum, node in pairs(body_map) do
 			line_map[body_base + lnum] = node
 		end
-
-		footer.set_items(helper.build_footer_items(groups, state.current_user))
 	end
 
 	return lines, spans, line_map

@@ -1,6 +1,6 @@
 local M = {}
 
-local service = require("atlas.pulls.providers.gitlab.api.service")
+local service = require("atlas.providers.gitlab.client").pulls
 local mapper = require("atlas.pulls.providers.gitlab.api.mapper")
 
 ---@param params table<string, any>
@@ -138,7 +138,7 @@ function M.get_project_labels(project_path, opts, on_done)
 	})
 end
 
----@param pr PullRequest
+---@param pr PullRequestRef
 ---@param opts { force_load?: boolean, force_refresh?: boolean }|nil
 ---@param on_done fun(pr: PullRequest|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
@@ -400,6 +400,22 @@ function M.approve(pr, on_done)
 		bust_caches(pr)
 		on_done(true, nil)
 	end)
+end
+
+---@param pr PullRequest
+---@param body string
+---@param on_done fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.submit_review(pr, body, on_done)
+	return require("atlas.pulls.providers.gitlab.api.comments").publish_review(pr, nil, body, on_done)
+end
+
+---@param pr PullRequest
+---@param body string
+---@param on_done fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.request_changes(pr, body, on_done)
+	return require("atlas.pulls.providers.gitlab.api.comments").publish_review(pr, "requested_changes", body, on_done)
 end
 
 ---@param pr PullRequest

@@ -1,11 +1,11 @@
 local M = {}
 
 local icons = require("atlas.ui.shared.icons")
-local footer = require("atlas.ui.components.footer")
+local statusline = require("atlas.ui.statusline")
 local multi_select = require("atlas.ui.popups.multi_select")
 local mr_api = require("atlas.pulls.providers.gitlab.api.mergerequests")
 local users_api = require("atlas.pulls.providers.gitlab.api.users")
-local service = require("atlas.pulls.providers.gitlab.api.service")
+local service = require("atlas.providers.gitlab.client").pulls
 
 ---@param ctx GitLabPullsActionContext
 ---@return boolean
@@ -55,6 +55,15 @@ local function is_open_or_draft(ctx)
 	return has_pr(ctx) and (ctx.pr.state == "open" or ctx.pr.state == "draft")
 end
 
+---@param ctx GitLabPullsActionContext
+---@param level "loading"|"success"|"warn"|"error"|"info"
+---@param message string
+---@param duration integer|nil
+local function notify(ctx, level, message, duration)
+	local callback = ctx.notify or statusline.notify
+	callback(level, message, duration)
+end
+
 local ACTIONS = {
 	{
 		id = "toggle_approval",
@@ -67,37 +76,73 @@ local ACTIONS = {
 		end,
 		run = function(ctx, done)
 			local pr = ctx.pr
-			footer.notify("loading", string.format("Checking approval for %s...", pr_label(pr)))
+			notify(ctx, "loading", string.format("Checking approval for %s...", pr_label(pr)))
 			mr_api.get_approval_state(pr, function(approved, err)
 				if err then
-					footer.notify("error", err)
+					notify(ctx, "error", err)
 					done(nil, err)
 					return
 				end
 
 				if approved then
-					footer.notify("loading", string.format("Unapproving %s...", pr_label(pr)))
+					notify(ctx, "loading", string.format("Unapproving %s...", pr_label(pr)))
 					mr_api.unapprove(pr, function(ok, unapprove_err)
 						if not ok then
-							footer.notify("error", unapprove_err or "Unapprove failed")
+							notify(ctx, "error", unapprove_err or "Unapprove failed")
 							done(nil, unapprove_err or "Unapprove failed")
 							return
 						end
-						footer.notify("success", string.format("Unapproved %s", pr_label(pr)), 1200)
+						notify(ctx, "success", string.format("Unapproved %s", pr_label(pr)), 1200)
 						done({ changed_pr = true, message = "Unapproved" }, nil)
 					end)
 				else
-					footer.notify("loading", string.format("Approving %s...", pr_label(pr)))
+					notify(ctx, "loading", string.format("Approving %s...", pr_label(pr)))
 					mr_api.approve(pr, function(ok, approve_err)
 						if not ok then
-							footer.notify("error", approve_err or "Approve failed")
+							notify(ctx, "error", approve_err or "Approve failed")
 							done(nil, approve_err or "Approve failed")
 							return
 						end
-						footer.notify("success", string.format("Approved %s", pr_label(pr)), 1200)
+						notify(ctx, "success", string.format("Approved %s", pr_label(pr)), 1200)
 						done({ changed_pr = true, message = "Approved" }, nil)
 					end)
 				end
+			end)
+		end,
+	},
+	{
+		id = "request_changes",
+		label = "Request changes",
+		is_available = function(ctx)
+			if not is_open_or_draft(ctx) then
+				return false, "MR is not open"
+			end
+			return true, nil
+		end,
+		run = function(ctx, done)
+			local pr = ctx.pr
+			vim.ui.input({ prompt = "Reason for requesting changes: " }, function(input)
+				if input == nil then
+					done({ changed_pr = false, message = "Cancelled" }, nil)
+					return
+				end
+
+				local body = vim.trim(input)
+				if body == "" then
+					body = "Changes requested"
+				end
+
+				notify(ctx, "loading", "Requesting changes...")
+				mr_api.request_changes(pr, body, function(ok, err)
+					if not ok then
+						notify(ctx, "error", "Request changes failed: " .. tostring(err))
+						done(nil, tostring(err))
+						return
+					end
+
+					notify(ctx, "success", "Changes requested", 1200)
+					done({ changed_pr = true, message = "Changes requested" }, nil)
+				end)
 			end)
 		end,
 	},
@@ -124,19 +169,31 @@ local ACTIONS = {
 					return
 				end
 				local squash = vim.trim(tostring(input)):lower() == "y"
-				footer.notify("loading", string.format("Merging %s...", pr_label(pr)))
+				statusline.notify("loading", string.format("Merging %s...", pr_label(pr)))
 				mr_api.merge(pr, {
 					squash = squash,
 					should_remove_source_branch = true,
 				}, function(ok, err)
 					if not ok then
-						footer.notify("error", err or "Merge failed")
+						statusline.notify("error", err or "Merge failed")
 						done(nil, err or "Merge failed")
 						return
 					end
-					footer.notify("success", string.format("Merged %s", pr_label(pr)), 1500)
+					statusline.notify("success", string.format("Merged %s", pr_label(pr)), 1500)
 					done({ changed_pr = true, message = "Merged" }, nil)
 				end)
+			end)
+		end,
+	},
+	{
+		id = "edit_title",
+		label = "Edit title",
+		is_available = function(ctx)
+			return has_pr(ctx), "No MR selected"
+		end,
+		run = function(ctx, done)
+			require("atlas.pulls.actions").edit_title(ctx.pr, mr_api.set_title, function(changed)
+				done({ changed_pr = changed, message = changed and "Title updated" or nil }, nil)
 			end)
 		end,
 	},
@@ -151,14 +208,14 @@ local ACTIONS = {
 		end,
 		run = function(ctx, done)
 			local pr = ctx.pr
-			footer.notify("loading", string.format("Closing %s...", pr_label(pr)))
+			statusline.notify("loading", string.format("Closing %s...", pr_label(pr)))
 			mr_api.set_state(pr, "close", function(ok, err)
 				if not ok then
-					footer.notify("error", err or "Close failed")
+					statusline.notify("error", err or "Close failed")
 					done(nil, err or "Close failed")
 					return
 				end
-				footer.notify("success", string.format("Closed %s", pr_label(pr)), 1200)
+				statusline.notify("success", string.format("Closed %s", pr_label(pr)), 1200)
 				done({ changed_pr = true, message = "Closed" }, nil)
 			end)
 		end,
@@ -177,14 +234,14 @@ local ACTIONS = {
 		end,
 		run = function(ctx, done)
 			local pr = ctx.pr
-			footer.notify("loading", string.format("Reopening %s...", pr_label(pr)))
+			statusline.notify("loading", string.format("Reopening %s...", pr_label(pr)))
 			mr_api.set_state(pr, "reopen", function(ok, err)
 				if not ok then
-					footer.notify("error", err or "Reopen failed")
+					statusline.notify("error", err or "Reopen failed")
 					done(nil, err or "Reopen failed")
 					return
 				end
-				footer.notify("success", string.format("Reopened %s", pr_label(pr)), 1200)
+				statusline.notify("success", string.format("Reopened %s", pr_label(pr)), 1200)
 				done({ changed_pr = true, message = "Reopened" }, nil)
 			end)
 		end,
@@ -204,14 +261,14 @@ local ACTIONS = {
 		run = function(ctx, done)
 			local pr = ctx.pr
 			local new_title = "Draft: " .. strip_draft_prefix(pr.title)
-			footer.notify("loading", string.format("Marking %s as draft...", pr_label(pr)))
+			statusline.notify("loading", string.format("Marking %s as draft...", pr_label(pr)))
 			mr_api.set_title(pr, new_title, function(ok, err)
 				if not ok then
-					footer.notify("error", err or "Failed")
+					statusline.notify("error", err or "Failed")
 					done(nil, err or "Failed")
 					return
 				end
-				footer.notify("success", "Marked as draft", 1200)
+				statusline.notify("success", "Marked as draft", 1200)
 				done({ changed_pr = true, message = "Marked as draft" }, nil)
 			end)
 		end,
@@ -235,14 +292,14 @@ local ACTIONS = {
 				done(nil, "MR title is empty after stripping draft prefix")
 				return
 			end
-			footer.notify("loading", string.format("Marking %s ready for review...", pr_label(pr)))
+			statusline.notify("loading", string.format("Marking %s ready for review...", pr_label(pr)))
 			mr_api.set_title(pr, new_title, function(ok, err)
 				if not ok then
-					footer.notify("error", err or "Failed")
+					statusline.notify("error", err or "Failed")
 					done(nil, err or "Failed")
 					return
 				end
-				footer.notify("success", "Marked as ready", 1200)
+				statusline.notify("success", "Marked as ready", 1200)
 				done({ changed_pr = true, message = "Marked as ready" }, nil)
 			end)
 		end,
@@ -264,14 +321,14 @@ local ACTIONS = {
 				return
 			end
 
-			footer.notify("loading", "Loading members...")
+			statusline.notify("loading", "Loading members...")
 			users_api.list_members(path, "", function(members, err)
 				if err or members == nil then
-					footer.notify("error", err or "Failed to load members")
+					statusline.notify("error", err or "Failed to load members")
 					done(nil, err or "Failed to load members")
 					return
 				end
-				footer.notify("info", "", 0)
+				statusline.clear_notice()
 				if #members == 0 then
 					done(nil, "No assignable members")
 					return
@@ -331,15 +388,15 @@ local ACTIONS = {
 							return
 						end
 
-						footer.notify("loading", string.format("Updating reviewers on %s...", pr_label(pr)))
+						statusline.notify("loading", string.format("Updating reviewers on %s...", pr_label(pr)))
 						mr_api.set_reviewer_ids(pr, final_ids, function(ok, set_err)
 							if not ok then
-								footer.notify("error", set_err or "Failed")
+								statusline.notify("error", set_err or "Failed")
 								done(nil, set_err or "Failed")
 								return
 							end
 							local msg = string.format("%d reviewer(s)", #final_ids)
-							footer.notify("success", msg, 1200)
+							statusline.notify("success", msg, 1200)
 							done({ changed_pr = true, message = msg }, nil)
 						end)
 					end,
@@ -364,14 +421,14 @@ local ACTIONS = {
 				return
 			end
 
-			footer.notify("loading", "Loading members...")
+			statusline.notify("loading", "Loading members...")
 			users_api.list_members(path, "", function(members, err)
 				if err or members == nil then
-					footer.notify("error", err or "Failed to load members")
+					statusline.notify("error", err or "Failed to load members")
 					done(nil, err or "Failed to load members")
 					return
 				end
-				footer.notify("info", "", 0)
+				statusline.clear_notice()
 				if #members == 0 then
 					done(nil, "No assignable members")
 					return
@@ -431,15 +488,15 @@ local ACTIONS = {
 							return
 						end
 
-						footer.notify("loading", string.format("Updating assignees on %s...", pr_label(pr)))
+						statusline.notify("loading", string.format("Updating assignees on %s...", pr_label(pr)))
 						mr_api.set_assignee_ids(pr, final_ids, function(ok, set_err)
 							if not ok then
-								footer.notify("error", set_err or "Failed")
+								statusline.notify("error", set_err or "Failed")
 								done(nil, set_err or "Failed")
 								return
 							end
 							local msg = string.format("%d assignee(s)", #final_ids)
-							footer.notify("success", msg, 1200)
+							statusline.notify("success", msg, 1200)
 							done({ changed_pr = true, message = msg }, nil)
 						end)
 					end,
@@ -461,14 +518,14 @@ local ACTIONS = {
 				end
 
 				local query = vim.trim(input)
-				footer.notify("loading", "Searching projects...")
+				statusline.notify("loading", "Searching projects...")
 				local endpoint = string.format(
 					"/projects?search=%s&per_page=20&order_by=last_activity_at",
 					service.url_encode(query)
 				)
 				service.request("GET", endpoint, nil, function(result, err)
 					if err then
-						footer.notify("error", string.format("Search failed: %s", tostring(err)))
+						statusline.notify("error", string.format("Search failed: %s", tostring(err)))
 						done(nil, tostring(err))
 						return
 					end
@@ -482,12 +539,12 @@ local ACTIONS = {
 					end
 
 					if #list == 0 then
-						footer.notify("warn", "No projects found")
+						statusline.notify("warn", "No projects found")
 						done({ changed_pr = false, message = "No projects found" }, nil)
 						return
 					end
 
-					footer.notify("info", string.format("Found %d projects", #list), 1200)
+					statusline.notify("info", string.format("Found %d projects", #list), 1200)
 
 					vim.ui.select(list, {
 						prompt = "Select project",
@@ -507,7 +564,7 @@ local ACTIONS = {
 						}
 
 						local controller = require("atlas.pulls.ui.main.controller")
-						footer.notify("success", string.format("Search view -> %s", project))
+						statusline.notify("success", string.format("Search view -> %s", project))
 						controller.switch_view(search_view)
 						done({ changed_pr = false, message = "Search view switched" }, nil)
 					end)
@@ -538,10 +595,10 @@ local ACTIONS = {
 			end
 			local action = pr.is_subscribed == true and "unsubscribe" or "subscribe"
 			local endpoint = string.format("/projects/%s/merge_requests/%d/%s", service.url_encode(path), iid, action)
-			footer.notify("loading", pr.is_subscribed and "Unsubscribing..." or "Subscribing...")
+			statusline.notify("loading", pr.is_subscribed and "Unsubscribing..." or "Subscribing...")
 			service.request("POST", endpoint, nil, function(result, err)
 				if err then
-					footer.notify("error", tostring(err))
+					statusline.notify("error", tostring(err))
 					done(nil, tostring(err))
 					return
 				end
@@ -550,7 +607,7 @@ local ACTIONS = {
 					subscribed = action == "subscribe"
 				end
 				pr.is_subscribed = subscribed == true
-				footer.notify("success", pr.is_subscribed and "Subscribed" or "Unsubscribed", 1200)
+				statusline.notify("success", pr.is_subscribed and "Subscribed" or "Unsubscribed", 1200)
 				done({ changed_pr = true, message = pr.is_subscribed and "Subscribed" or "Unsubscribed" }, nil)
 			end)
 		end,
@@ -570,9 +627,19 @@ function M.available(ctx)
 		end
 	end
 
-	-- Shared actions (from atlas.pulls.actions): open_diff, checkout
+	-- Shared actions
 	if has_pr(ctx) then
 		local shared_actions = require("atlas.pulls.actions")
+		table.insert(out, {
+			id = "open_pipelines",
+			label = "Open Pipelines",
+			is_available = function()
+				return true, nil
+			end,
+			run = function(action_ctx, done)
+				shared_actions.open_pipelines(action_ctx.pr, done)
+			end,
+		})
 		table.insert(out, {
 			id = "open_diff",
 			label = "Open diff",
@@ -614,7 +681,7 @@ function M.available(ctx)
 					return true, nil
 				end,
 				run = function(action_ctx, done)
-					footer.notify("loading", string.format("Running %s...", tostring(item.label)))
+					statusline.notify("loading", string.format("Running %s...", tostring(item.label)))
 
 					local done_called = false
 					local function custom_done(ok, message)
@@ -624,11 +691,11 @@ function M.available(ctx)
 						done_called = true
 						vim.schedule(function()
 							if ok == false then
-								footer.notify("error", tostring(message or (item.label .. " failed")))
+								statusline.notify("error", tostring(message or (item.label .. " failed")))
 								done(nil, tostring(message or (item.label .. " failed")))
 								return
 							end
-							footer.notify("success", tostring(message or (item.label .. " done")))
+							statusline.notify("success", tostring(message or (item.label .. " done")))
 							done({ changed_pr = false, message = tostring(message or (item.label .. " done")) }, nil)
 						end)
 					end

@@ -3,13 +3,15 @@ local M = {}
 local pullrequests = require("atlas.pulls.providers.bitbucket.api.pullrequests")
 local users_api = require("atlas.pulls.providers.bitbucket.api.users")
 local repositories = require("atlas.pulls.providers.bitbucket.api.repositories")
-local footer = require("atlas.ui.components.footer")
+local statusline = require("atlas.ui.statusline")
 local checkout = require("atlas.core.git.checkout")
 local logger = require("atlas.core.logger")
 
 ---@class BitbucketActionContext
 ---@field pr PullRequest|nil
----@field source "main"|"panel"|nil
+---@field source "main"|"panel"|"diff"|nil
+---@field current_user PullsUser|nil
+---@field notify fun(level: "loading"|"success"|"info"|"warn"|"error", message: string, duration: integer|nil)|nil
 
 ---@class BitbucketActionDef
 ---@field id BitbucketActionId|string
@@ -23,11 +25,33 @@ local function has_pr(ctx)
 	return ctx.pr ~= nil and ctx.pr.id ~= nil
 end
 
+---@param pr PullRequest
+---@param current_user PullsUser
+---@return boolean
+local function is_approved(pr, current_user)
+	for _, participant in ipairs(pr._raw.participants or {}) do
+		local user = participant.user or {}
+		if tostring(user.account_id or user.uuid or "") == current_user.id then
+			return participant.approved == true or participant.state == "approved"
+		end
+	end
+	return false
+end
+
+---@param ctx BitbucketActionContext
+---@param level "loading"|"success"|"warn"|"error"|"info"
+---@param message string
+---@param duration integer|nil
+local function notify(ctx, level, message, duration)
+	local callback = ctx.notify or statusline.notify
+	callback(level, message, duration)
+end
+
 ---@type BitbucketActionDef[]
 local ACTIONS = {
 	{
-		id = "approve",
-		label = "Approve",
+		id = "toggle_approval",
+		label = "Approve / Unapprove",
 		is_available = function(ctx)
 			if not has_pr(ctx) or ctx.pr == nil then
 				return false, "No PR selected"
@@ -43,17 +67,36 @@ local ACTIONS = {
 				done(nil, "No PR selected")
 				return
 			end
+			if ctx.current_user == nil then
+				notify(ctx, "error", "Current user is unavailable")
+				done(nil, "Current user is unavailable")
+				return
+			end
 
-			footer.notify("loading", "Approving PR...")
-			pullrequests.approve(pr, function(_, err)
-				if err ~= nil then
-					footer.notify("error", string.format("Approve failed: %s", tostring(err)))
-					done(nil, tostring(err))
+			notify(ctx, "loading", "Checking approval...")
+			pullrequests.fetch_pullrequest(pr, { force_load = true }, function(fresh_pr, err)
+				if not fresh_pr then
+					local message = tostring(err or "Unable to load pull request")
+					notify(ctx, "error", message)
+					done(nil, message)
 					return
 				end
 
-				footer.notify("success", "PR approved", 1200)
-				done({ changed_pr = true, message = "Approved" }, nil)
+				local approved = is_approved(fresh_pr, ctx.current_user)
+				local update = approved and pullrequests.unapprove or pullrequests.approve
+				notify(ctx, "loading", approved and "Unapproving PR..." or "Approving PR...")
+				update(fresh_pr, function(_, update_err)
+					if update_err ~= nil then
+						local action = approved and "Unapprove" or "Approve"
+						notify(ctx, "error", string.format("%s failed: %s", action, tostring(update_err)))
+						done(nil, tostring(update_err))
+						return
+					end
+
+					local message = approved and "Unapproved" or "Approved"
+					notify(ctx, "success", "PR " .. message:lower(), 1200)
+					done({ changed_pr = true, message = message }, nil)
+				end)
 			end)
 		end,
 	},
@@ -76,15 +119,15 @@ local ACTIONS = {
 				return
 			end
 
-			footer.notify("loading", "Requesting changes...")
+			notify(ctx, "loading", "Requesting changes...")
 			pullrequests.request_changes(pr, function(_, err)
 				if err ~= nil then
-					footer.notify("error", string.format("Request changes failed: %s", tostring(err)))
+					notify(ctx, "error", string.format("Request changes failed: %s", tostring(err)))
 					done(nil, tostring(err))
 					return
 				end
 
-				footer.notify("success", "Changes requested", 1200)
+				notify(ctx, "success", "Changes requested", 1200)
 				done({ changed_pr = true, message = "Changes requested" }, nil)
 			end)
 		end,
@@ -118,22 +161,34 @@ local ACTIONS = {
 
 				local normalized = vim.trim(tostring(input)):lower()
 				if normalized ~= "y" and normalized ~= "yes" then
-					footer.notify("info", "Merge cancelled")
+					statusline.notify("info", "Merge cancelled")
 					done({ changed_pr = false, message = "Merge cancelled" }, nil)
 					return
 				end
 
-				footer.notify("loading", "Starting Merge...")
+				statusline.notify("loading", "Starting Merge...")
 				pullrequests.merge(pr, {}, function(_, err)
 					if err ~= nil then
-						footer.notify("error", string.format("Merge failed: %s", tostring(err)))
+						statusline.notify("error", string.format("Merge failed: %s", tostring(err)))
 						done(nil, tostring(err))
 						return
 					end
 
-					footer.notify("success", "Merge succeeded", 1200)
+					statusline.notify("success", "Merge succeeded", 1200)
 					done({ changed_pr = true, message = "Merged" }, nil)
 				end)
+			end)
+		end,
+	},
+	{
+		id = "edit_title",
+		label = "Edit title",
+		is_available = function(ctx)
+			return has_pr(ctx), "No PR selected"
+		end,
+		run = function(ctx, done)
+			require("atlas.pulls.actions").edit_title(ctx.pr, pullrequests.update_title, function(changed)
+				done({ changed_pr = changed, message = changed and "Title updated" or nil }, nil)
 			end)
 		end,
 	},
@@ -144,26 +199,26 @@ local ACTIONS = {
 			return true, nil
 		end,
 		run = function(_, done)
-			footer.notify("loading", "Loading workspaces...")
+			statusline.notify("loading", "Loading workspaces...")
 			users_api.fetch_workspaces(function(workspaces, err)
 				if err ~= nil then
-					footer.notify("error", string.format("Failed loading workspaces: %s", tostring(err)))
+					statusline.notify("error", string.format("Failed loading workspaces: %s", tostring(err)))
 					done(nil, tostring(err))
 					return
 				end
 
 				local ws = workspaces or {}
 				if #ws == 0 then
-					footer.notify("warn", "No workspaces found")
+					statusline.notify("warn", "No workspaces found")
 					done({ changed_pr = false, message = "No workspaces found" }, nil)
 					return
 				end
 
-				footer.notify("info", string.format("Loaded %d workspaces", #ws), 1200)
+				statusline.notify("info", string.format("Loaded %d workspaces", #ws), 1200)
 
 				local function continue_with_workspace(selected_ws)
 					if type(selected_ws) ~= "table" or tostring(selected_ws.slug or "") == "" then
-						footer.notify("warn", "Invalid workspace selection")
+						statusline.notify("warn", "Invalid workspace selection")
 						done({ changed_pr = false, message = "Invalid workspace" }, nil)
 						return
 					end
@@ -174,22 +229,22 @@ local ACTIONS = {
 							return
 						end
 
-						footer.notify("loading", "Searching repositories...")
+						statusline.notify("loading", "Searching repositories...")
 						repositories.fetch_workspace_repositories(selected_ws.slug, input, function(repos, repo_err)
 							if repo_err ~= nil then
-								footer.notify("error", string.format("Repo search failed: %s", tostring(repo_err)))
+								statusline.notify("error", string.format("Repo search failed: %s", tostring(repo_err)))
 								done(nil, tostring(repo_err))
 								return
 							end
 
 							local list = repos or {}
 							if #list == 0 then
-								footer.notify("warn", "No repositories found")
+								statusline.notify("warn", "No repositories found")
 								done({ changed_pr = false, message = "No repositories found" }, nil)
 								return
 							end
 
-							footer.notify("info", string.format("Found %d repositories", #list), 1200)
+							statusline.notify("info", string.format("Found %d repositories", #list), 1200)
 
 							vim.ui.select(list, {
 								prompt = "Select repository",
@@ -217,7 +272,7 @@ local ACTIONS = {
 								}
 
 								local controller = require("atlas.pulls.ui.main.controller")
-								footer.notify(
+								statusline.notify(
 									"success",
 									string.format("Search view -> %s", tostring(repo.full_name or repo.name))
 								)
@@ -270,6 +325,16 @@ function M.available(ctx)
 	if has_pr(ctx) then
 		local shared_actions = require("atlas.pulls.actions")
 		table.insert(out, {
+			id = "open_pipelines",
+			label = "Open Pipelines",
+			is_available = function()
+				return true, nil
+			end,
+			run = function(action_ctx, done)
+				shared_actions.open_pipelines(action_ctx.pr, done)
+			end,
+		})
+		table.insert(out, {
 			id = "open_diff",
 			label = "Open diff",
 			is_available = function()
@@ -306,7 +371,7 @@ function M.available(ctx)
 					return true, nil
 				end,
 				run = function(action_ctx, done)
-					footer.notify("loading", string.format("Running %s...", tostring(item.label)))
+					statusline.notify("loading", string.format("Running %s...", tostring(item.label)))
 
 					local done_called = false
 					local function custom_done(ok, message)
@@ -317,12 +382,12 @@ function M.available(ctx)
 
 						vim.schedule(function()
 							if ok == false then
-								footer.notify("error", tostring(message or (item.label .. " failed")))
+								statusline.notify("error", tostring(message or (item.label .. " failed")))
 								logger.logerror(string.format("Custom action failed: %s", tostring(message)))
 								done(nil, tostring(message or (item.label .. " failed")))
 								return
 							end
-							footer.notify("success", tostring(message or (item.label .. " done")))
+							statusline.notify("success", tostring(message or (item.label .. " done")))
 							done({ changed_pr = false, message = tostring(message or (item.label .. " done")) }, nil)
 						end)
 					end

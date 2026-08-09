@@ -1,6 +1,8 @@
 local actions = require("atlas.pulls.notes.ui.actions")
+local icons = require("atlas.ui.shared.icons")
 local keymaps = require("atlas.pulls.notes.ui.keymaps")
 local notes = require("atlas.pulls.notes")
+local notify = require("atlas.core.notify")
 local renderer = require("atlas.pulls.notes.ui.renderer")
 
 local M = {}
@@ -17,6 +19,7 @@ local namespace = vim.api.nvim_create_namespace("atlas.notes")
 ---@field target_filter AtlasNoteTarget|nil
 ---@field documents AtlasNotesUIManagerDocument[]
 ---@field line_map table<integer, AtlasNotesUIItem>
+---@field expanded table<string, boolean>
 
 ---@type AtlasNotesUIState
 local state = {
@@ -25,13 +28,8 @@ local state = {
 	target_filter = nil,
 	documents = {},
 	line_map = {},
+	expanded = {},
 }
-
----@param message string
----@param level integer|nil
-local function notify(message, level)
-	vim.notify("[Atlas Notes] " .. message, level or vim.log.levels.INFO)
-end
 
 ---@return boolean
 local function valid_buffer()
@@ -43,28 +41,42 @@ local function valid_window()
 	return state.win ~= nil and vim.api.nvim_win_is_valid(state.win)
 end
 
----@return AtlasNotesUIItem|nil
-local function item_at_cursor()
-	if not valid_window() or vim.api.nvim_get_current_buf() ~= state.buf then
-		return nil
-	end
-	return state.line_map[vim.api.nvim_win_get_cursor(state.win)[1]]
-end
-
 local function render()
 	if not valid_buffer() then
 		return
 	end
 
-	local previous = item_at_cursor()
-	local previous_note = previous and previous.note and previous.note.id or nil
-	local previous_target = previous and previous.target.ref or nil
-	local lines, line_map, spans = renderer.render_manager({
+	local selected
+	if valid_window() then
+		local item = state.line_map[vim.api.nvim_win_get_cursor(state.win)[1]]
+		selected = item and item.tree_key or nil
+	end
+	local lines, spans, line_map = renderer.render_manager({
 		documents = state.documents,
 		width = valid_window() and vim.api.nvim_win_get_width(state.win) or vim.o.columns,
 		target_filter = state.target_filter,
+		expanded = state.expanded,
 	})
 	state.line_map = line_map
+	if valid_window() then
+		local note_count = 0
+		for _, document in ipairs(state.documents) do
+			note_count = note_count + #document.notes
+		end
+		local pull_icon = icons.pulls("pr")
+		local note_icon = icons.general("pin")
+		vim.api.nvim_set_option_value(
+			"winbar",
+			string.format(
+				" Atlas Notes %%=%s Pull requests: %d   %s Notes: %d ",
+				pull_icon,
+				#state.documents,
+				note_icon,
+				note_count
+			),
+			{ win = state.win }
+		)
+	end
 	vim.api.nvim_set_option_value("modifiable", true, { buf = state.buf })
 	vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
 	vim.api.nvim_set_option_value("modifiable", false, { buf = state.buf })
@@ -76,17 +88,13 @@ local function render()
 			hl_group = span.hl_group,
 		})
 	end
-
-	if not valid_window() then
-		return
-	end
-	for line, item in pairs(line_map) do
-		if
-			(previous_note and item.note and item.note.id == previous_note)
-			or (not previous_note and previous_target and item.kind == "target" and item.target.ref == previous_target)
-		then
-			vim.api.nvim_win_set_cursor(state.win, { line, 0 })
-			break
+	if selected and valid_window() then
+		for line = 1, #lines do
+			local item = line_map[line]
+			if item and item.tree_key == selected then
+				vim.api.nvim_win_set_cursor(state.win, { line, 0 })
+				break
+			end
 		end
 	end
 end
@@ -110,12 +118,14 @@ local function refresh()
 		local target = state.target_filter
 		local items
 		items, err = notes.list(target)
-		documents = items and #items > 0 and { { target = target, notes = items } } or (items and {} or nil)
+		if items then
+			documents = #items > 0 and { { target = target, notes = items } } or {}
+		end
 	else
 		documents, err = notes.documents()
 	end
 	if not documents then
-		notify(err or "Unable to read notes", vim.log.levels.ERROR)
+		notify.error(err or "Unable to read notes")
 		return
 	end
 	state.documents = documents
@@ -135,7 +145,7 @@ local function ensure_buffer()
 	vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
 	vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
 	vim.api.nvim_set_option_value("filetype", "atlas-notes", { buf = buf })
-	keymaps.register(buf, actions.new(state, refresh))
+	keymaps.register(buf, actions.new(state, refresh, render))
 	vim.api.nvim_create_autocmd("BufWipeout", {
 		buffer = buf,
 		once = true,
@@ -143,6 +153,7 @@ local function ensure_buffer()
 			state.buf = nil
 			state.win = nil
 			state.line_map = {}
+			state.expanded = {}
 		end,
 	})
 	return buf
@@ -157,7 +168,7 @@ function M.open(opts)
 		target, err = notes.resolve_target(opts.target)
 	end
 	if err then
-		notify(err, vim.log.levels.ERROR)
+		notify.error(err)
 		return
 	end
 
@@ -180,6 +191,7 @@ function M.open(opts)
 	vim.api.nvim_set_option_value("wrap", false, { win = state.win })
 	vim.api.nvim_set_option_value("cursorline", true, { win = state.win })
 	vim.api.nvim_set_option_value("winfixheight", true, { win = state.win })
+	vim.api.nvim_set_option_value("foldenable", false, { win = state.win })
 	vim.api.nvim_set_option_value("diff", false, { win = state.win })
 	vim.api.nvim_set_option_value("scrollbind", false, { win = state.win })
 	vim.api.nvim_set_option_value("cursorbind", false, { win = state.win })

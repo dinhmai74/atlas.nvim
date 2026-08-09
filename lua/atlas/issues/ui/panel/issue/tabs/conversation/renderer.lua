@@ -18,6 +18,7 @@ local REPLY_INDENT = "    "
 -- Helpers
 
 ---@param author IssueUser|nil
+---@return string
 local function author_name(author)
 	if author == nil then
 		return "Unknown"
@@ -121,12 +122,16 @@ end
 ---@param comment IssueComment
 ---@param verb "commented"|"replied"
 ---@param width integer
-local function build_comment_sections(comment, verb, width)
+---@param show_actions boolean|nil
+local function build_comment_sections(comment, verb, width, show_actions)
 	local author = author_name(comment.author)
-	local actions = { string.format("%s (c)", icons.general("reply")) }
-	if is_own_comment(comment) then
-		table.insert(actions, string.format("%s (e)", icons.general("edit")))
-		table.insert(actions, string.format("%s (d)", icons.general("delete")))
+	local actions = {}
+	if show_actions ~= false then
+		table.insert(actions, string.format("%s (c)", icons.general("reply")))
+		if is_own_comment(comment) then
+			table.insert(actions, string.format("%s (e)", icons.general("edit")))
+			table.insert(actions, string.format("%s (d)", icons.general("delete")))
+		end
 	end
 
 	local body_lines, body_hl = {}, nil
@@ -165,6 +170,18 @@ local function build_comment_sections(comment, verb, width)
 		reactions = reactions,
 		width = width,
 	})
+end
+
+---@param comment IssueComment
+---@param width integer
+---@return AtlasMarkdownEditorPreview
+function M.render_comment(comment, width)
+	local verb = comment.parent_id and "replied" or "commented"
+	local header, body = build_comment_sections(comment, verb, width, false)
+	local lines, highlights = {}, {}
+	splice(lines, highlights, {}, header.lines, header.spans)
+	splice(lines, highlights, {}, body.lines, body.spans)
+	return { lines = lines, highlights = highlights }
 end
 
 ---@param replies IssueComment[]

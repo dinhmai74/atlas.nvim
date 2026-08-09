@@ -24,8 +24,9 @@ function M.setup(buf, refresh)
 	local tab = require("atlas.pulls.ui.panel.pr.tabs.review")
 	local panel_state = require("atlas.pulls.ui.panel.pr.state")
 	local provider = require("atlas.pulls.state").provider
-	local edit_description = provider and provider.edit_task and "Edit comment / task" or "Edit comment"
-	local delete_description = provider and provider.delete_task and "Delete comment / task" or "Delete comment"
+	local reviews = provider and provider.capabilities.reviews
+	local edit_description = reviews and reviews.edit_task and "Edit comment / task" or "Edit comment"
+	local delete_description = reviews and reviews.delete_task and "Delete comment / task" or "Delete comment"
 
 	local function cursor_entry()
 		local win = layout.win_id("detail")
@@ -36,9 +37,10 @@ function M.setup(buf, refresh)
 		return (panel_state.line_map or {})[lnum]
 	end
 
-	local items = {
-		{
-			key = "c",
+	local items = {}
+	utils.insert_if(
+		items,
+		from_action("pulls.review.diff.submit_comment", {
 			desc = "Reply to comment",
 			opts = { nowait = true, silent = true },
 			callback = function()
@@ -48,9 +50,11 @@ function M.setup(buf, refresh)
 					tab.reply_comment(pr, entry, refresh)
 				end
 			end,
-		},
-		{
-			key = "e",
+		})
+	)
+	utils.insert_if(
+		items,
+		from_action("pulls.review.diff.edit_comment", {
 			desc = edit_description,
 			opts = { nowait = true, silent = true },
 			callback = function()
@@ -60,9 +64,26 @@ function M.setup(buf, refresh)
 					tab.edit_comment(pr, entry, refresh)
 				end
 			end,
-		},
-		{
-			key = "d",
+		})
+	)
+	if reviews and reviews.add_task then
+		utils.insert_if(
+			items,
+			from_action("pulls.review.diff.add_task", {
+				desc = "Add task",
+				opts = { nowait = true, silent = true },
+				callback = function()
+					local pr = panel_state.current_pr
+					if pr then
+						tab.add_task(pr, refresh)
+					end
+				end,
+			})
+		)
+	end
+	utils.insert_if(
+		items,
+		from_action("pulls.review.diff.delete", {
 			desc = delete_description,
 			opts = { nowait = true, silent = true },
 			callback = function()
@@ -72,24 +93,11 @@ function M.setup(buf, refresh)
 					tab.delete_comment(pr, entry, refresh)
 				end
 			end,
-		},
-	}
-	if provider and provider.add_task then
-		table.insert(items, {
-			key = "T",
-			desc = "Add task",
-			opts = { nowait = true, silent = true },
-			callback = function()
-				local pr = panel_state.current_pr
-				if pr then
-					tab.add_task(pr, refresh)
-				end
-			end,
 		})
-	end
+	)
 	utils.insert_if(
 		items,
-		from_action("pulls.review.toggle_resolved", {
+		from_action("pulls.review.diff.toggle_resolved", {
 			desc = "Toggle resolved",
 			opts = { nowait = true, silent = true },
 			callback = function()
@@ -128,7 +136,7 @@ function M.setup(buf, refresh)
 				end
 
 				local entity = entry.entity_kind
-				if entity == "comment" or entity == "comment_summary" or entity == "task" then
+				if entity == "comment" or entity == "task" then
 					local roots = entry.thread_roots or (entry.thread_root and { entry.thread_root }) or {}
 					if state.toggle_threads(roots) then
 						refresh()
@@ -191,7 +199,7 @@ function M.setup(buf, refresh)
 	)
 	utils.insert_if(
 		items,
-		from_action("pulls.review.next_hunk", {
+		from_action("pulls.review.diff.next_hunk", {
 			desc = "Next hunk",
 			opts = { nowait = true, silent = true },
 			callback = function()
@@ -215,7 +223,7 @@ function M.setup(buf, refresh)
 	)
 	utils.insert_if(
 		items,
-		from_action("pulls.review.previous_hunk", {
+		from_action("pulls.review.diff.previous_hunk", {
 			desc = "Previous hunk",
 			opts = { nowait = true, silent = true },
 			callback = function()
@@ -252,17 +260,16 @@ end
 
 ---@param buf integer
 function M.teardown(buf)
-	local items = {
-		{ key = "c" },
-		{ key = "e" },
-		{ key = "d" },
-		{ key = "T" },
-	}
-	utils.insert_if(items, remove_item("pulls.review.toggle_resolved"))
+	local items = {}
+	utils.insert_if(items, remove_item("pulls.review.diff.submit_comment"))
+	utils.insert_if(items, remove_item("pulls.review.diff.edit_comment"))
+	utils.insert_if(items, remove_item("pulls.review.diff.add_task"))
+	utils.insert_if(items, remove_item("pulls.review.diff.delete"))
+	utils.insert_if(items, remove_item("pulls.review.diff.toggle_resolved"))
 	utils.insert_if(items, remove_item("ui.toggle_fold"))
 	utils.insert_if(items, remove_item("ui.toggle_all_folds"))
-	utils.insert_if(items, remove_item("pulls.review.next_hunk"))
-	utils.insert_if(items, remove_item("pulls.review.previous_hunk"))
+	utils.insert_if(items, remove_item("pulls.review.diff.next_hunk"))
+	utils.insert_if(items, remove_item("pulls.review.diff.previous_hunk"))
 	utils.insert_if(items, remove_item("ui.show_details"))
 	help.remove("Panel", items, { buffer = buf })
 end
