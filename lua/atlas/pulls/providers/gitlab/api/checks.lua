@@ -1,274 +1,88 @@
 local M = {}
 
-local providers = require("atlas.pulls.providers")
-local service = require("atlas.providers.gitlab.client").pulls
-local mr_api = require("atlas.pulls.providers.gitlab.api.mergerequests")
+local json = require("atlas.core.json")
+local pipeline_utils = require("atlas.pulls.pipelines.utils")
+local gitlab_pipelines = require("atlas.pulls.providers.gitlab.api.pipelines")
+local service = require("atlas.providers.gitlab.client")
 
----@param pr PullRequest
----@return string project_path, integer|nil iid
-local function project_iid(pr)
-	return pr.repo_full_name, tonumber(pr.id)
-end
+local MERGE_CHECKS_QUERY = [[
+query($path:ID!,$iid:String!){
+  project(fullPath:$path){
+    mergeRequest(iid:$iid){
+      draft
+      detailed_merge_status:detailedMergeStatus
+      blocking_discussions_resolved:mergeableDiscussionsState
+      has_conflicts:conflicts
+      head_pipeline:headPipeline{status}
+    }
+  }
+}
+]]
 
----@param status string|nil
----@return "SUCCESSFUL"|"FAILED"|"INPROGRESS"|"STOPPED"
-local function map_pipeline_state(status)
-	local s = tostring(status or ""):lower()
-	if s == "success" then
-		return "SUCCESSFUL"
-	elseif s == "failed" then
-		return "FAILED"
-	elseif s == "canceled" or s == "skipped" then
-		return "STOPPED"
-	end
-	return "INPROGRESS"
-end
+---@type table<string, PullsMergeCheck>
+local MERGE_STATUS_CHECKS = {
+	merge_request_blocked = {
+		key = "blocks",
+		state = "failed",
+		label = "Merge request dependencies must be merged",
+	},
+	requested_changes = {
+		key = "requested_changes",
+		state = "failed",
+		label = "Change requests must be approved by the requesting user",
+	},
+	not_approved = {
+		key = "approvals",
+		state = "failed",
+		label = "All required approvals must be given",
+	},
+	need_rebase = {
+		key = "rebase",
+		state = "failed",
+		label = "Source branch must be rebased onto target",
+	},
+	jira_association_missing = {
+		key = "jira",
+		state = "failed",
+		label = "Jira issue must be referenced",
+	},
+	external_status_checks = {
+		key = "external_checks",
+		state = "failed",
+		label = "External status checks must pass",
+	},
+	broken_status = {
+		key = "broken",
+		state = "failed",
+		label = "Merge status is broken",
+	},
+	preparing = {
+		key = "preparing",
+		state = "inprogress",
+		label = "Preparing merge",
+	},
+}
 
----@param pr PullRequest
----@param opts { force_refresh: boolean|nil }|nil
----@param on_done fun(pipelines: PullsPipeline[]|nil, err: string|nil)
----@return { cancel: fun() }|nil
-function M.get_pipelines(pr, opts, on_done)
-	opts = opts or {}
-	local path, iid = project_iid(pr)
-	if path == "" or iid == nil then
-		vim.schedule(function()
-			on_done(nil, "Invalid MR identifier")
-		end)
-		return nil
-	end
+---@class GitLabMergeCheckState
+---@field draft boolean
+---@field detailed_merge_status string|nil
+---@field blocking_discussions_resolved boolean|nil
+---@field has_conflicts boolean
+---@field head_pipeline_status string|nil
 
-	local cache_key = string.format("gitlab_pulls:pipelines:%s!%d", path, iid)
-	if not opts.force_refresh then
-		local cached, ok = service.get_memory_cache(cache_key)
-		if ok then
-			on_done(cached, nil)
-			return nil
-		end
-	end
-
-	local cancelled = false
-	local handles = {}
-	local function track(handle)
-		if handle then
-			table.insert(handles, handle)
-		end
-	end
-
-	local project = service.url_encode(path)
-	local endpoint = string.format("/projects/%s/merge_requests/%d/pipelines?per_page=100", project, iid)
-	track(service.request("GET", endpoint, nil, function(result, err)
-		if cancelled then
-			return
-		end
-		if err then
-			on_done(nil, err)
-			return
-		end
-
-		local pipelines = {}
-		for _, item in ipairs(type(result) == "table" and result or {}) do
-			if type(item) == "table" then
-				local id = item.id
-				table.insert(pipelines, {
-					name = string.format("Pipeline #%s", tostring(id or "")),
-					state = map_pipeline_state(item.status),
-					provider_state = tostring(item.status or ""),
-					url = type(item.web_url) == "string" and item.web_url or nil,
-					key = id and tostring(id) or nil,
-					provider_id = id and tostring(id) or nil,
-					commit_hash = tostring(item.sha or ""),
-					jobs = {},
-				})
-			end
-		end
-
-		if #pipelines == 0 then
-			service.set_memory_cache(cache_key, pipelines)
-			on_done(pipelines, nil)
-			return
-		end
-
-		local pending = #pipelines
-		local first_err
-		local function finish()
-			if cancelled then
-				return
-			end
-			pending = pending - 1
-			if pending > 0 then
-				return
-			end
-			if first_err then
-				on_done(nil, first_err)
-				return
-			end
-			service.set_memory_cache(cache_key, pipelines)
-			on_done(pipelines, nil)
-		end
-
-		for _, pipeline in ipairs(pipelines) do
-			local pipeline_id = tonumber(pipeline.provider_id)
-			if pipeline_id == nil then
-				finish()
-			else
-				local jobs_endpoint = string.format("/projects/%s/pipelines/%d/jobs?per_page=100", project, pipeline_id)
-				track(service.request("GET", jobs_endpoint, nil, function(jobs, jobs_err)
-					if cancelled then
-						return
-					end
-					if jobs_err then
-						first_err = first_err or tostring(jobs_err)
-					else
-						for _, job in ipairs(type(jobs) == "table" and jobs or {}) do
-							if type(job) == "table" then
-								table.insert(pipeline.jobs, {
-									id = job.id or "",
-									name = tostring(job.name or "Job"),
-									state = map_pipeline_state(job.status),
-									provider_state = tostring(job.status or ""),
-									url = type(job.web_url) == "string" and job.web_url or nil,
-									stage = type(job.stage) == "string" and job.stage or nil,
-									started_at = job.started_at,
-									completed_at = job.finished_at,
-									duration = tonumber(job.duration),
-								})
-							end
-						end
-					end
-					finish()
-				end))
-			end
-		end
-	end))
-
-	return {
-		cancel = function()
-			cancelled = true
-			for _, handle in ipairs(handles) do
-				if type(handle.cancel) == "function" then
-					handle.cancel()
-				end
-			end
-		end,
-	}
-end
-
----@param pr PullRequest
----@param _pipeline PullsPipeline
----@param job PullsPipelineJob
----@param on_done fun(log: string|nil, err: string|nil)
----@return { cancel: fun() }|nil
-function M.get_pipeline_job_log(pr, _pipeline, job, on_done)
-	local path = tostring(pr.repo_full_name or "")
-	local job_id = tonumber(job.id)
-	if path == "" or job_id == nil then
-		vim.schedule(function()
-			on_done(nil, path == "" and "Missing project" or "Missing pipeline job ID")
-		end)
-		return nil
-	end
-
-	local endpoint = string.format("/projects/%s/jobs/%d/trace", service.url_encode(path), job_id)
-	return service.request_text("GET", endpoint, on_done, {
-		action = "Fetch pipeline job log",
-		project = path,
-		job_id = job_id,
-	})
-end
-
----@param pr PullRequest
----@param endpoint string
----@param action string
----@param on_done fun(ok: boolean, err: string|nil)
----@return { cancel: fun() }|nil
-local function post_pipeline_action(pr, endpoint, action, on_done)
-	local path = tostring(pr.repo_full_name or "")
-	if path == "" then
-		on_done(false, "Missing project")
-		return nil
-	end
-	return service.request(
-		"POST",
-		string.format("/projects/%s/%s", service.url_encode(path), endpoint),
-		nil,
-		function(_, err)
-			on_done(err == nil, err)
-		end,
-		{ action = action, project = path }
-	)
-end
-
----@param pr PullRequest
----@param pipeline PullsPipeline
----@param on_done fun(ok: boolean, err: string|nil)
----@return { cancel: fun() }|nil
-function M.retry_pipeline(pr, pipeline, on_done)
-	local pipeline_id = tonumber(pipeline.provider_id)
-	if not pipeline_id then
-		on_done(false, "Missing pipeline ID")
-		return nil
-	end
-	return post_pipeline_action(pr, string.format("pipelines/%d/retry", pipeline_id), "Retry pipeline", on_done)
-end
-
----@param pr PullRequest
----@param pipeline PullsPipeline
----@param on_done fun(ok: boolean, err: string|nil)
----@return { cancel: fun() }|nil
-function M.cancel_pipeline(pr, pipeline, on_done)
-	local pipeline_id = tonumber(pipeline.provider_id)
-	if not pipeline_id then
-		on_done(false, "Missing pipeline ID")
-		return nil
-	end
-	return post_pipeline_action(pr, string.format("pipelines/%d/cancel", pipeline_id), "Cancel pipeline", on_done)
-end
-
----@param pr PullRequest
----@param job PullsPipelineJob
----@param action "retry"|"cancel"
----@param on_done fun(ok: boolean, err: string|nil)
----@return { cancel: fun() }|nil
-local function run_job_action(pr, job, action, on_done)
-	local job_id = tonumber(job.id)
-	if not job_id then
-		on_done(false, "Missing pipeline job ID")
-		return nil
-	end
-	local label = action == "retry" and "Retry pipeline job" or "Cancel pipeline job"
-	return post_pipeline_action(pr, string.format("jobs/%d/%s", job_id, action), label, on_done)
-end
-
----@param pr PullRequest
----@param job PullsPipelineJob
----@param on_done fun(ok: boolean, err: string|nil)
----@return { cancel: fun() }|nil
-function M.retry_pipeline_job(pr, job, on_done)
-	return run_job_action(pr, job, "retry", on_done)
-end
-
----@param pr PullRequest
----@param job PullsPipelineJob
----@param on_done fun(ok: boolean, err: string|nil)
----@return { cancel: fun() }|nil
-function M.cancel_pipeline_job(pr, job, on_done)
-	return run_job_action(pr, job, "cancel", on_done)
-end
-
----@param raw table
+---@param state GitLabMergeCheckState
 ---@return PullsMergeCheck[]
-local function parse_merge_checks(raw)
+local function parse_merge_checks(state)
 	local checks = {}
-	local dms = tostring(raw.detailed_merge_status or ""):lower()
-	local has_conflicts = raw.has_conflicts == true
+	local dms = tostring(state.detailed_merge_status or ""):lower()
+	local has_conflicts = state.has_conflicts == true
 
-	if raw.draft == true or raw.work_in_progress == true then
+	if state.draft then
 		table.insert(checks, {
 			key = "draft",
 			state = "warning",
 			label = "This merge request is still a draft",
-			details = { "Draft merge requests cannot be merged." },
+			details = { "Draft merge requests cannot be merged" },
 		})
 	end
 
@@ -277,7 +91,7 @@ local function parse_merge_checks(raw)
 			key = "conflicts",
 			state = "failed",
 			label = "This branch has conflicts that must be resolved",
-			details = { "Conflicting files must be resolved before merging." },
+			details = { "Conflicting files must be resolved before merging" },
 		})
 	elseif dms == "mergeable" then
 		table.insert(checks, {
@@ -287,85 +101,38 @@ local function parse_merge_checks(raw)
 		})
 	end
 
-	if raw.blocking_discussions_resolved == false or dms == "discussions_not_resolved" then
+	if state.blocking_discussions_resolved == false or dms == "discussions_not_resolved" then
 		table.insert(checks, {
 			key = "discussions",
 			state = "failed",
 			label = "Unresolved discussions",
-			details = { "Resolve all threads before merging." },
+			details = { "Resolve all threads before merging" },
 		})
 	end
 
-	if dms == "merge_request_blocked" then
+	local status_check = MERGE_STATUS_CHECKS[dms]
+	if status_check then
 		table.insert(checks, {
-			key = "blocks",
-			state = "failed",
-			label = "Merge request dependencies must be merged",
+			key = status_check.key,
+			state = status_check.state,
+			label = status_check.label,
 		})
 	end
 
-	if dms == "requested_changes" then
-		table.insert(checks, {
-			key = "requested_changes",
-			state = "failed",
-			label = "Change requests must be approved by the requesting user",
-		})
-	end
-
-	if dms == "not_approved" then
-		table.insert(checks, {
-			key = "approvals",
-			state = "failed",
-			label = "All required approvals must be given",
-		})
-	end
-
-	if dms == "need_rebase" then
-		table.insert(checks, {
-			key = "rebase",
-			state = "failed",
-			label = "Source branch must be rebased onto target",
-		})
-	end
-
-	if dms == "jira_association_missing" then
-		table.insert(checks, {
-			key = "jira",
-			state = "failed",
-			label = "Jira issue must be referenced",
-		})
-	end
-
-	if dms == "external_status_checks" then
-		table.insert(checks, {
-			key = "external_checks",
-			state = "failed",
-			label = "External status checks must pass",
-		})
-	end
-
-	if dms == "broken_status" then
-		table.insert(checks, {
-			key = "broken",
-			state = "failed",
-			label = "Merge status is broken",
-		})
-	end
-
-	if dms == "preparing" then
-		table.insert(checks, {
-			key = "preparing",
-			state = "inprogress",
-			label = "Preparing merge",
-		})
-	end
-
-	if dms == "ci_must_pass" or dms == "ci_still_running" then
+	local pipeline_status = state.head_pipeline_status
+	if pipeline_status ~= nil and pipeline_status ~= "" then
+		local pipeline_check = pipeline_utils.to_merge_check({
+			{ state = gitlab_pipelines.to_pipeline_state(pipeline_status) },
+		}, "Pipelines")
+		if pipeline_check then
+			table.insert(checks, pipeline_check)
+		end
+	elseif dms == "ci_must_pass" or dms == "ci_still_running" then
 		table.insert(checks, {
 			key = "ci",
 			state = dms == "ci_still_running" and "inprogress" or "warning",
 			label = "Pipeline must pass",
-			details = { "CI is required to merge." },
+			details = { "CI is required to merge" },
 		})
 	end
 
@@ -376,57 +143,52 @@ end
 ---@param opts { force_refresh: boolean|nil }|nil
 ---@param on_done fun(checks: PullsMergeCheck[]|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
-function M.get_merge_checks(pr, opts, on_done)
-	opts = opts or {}
-	local pending = 2
-	local mr_raw, pipelines_result
-	local first_err
-
-	local function finish()
-		pending = pending - 1
-		if pending > 0 then
-			return
-		end
-		if mr_raw == nil and pipelines_result == nil then
-			on_done(nil, first_err or "Failed to fetch merge checks")
-			return
-		end
-		local checks = parse_merge_checks(mr_raw or {})
-		local bc = providers.pipelines_check(pipelines_result, "Pipelines")
-		if bc then
-			table.insert(checks, bc)
-		end
-		on_done(checks, nil)
+function M.fetch(pr, opts, on_done)
+	local path = tostring(pr.repo_full_name or "")
+	local iid = tonumber(pr.id)
+	if path == "" or iid == nil then
+		on_done(nil, "Invalid MR identifier")
+		return nil
 	end
 
-	local h_mr = mr_api.get_mr(pr, { force_refresh = opts.force_refresh == true }, function(fresh, err)
-		if err then
-			first_err = first_err or err
-		elseif fresh then
-			mr_raw = fresh._raw
+	local cache_key = string.format("gitlab_pulls:merge-checks:%s!%d", path, iid)
+	if not (opts or {}).force_refresh then
+		local cached, ok = service.get_memory_cache(cache_key)
+		if ok then
+			on_done(cached, nil)
+			return nil
 		end
-		finish()
-	end)
+	end
 
-	local h_pipelines = M.get_pipelines(pr, opts, function(result, err)
+	return service.graphql(MERGE_CHECKS_QUERY, { path = path, iid = tostring(iid) }, function(result, err)
 		if err then
-			first_err = first_err or err
-		else
-			pipelines_result = result
+			on_done(nil, err)
+			return
 		end
-		finish()
-	end)
 
-	return {
-		cancel = function()
-			if h_mr and h_mr.cancel then
-				h_mr.cancel()
-			end
-			if h_pipelines and h_pipelines.cancel then
-				h_pipelines.cancel()
-			end
-		end,
-	}
+		local project = json.safe_table(result).project
+		local raw = json.nilify(json.safe_table(project).mergeRequest)
+		if raw == nil then
+			on_done(nil, "Merge request not found")
+			return
+		end
+
+		local discussions_resolved = json.nilify(raw.blocking_discussions_resolved)
+		local head_pipeline = json.nilify(raw.head_pipeline)
+		local checks = parse_merge_checks({
+			draft = raw.draft == true,
+			detailed_merge_status = json.safe_str(raw.detailed_merge_status),
+			blocking_discussions_resolved = discussions_resolved,
+			has_conflicts = raw.has_conflicts == true,
+			head_pipeline_status = head_pipeline and json.safe_str(head_pipeline.status) or nil,
+		})
+		service.set_memory_cache(cache_key, checks)
+		on_done(checks, nil)
+	end, {
+		action = "Fetch MR merge state",
+		project_path = path,
+		iid = iid,
+	})
 end
 
 return M

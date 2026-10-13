@@ -9,9 +9,10 @@ local function normalize_author(raw)
 	if type(raw) == "table" then
 		local username = json.safe_str(raw.username) or "unknown"
 		local name = json.safe_str(raw.name) or ""
+		local id = tostring(raw.id or "")
 		return {
 			name = name ~= "" and name or username,
-			id = tostring(raw.id or ""),
+			id = id:match("([^/]+)$") or id,
 			username = username,
 			nickname = username,
 		}
@@ -19,12 +20,68 @@ local function normalize_author(raw)
 	return { name = "Unknown", id = "", username = "unknown", nickname = "unknown" }
 end
 
+---@param values table
+---@return PullsAuthor[]
+local function normalize_authors(values)
+	local authors = {}
+	for _, raw in ipairs(values) do
+		if type(raw) == "table" then
+			table.insert(authors, normalize_author(raw))
+		end
+	end
+	return authors
+end
+
+---@param values table
+---@return PullsReviewer[]
+local function normalize_reviewers(values)
+	local reviewers = {}
+	for _, raw in ipairs(values) do
+		if type(raw) == "table" then
+			local author = normalize_author(raw)
+			table.insert(reviewers, {
+				id = author.id,
+				provider_id = author.id,
+				name = author.name,
+				username = author.username,
+				nickname = author.nickname,
+				decision = "pending",
+				role = "reviewer",
+			})
+		end
+	end
+	return reviewers
+end
+
+---@param values any
+---@return PullsReviewer[]|nil
+local function normalize_optional_reviewers(values)
+	if json.nilify(values) == nil then
+		return nil
+	end
+	return normalize_reviewers(json.safe_table(values))
+end
+
+---@param values table
+---@return PullsLabel[]
+local function normalize_labels(values)
+	local labels = {}
+	for _, raw in ipairs(values) do
+		local name = type(raw) == "table" and json.safe_str(raw.name) or json.safe_str(raw)
+		if name and name ~= "" then
+			table.insert(labels, {
+				name = name,
+				color = type(raw) == "table" and json.safe_str(raw.color) or nil,
+				text_color = type(raw) == "table" and json.safe_str(raw.text_color) or nil,
+			})
+		end
+	end
+	return labels
+end
+
 ---@param mr table
 ---@return "open"|"merged"|"declined"|"draft"
 local function normalize_state(mr)
-	if mr.draft == true or mr.work_in_progress == true then
-		return "draft"
-	end
 	local s = tostring(mr.state or ""):lower()
 	if s == "merged" then
 		return "merged"
@@ -32,11 +89,14 @@ local function normalize_state(mr)
 	if s == "closed" then
 		return "declined"
 	end
+	if mr.draft == true or mr.work_in_progress == true then
+		return "draft"
+	end
 	return "open"
 end
 
 ---@param raw any Decoded API value.
----@return PullRequest|nil
+---@return GitLabPullRequest|nil
 function M.to_pull_request(raw)
 	raw = json.nilify(raw)
 	if type(raw) ~= "table" then
@@ -48,121 +108,89 @@ function M.to_pull_request(raw)
 		return nil
 	end
 
-	-- references.full looks like "group/proj!7"
+	-- REST references.full and GraphQL reference look like "group/proj!7".
 	local refs = json.nilify(raw.references)
-	local full_ref = type(refs) == "table" and json.safe_str(refs.full) or nil
+	local full_ref = json.safe_str(raw.reference) or (type(refs) == "table" and json.safe_str(refs.full) or nil)
+	local web_url = json.safe_str(raw.web_url) or ""
 	local project_path = ""
 	if full_ref then
 		project_path = full_ref:match("^(.-)!%d+$") or ""
 	end
 	if project_path == "" then
-		local web = json.safe_str(raw.web_url) or ""
-		project_path = web:match("^https?://[^/]+/(.+)/%-/merge_requests/") or ""
+		project_path = web_url:match("^https?://[^/]+/(.+)/%-/merge_requests/") or ""
 	end
 
-	local workspace, repo = project_path:match("^(.*)/([^/]+)$")
-	workspace = workspace or ""
-	repo = repo or project_path
+	local owner, name = project_path:match("^(.*)/([^/]+)$")
+	owner = owner or ""
+	name = name or project_path
 
 	local source_branch = json.safe_str(raw.source_branch) or ""
 	local target_branch = json.safe_str(raw.target_branch) or ""
 	local sha = json.nilify(raw.sha)
+	local diff_refs = json.nilify(raw.diff_refs)
+	local head_sha = type(diff_refs) == "table" and json.safe_str(diff_refs.head_sha) or nil
+	local base_sha = type(diff_refs) == "table" and json.safe_str(diff_refs.base_sha) or nil
 
-	---@type PullRequest
+	---@type GitLabPullRequest
 	return {
 		id = iid,
 		title = json.safe_str(raw.title) or "",
-		description = json.safe_str(raw.description) or "",
 		state = normalize_state(raw),
 		author = normalize_author(raw.author),
 		source = {
 			branch = source_branch,
-			commit_hash = type(sha) == "string" and sha or "",
+			commit_hash = head_sha or (type(sha) == "string" and sha or ""),
 			fetch_ref = string.format("refs/merge-requests/%d/head", iid),
 		},
-		destination = { branch = target_branch, commit_hash = "" },
+		destination = { branch = target_branch, commit_hash = base_sha or "" },
 		comments_count = tonumber(raw.user_notes_count) or 0,
-		tasks_count = 0,
 		created_on = json.safe_str(raw.created_at) or "",
 		updated_on = json.safe_str(raw.updated_at) or "",
-		link = { html = json.safe_str(raw.web_url) or "" },
+		link = { html = web_url },
 		provider = "gitlab",
-		workspace = workspace,
-		repo = repo,
-		repo_full_name = project_path,
-		is_subscribed = type(raw.subscribed) == "boolean" and raw.subscribed or nil,
-		_raw = {
-			iid = iid,
-			project_id = tonumber(raw.project_id),
-			project_path = project_path,
-			merge_status = json.safe_str(raw.merge_status),
-			detailed_merge_status = json.safe_str(raw.detailed_merge_status),
-			blocking_discussions_resolved = json.nilify(raw.blocking_discussions_resolved),
-			has_conflicts = raw.has_conflicts == true,
-			draft = raw.draft == true or raw.work_in_progress == true,
-			labels = json.safe_table(raw.labels),
-			assignees = json.safe_table(raw.assignees),
-			reviewers = json.safe_table(raw.reviewers),
-			milestone = json.nilify(raw.milestone),
-			merged_at = json.safe_str(raw.merged_at),
-			closed_at = json.safe_str(raw.closed_at),
-			sha = type(sha) == "string" and sha or nil,
-			diff_refs = json.nilify(raw.diff_refs),
-			pipeline = json.nilify(raw.head_pipeline) or json.nilify(raw.pipeline),
+		repo = {
+			id = project_path,
+			name = name,
+			owner = owner,
+			repo_name = name,
+			full_name = project_path,
+			html_url = web_url:match("^(.-)/%-/merge_requests/%d+") or "",
 		},
+		repo_full_name = project_path,
+		reviewers = normalize_optional_reviewers(json.safe_table(raw.reviewers).nodes or raw.reviewers),
+		merge_status = json.safe_str(raw.merge_status),
+		detailed_merge_status = json.safe_str(raw.detailed_merge_status),
+		diff_refs = diff_refs,
 	}
-end
-
----@param raw_list table[]|nil
----@return PullsGroup[] groups grouped by repo_full_name
-function M.to_pull_request_groups(raw_list)
-	local by_repo = {}
-	local order = {}
-	for _, raw in ipairs(raw_list or {}) do
-		local pr = M.to_pull_request(raw)
-		if pr ~= nil then
-			local key = pr.repo_full_name ~= "" and pr.repo_full_name or "unknown"
-			if not by_repo[key] then
-				by_repo[key] = {
-					repo = {
-						id = key,
-						name = pr.repo,
-						owner = pr.workspace,
-						repo_name = pr.repo,
-						html_url = nil,
-					},
-					prs = {},
-				}
-				table.insert(order, key)
-			end
-			table.insert(by_repo[key].prs, pr)
-		end
-	end
-
-	local groups = {}
-	for _, key in ipairs(order) do
-		table.insert(groups, by_repo[key])
-	end
-	return groups
 end
 
 ---@param raw any Decoded API value.
----@return PullsUser|nil
-function M.to_user(raw)
-	raw = json.nilify(raw)
-	if type(raw) ~= "table" then
+---@return GitLabPullRequestDetails|nil
+function M.to_pull_request_details(raw)
+	local value = json.nilify(raw)
+	if type(value) ~= "table" then
 		return nil
 	end
-	local username = json.safe_str(raw.username) or ""
-	if username == "" then
-		return nil
-	end
-	local name = json.safe_str(raw.name) or ""
+	---@type GitLabPullRequestDetails
 	return {
-		name = name ~= "" and name or username,
-		id = tostring(raw.id or ""),
-		username = username,
+		description = json.safe_str(value.description) or "",
+		is_subscribed = json.nilify(value.subscribed),
+		assignees = normalize_authors(json.safe_table(json.safe_table(value.assignees).nodes or value.assignees)),
+		labels = normalize_labels(json.safe_table(json.safe_table(value.labels).nodes or value.labels)),
 	}
+end
+
+---@param raw_list table[]
+---@return PullRequest[]
+function M.to_pull_requests(raw_list)
+	local pulls = {}
+	for _, raw in ipairs(json.safe_table(raw_list)) do
+		local pr = M.to_pull_request(raw)
+		if pr then
+			table.insert(pulls, pr)
+		end
+	end
+	return pulls
 end
 
 ---@param user any
@@ -206,6 +234,8 @@ local function to_inline_position(position)
 	local path = json.safe_str(position.new_path) or json.safe_str(position.old_path) or ""
 	local old_line = tonumber(position.old_line)
 	local new_line = tonumber(position.new_line)
+	local line_range = type(position.line_range) == "table" and position.line_range or {}
+	local start = type(line_range.start) == "table" and line_range.start or {}
 	if path == "" or (old_line == nil and new_line == nil) then
 		return nil
 	end
@@ -214,6 +244,9 @@ local function to_inline_position(position)
 		old_path = json.safe_str(position.old_path),
 		from = old_line,
 		to = new_line,
+		start_from = tonumber(start.old_line),
+		start_to = tonumber(start.new_line),
+		commit_hash = json.safe_str(position.head_sha),
 	}
 end
 
@@ -241,30 +274,47 @@ function M.to_comment(note, discussion_first_id, discussion_id, resolved)
 	local original_position = type(note.original_position) == "table" and note.original_position or nil
 	local outdated = position == nil and original_position ~= nil
 	position = position or original_position
-	local inline
-	if position and tostring(position.position_type or "text") == "text" then
+	local diff_refs = position
+			and {
+				base_sha = json.safe_str(position.base_sha),
+				start_sha = json.safe_str(position.start_sha),
+				head_sha = json.safe_str(position.head_sha),
+			}
+		or nil
+	local file, inline
+	local position_type = position and tostring(position.position_type or "text") or ""
+	if position_type == "text" then
 		inline = to_inline_position(position)
+	elseif position_type == "file" then
+		local path = json.safe_str(position.new_path) or json.safe_str(position.old_path)
+		if path then
+			file = {
+				path = path,
+				old_path = json.safe_str(position.old_path),
+				commit_hash = json.safe_str(position.head_sha),
+			}
+		end
 	end
 	local state = resolved and "RESOLVED" or (outdated and "OUTDATED" or nil)
+	local is_thread_root = note.id == discussion_first_id
 
-	local raw_with_discussion = note
-	if discussion_id ~= nil and discussion_id ~= "" then
-		raw_with_discussion = vim.tbl_extend("force", {}, note, { discussion_id = discussion_id })
-	end
 	return {
 		id = note.id,
-		parent_id = (note.id ~= discussion_first_id) and discussion_first_id or nil,
+		parent_id = not is_thread_root and discussion_first_id or nil,
+		thread_id = discussion_id ~= nil and discussion_id ~= "" and discussion_id or nil,
 		author = actor_from(note.author),
 		content_raw = tostring(note.body or ""),
 		created_on = tostring(note.created_at or ""),
+		resolved_on = resolved and is_thread_root and json.safe_str(note.resolved_at) or nil,
+		resolved_by = resolved and is_thread_root and actor_from(note.resolved_by) or nil,
+		file = file,
 		inline = inline,
 		is_task = nil,
 		state = state,
 		outdated = outdated,
-		can_resolve = note.resolvable,
 		reactions = reaction_counts(note.award_emoji),
 		html_url = json.safe_str(note.web_url),
-		_raw = raw_with_discussion,
+		_raw = diff_refs and { diff_refs = diff_refs } or nil,
 	}
 end
 
@@ -281,14 +331,59 @@ function M.to_draft_comment(draft, discussion_first_id)
 	if draft.author_id ~= nil and draft.author_id ~= vim.NIL then
 		comment.author = { name = "You", nickname = nil, username = "", id = tostring(draft.author_id) }
 	end
-	comment.state = "PENDING"
-	comment._raw = vim.tbl_extend("force", {}, draft, { draft_note_id = draft.id })
+	comment.pending = true
+	comment._raw = vim.tbl_extend("force", comment._raw or {}, { draft_note_id = draft.id })
 	return comment
 end
 
+---@param values table|nil
+---@return DiffHunk|nil
+function M.to_diff_hunk(values)
+	local lines = json.safe_table(values)
+	if #lines == 0 then
+		return nil
+	end
+	local hunk = {
+		header = "",
+		context = "",
+		old_start = 0,
+		old_count = 0,
+		new_start = 0,
+		new_count = 0,
+		additions = 0,
+		deletions = 0,
+		lines = {},
+	}
+	local kinds = { new = "add", old = "remove", [""] = "context" }
+	for _, line in ipairs(lines) do
+		local kind = kinds[json.safe_str(line.type) or ""] or "meta"
+		local text = (json.safe_str(line.text) or ""):gsub("\r?\n$", "")
+		local old_line = tonumber(line.oldLine)
+		local new_line = tonumber(line.newLine)
+		table.insert(hunk.lines, {
+			kind = kind,
+			text = text,
+			content = kind == "meta" and text or text:sub(2),
+			old_line = old_line,
+			new_line = new_line,
+		})
+		if old_line then
+			hunk.old_start = hunk.old_start == 0 and old_line or hunk.old_start
+			hunk.old_count = hunk.old_count + 1
+		end
+		if new_line then
+			hunk.new_start = hunk.new_start == 0 and new_line or hunk.new_start
+			hunk.new_count = hunk.new_count + 1
+		end
+		hunk.additions = hunk.additions + (kind == "add" and 1 or 0)
+		hunk.deletions = hunk.deletions + (kind == "remove" and 1 or 0)
+	end
+	return hunk
+end
+
 ---@param note table
----@return PullsActivityEntry|nil
-function M.to_inline_thread_activity(note)
+---@return GitLabPullsActivityEntry|nil
+local function to_inline_thread_activity(note)
 	if note.system == true then
 		return nil
 	end
@@ -306,7 +401,7 @@ function M.to_inline_thread_activity(note)
 		actor = actor_from(note.author),
 		date = tostring(note.created_at or ""),
 		label = string.format("started a review thread on %s:%d", inline.path, line),
-		_raw = { gitlab_inline_thread_activity = true },
+		inline_thread = true,
 	}
 end
 
@@ -314,7 +409,7 @@ end
 ---@return PullsActivityEntry|nil
 function M.to_activity(note)
 	if note.system ~= true then
-		return M.to_inline_thread_activity(note)
+		return to_inline_thread_activity(note)
 	end
 	local body = tostring(note.body or "")
 	if body == "" then

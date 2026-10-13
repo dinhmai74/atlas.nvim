@@ -3,26 +3,52 @@ local M = {}
 local json = require("atlas.core.json")
 local github_mapping = require("atlas.providers.github.mapping")
 
----@param raw_user any Decoded API value.
----@return IssueUser|nil
-function M.to_user(raw_user)
-	local user = github_mapping.identity(raw_user)
-	if user == nil or user.login == "" then
-		return nil
-	end
-	return { account_id = user.login, display_name = user.name }
-end
+M.to_user = require("atlas.providers.github.users").to_user
 
----@param raw_assignees table[]|nil
----@return IssueUser|nil
-local function first_assignee(raw_assignees)
-	for _, raw in ipairs(json.safe_table(raw_assignees)) do
+---@param raw_users table[]|nil
+---@return AtlasUser[]
+function M.to_users(raw_users)
+	local users = {}
+	for _, raw in ipairs(json.safe_table(raw_users)) do
 		local user = M.to_user(raw)
 		if user then
-			return user
+			table.insert(users, user)
 		end
 	end
-	return nil
+	return users
+end
+
+---@param raw_labels table[]|nil
+---@return IssueLabel[]
+local function labels(raw_labels)
+	local result = {}
+	for _, raw in ipairs(json.safe_table(raw_labels)) do
+		local name = json.safe_str(raw.name)
+		if name then
+			table.insert(result, { name = name, color = json.safe_str(raw.color) })
+		end
+	end
+	return result
+end
+
+---@param raw any
+---@return GitHubIssueMilestone|nil
+local function milestone(raw)
+	raw = json.nilify(raw)
+	if type(raw) ~= "table" then
+		return nil
+	end
+	local title = json.safe_str(raw.title)
+	if title == nil then
+		return nil
+	end
+	return {
+		title = title,
+		number = tonumber(raw.number),
+		progress_percentage = tonumber(raw.progressPercentage),
+		open_issues = tonumber((raw.openIssues or {}).totalCount),
+		closed_issues = tonumber((raw.closedIssues or {}).totalCount),
+	}
 end
 
 ---@param state string|nil
@@ -37,133 +63,109 @@ end
 
 ---@param raw any Decoded API value.
 ---@param fallback_slug string|nil
----@return Issue|nil
-function M.to_issue(raw, fallback_slug)
+---@return IssueRef|nil, string, integer|nil
+local function issue_identity(raw, fallback_slug)
 	raw = json.nilify(raw)
 	if type(raw) ~= "table" then
-		return nil
+		return nil, "", nil
 	end
 
 	local number = tonumber(raw.number)
 	if number == nil then
-		return nil
+		return nil, "", nil
 	end
 
 	local _, _, slug = github_mapping.repository(raw.repository, fallback_slug)
-	local url = json.safe_str(raw.url) or json.safe_str(raw.html_url) or ""
-	if slug == "" then
-		local extracted = url:match("github%.com/([^/]+/[^/]+)/issues/")
-		if extracted then
-			slug = extracted
-		end
-	end
-
 	local key = slug ~= "" and string.format("%s#%d", slug, number) or string.format("#%d", number)
-	local title = json.safe_str(raw.title) or ""
+	return { key = key, title = json.safe_str(raw.title) }, slug, number
+end
+
+---@param raw any Decoded API value.
+---@param fallback_slug string|nil
+---@return GitHubIssue|nil
+function M.to_issue(raw, fallback_slug)
+	raw = json.nilify(raw)
+	local ref, repo_full_name, number = issue_identity(raw, fallback_slug)
+	if ref == nil or number == nil then
+		return nil
+	end
+	local url = json.safe_str(raw.url) or ""
 	local status_name, status_id = normalize_state(raw.state)
 	local author = M.to_user(raw.author)
 
-	local labels = github_mapping.connection_nodes(raw.labels)
-	local assignees = github_mapping.connection_nodes(raw.assignees)
-	local parent = M.to_issue(json.nilify(raw.parent), fallback_slug)
-	local milestone = json.nilify(raw.milestone)
-	local body = json.safe_str(raw.body) or ""
-	local created_at = json.safe_str(raw.createdAt) or json.safe_str(raw.created_at) or ""
-	local updated_at = json.safe_str(raw.updatedAt) or json.safe_str(raw.updated_at) or ""
-	local closed_at = json.safe_str(raw.closedAt) or json.safe_str(raw.closed_at)
+	local issue_assignees = github_mapping.connection_nodes(raw.assignees)
+	local parent = issue_identity(json.nilify(raw.parent), fallback_slug)
+	local subscription = json.safe_str(raw.viewerSubscription)
+	local is_subscribed = subscription and subscription == "SUBSCRIBED"
+	local created_at = json.safe_str(raw.createdAt) or ""
+	local updated_at = json.safe_str(raw.updatedAt) or ""
+	local closed_at = json.safe_str(raw.closedAt)
+	local comment_count = tonumber(json.safe_table(raw.comments).totalCount) or 0
 
-	local comments_field = json.nilify(raw.comments)
-	local comment_count = tonumber(raw.commentsCount)
-		or (type(comments_field) == "number" and comments_field)
-		or (type(comments_field) == "table" and tonumber(comments_field.totalCount))
-		or (type(comments_field) == "table" and #comments_field)
-		or 0
-
-	---@type Issue
+	---@type GitHubIssue
 	local issue = {
-		key = key,
-		summary = title,
-		project = nil,
+		key = ref.key,
+		repo_full_name = repo_full_name,
+		number = number,
+		title = ref.title or "",
 		status = status_name,
 		status_id = status_id,
-		status_category = nil,
-		status_color = nil,
 		type = nil,
-		priority = nil,
-		assignee = first_assignee(assignees),
+		assignee = M.to_users(issue_assignees)[1],
 		reporter = author,
 		story_points = nil,
 		duedate = nil,
 		parent = parent,
 		url = url ~= "" and url or nil,
+		created_at = created_at ~= "" and created_at or nil,
+		updated_at = updated_at ~= "" and updated_at or nil,
+		closed_at = closed_at,
+		comment_count = comment_count,
 		is_pinned = raw.isPinned == true,
-		is_subscribed = tostring(raw.viewerSubscription or "") == "SUBSCRIBED",
-		_raw = {
-			node_id = json.safe_str(raw.id),
-			number = number,
-			slug = slug,
-			body = body,
-			created_at = created_at,
-			updated_at = updated_at,
-			closed_at = closed_at,
-			labels = labels,
-			assignees = assignees,
-			milestone = milestone,
-			comment_count = comment_count,
-			html_url = url,
-			reactions = github_mapping.reaction_groups(raw.reactionGroups),
-			sub_issues = github_mapping.connection_nodes(raw.subIssues),
-		},
+		is_subscribed = is_subscribed,
+		node_id = json.safe_str(raw.id),
 	}
 	return issue
 end
 
----@param raw_list table[]|nil
+---@param raw any Decoded API value.
 ---@param fallback_slug string|nil
----@return Issue[]
-function M.to_issues_list(raw_list, fallback_slug)
-	local out = {}
-	for _, raw in ipairs(raw_list or {}) do
-		local issue = M.to_issue(raw, fallback_slug)
-		if issue ~= nil then
-			table.insert(out, issue)
+---@return GitHubIssueDetails|nil
+function M.to_issue_details(raw, fallback_slug)
+	raw = json.nilify(raw)
+	if type(raw) ~= "table" then
+		return nil
+	end
+
+	---@type GitHubIssueDetails
+	local details = {
+		title = json.safe_str(raw.title),
+		description = json.safe_str(raw.body) or "",
+		assignees = M.to_users(github_mapping.connection_nodes(raw.assignees)),
+		labels = labels(github_mapping.connection_nodes(raw.labels)),
+		milestone = milestone(raw.milestone),
+		sub_issues = {},
+	}
+	for _, child in ipairs(github_mapping.connection_nodes(raw.subIssues)) do
+		local sub_issue = M.to_issue(child, fallback_slug)
+		if sub_issue then
+			table.insert(details.sub_issues, sub_issue)
 		end
 	end
-	return out
+	return details
 end
 
----@param nodes table[]|nil
+---@param nodes table[]
 ---@return Issue[]
 function M.to_search_results(nodes)
-	local out = {}
-	local seen = {}
-
-	local function insert_issue(issue)
-		local key = type(issue) == "table" and tostring(issue.key or "") or ""
-		if key == "" or seen[key] then
-			return
-		end
-		seen[key] = true
-		table.insert(out, issue)
-	end
-
-	for _, raw in ipairs(nodes or {}) do
+	local issues = {}
+	for _, raw in ipairs(nodes) do
 		local issue = M.to_issue(raw, nil)
-		if type(issue) == "table" then
-			insert_issue(issue.parent)
-			insert_issue(issue)
-
-			for _, child_raw in ipairs(github_mapping.connection_nodes(raw.subIssues)) do
-				local child = M.to_issue(child_raw, nil)
-				if type(child) == "table" and child.parent == nil then
-					child.parent = issue
-				end
-				insert_issue(child)
-			end
+		if issue then
+			table.insert(issues, issue)
 		end
 	end
-
-	return out
+	return issues
 end
 
 ---@param key string
@@ -185,8 +187,7 @@ local function to_comment(raw, raw_user)
 	if type(raw) ~= "table" or json.nilify(raw.id) == nil then
 		return nil
 	end
-	local user = github_mapping.identity(raw_user)
-	local author = user and user.login ~= "" and { account_id = user.login, display_name = user.login } or nil
+	local author = M.to_user(raw_user)
 	return {
 		id = tostring(raw.id),
 		self = nil,
@@ -204,32 +205,7 @@ end
 ---@param raw any Decoded API value.
 ---@return IssueComment|nil
 function M.to_comment(raw)
-	return to_comment(raw, type(raw) == "table" and raw.user or nil)
-end
-
----@param raw_list table[]|nil
----@return IssueComment[]
-function M.to_comments_list(raw_list)
-	local out = {}
-	for _, raw in ipairs(raw_list or {}) do
-		local c = M.to_comment(raw)
-		if c ~= nil then
-			table.insert(out, c)
-		end
-	end
-	return out
-end
-
----@param hex string|nil
----@return string|nil
-local function label_hl_group(hex)
-	local clean = tostring(hex or ""):lower():gsub("[^0-9a-f]", "")
-	if #clean ~= 6 then
-		return nil
-	end
-	local name = "AtlasGHIssueLabel_" .. clean
-	vim.api.nvim_set_hl(0, name, { fg = "#" .. clean, bold = true })
-	return name
+	return to_comment(raw, json.safe_table(raw).user)
 end
 
 local EVENT_LABELS = {
@@ -240,13 +216,6 @@ local EVENT_LABELS = {
 	unpinned = "unpinned this issue",
 	transferred = "transferred",
 	marked_as_duplicate = "marked as duplicate",
-	ready_for_review = "marked as ready for review",
-	convert_to_draft = "marked as draft",
-	head_ref_force_pushed = "force pushed",
-	base_ref_force_pushed = "base branch force pushed",
-	review_requested = "requested a review",
-	reviewed = "reviewed",
-	committed = "added a commit",
 	subscribed = "subscribed",
 	unsubscribed = "unsubscribed",
 	mentioned = "was mentioned",
@@ -282,38 +251,22 @@ function M.to_timeline_entry(raw)
 	---@type IssueActivityEntry
 	local entry = { kind = event, actor = actor, date = date }
 
-	if event == "commented" then
-		local body = json.safe_str(raw.body) or ""
-		entry.label = "commented"
-		entry.body = body ~= "" and body or nil
-	elseif event == "labeled" or event == "unlabeled" then
-		local label = json.nilify(raw.label)
-		local name = type(label) == "table" and (json.safe_str(label.name) or "") or ""
-		local color = type(label) == "table" and (json.safe_str(label.color) or "") or ""
-		entry.label = event == "labeled" and "added label" or "removed label"
-		if name ~= "" then
-			entry.body = name
-			local hl = label_hl_group(color)
-			if hl then
-				entry.body_hl = function(row, _)
-					return { { start_col = 0, end_col = #row, hl_group = hl } }
-				end
-			end
-		end
+	if event == "labeled" or event == "unlabeled" then
+		local name = json.safe_str(json.safe_table(raw.label).name) or ""
+		local verb = event == "labeled" and "added label" or "removed label"
+		entry.label = name ~= "" and (verb .. ": " .. name) or verb
 	elseif event == "assigned" or event == "unassigned" then
-		local assignee = json.nilify(raw.assignee)
-		local login = type(assignee) == "table" and (json.safe_str(assignee.login) or "") or ""
-		entry.label = event == "assigned" and "assigned" or "unassigned"
-		entry.body = login ~= "" and login or nil
+		local login = json.safe_str(json.safe_table(raw.assignee).login) or ""
+		local verb = event == "assigned" and "assigned" or "unassigned"
+		entry.label = login ~= "" and (verb .. " " .. login) or verb
 	elseif event == "milestoned" or event == "demilestoned" then
-		local milestone = json.nilify(raw.milestone)
-		local title = type(milestone) == "table" and (json.safe_str(milestone.title) or "") or ""
-		entry.label = event == "milestoned" and "added milestone" or "removed milestone"
-		entry.body = title ~= "" and title or nil
+		local title = json.safe_str(json.safe_table(raw.milestone).title) or ""
+		local verb = event == "milestoned" and "added milestone" or "removed milestone"
+		entry.label = title ~= "" and (verb .. ": " .. title) or verb
 	elseif event == "renamed" then
-		local rename = json.nilify(raw.rename)
-		local from = type(rename) == "table" and (json.safe_str(rename.from) or "") or ""
-		local to = type(rename) == "table" and (json.safe_str(rename.to) or "") or ""
+		local rename = json.safe_table(raw.rename)
+		local from = json.safe_str(rename.from) or ""
+		local to = json.safe_str(rename.to) or ""
 		entry.label = "renamed"
 		if from ~= "" or to ~= "" then
 			entry.body = from .. " → " .. to
@@ -323,16 +276,13 @@ function M.to_timeline_entry(raw)
 					return nil
 				end
 				return {
-					{ start_col = 0, end_col = start - 1, hl_group = "AtlasTextWarning" },
-					{ start_col = finish, end_col = #row, hl_group = "AtlasTextPositive" },
+					{ start_col = 0, end_col = start - 1, hl_group = "AtlasTextMuted" },
+					{ start_col = finish, end_col = #row, hl_group = "Normal" },
 				}
 			end
 		end
 	elseif event == "cross-referenced" then
-		local source = json.nilify(raw.source)
-		source = type(source) == "table" and source or {}
-		local issue = json.nilify(source.issue)
-		issue = type(issue) == "table" and issue or {}
+		local issue = json.safe_table(json.safe_table(raw.source).issue)
 		local title = json.safe_str(issue.title) or ""
 		local url = json.safe_str(issue.html_url) or ""
 		entry.label = "referenced"

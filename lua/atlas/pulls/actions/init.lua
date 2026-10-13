@@ -1,236 +1,462 @@
+local action_runner = require("atlas.core.actions")
+local diff = require("atlas.pulls.diff")
+local git_checkout = require("atlas.core.git.checkout")
+local icons = require("atlas.ui.shared.icons")
+local merge_buffer = require("atlas.pulls.ui.merge")
+local notes = require("atlas.pulls.notes")
+local picker = require("atlas.ui.picker")
+local pipeline_api = require("atlas.pulls.pipelines")
+local repository = require("atlas.ui.repository")
+local review = require("atlas.pulls.actions.review")
+local utils = require("atlas.pulls.actions.utils")
+
 local M = {}
 
-local statusline = require("atlas.ui.statusline")
-local checkout = require("atlas.core.git.checkout")
-local md_editor = require("atlas.ui.popups.editor")
+local has_pr = utils.has_pr
+local notify = utils.notify
 
 ---@class PullsActionResult
 ---@field changed_pr boolean
 ---@field message string|nil
 
----@return PullsProvider|nil
-local function provider()
-	return require("atlas.pulls.state").provider
-end
+---@alias AtlasPullActionId
+---| "copy_id"
+---| "copy_url"
+---| "open_in_browser"
+---| "open_pipelines"
+---| "browse_repository"
+---| "browse_repositories"
+---| "open_diff"
+---| "checkout"
+---| "merge"
+---| "decline"
+---| "edit_pr"
+---| "ready_for_review"
+---| "convert_to_draft"
+---| "edit_reviewers"
+---| "search"
+---| "search_pull_requests"
+---| "edit_search"
+---| "approve"
+---| "request_changes"
 
----@param pr PullRequest
-function M.copy_id(pr)
-	vim.fn.setreg("+", tostring(pr.id))
-	statusline.notify("success", string.format("Copied #%s to clipboard", tostring(pr.id)), 1200)
-end
+---@class AtlasPullActionContext
+---@field provider PullsProvider
+---@field pr PullRequest|nil
+---@field details PullRequestDetails|nil
+---@field current_user AtlasUser|nil
+---@field buf integer|nil
+---@field notify fun(level: AtlasNotifyLevel, message: string, duration: integer|nil)|nil
 
----@param pr PullRequest
-function M.copy_url(pr)
-	local url = pr.link and pr.link.html
-	if url == nil or url == "" then
-		statusline.notify("warn", "No URL available")
-		return
-	end
-	vim.fn.setreg("+", url)
-	statusline.notify("success", "Copied URL to clipboard", 1200)
-end
+---@class AtlasPullAction
+---@field id string
+---@field label string
+---@field icon string|nil
+---@field hidden boolean|nil
+---@field confirmation boolean|nil
+---@field is_available (fun(context: AtlasPullActionContext): boolean, string|nil)|nil
+---@field run fun(context: AtlasPullActionContext, on_done: fun(result: PullsActionResult|nil, err: string|nil)): boolean|nil
 
----@param pr PullRequest
-function M.open_in_browser(pr)
-	local url = pr.link and pr.link.html
-	if url == nil or url == "" then
-		statusline.notify("warn", "No URL available")
-		return
-	end
-	vim.ui.open(url)
-	statusline.notify("info", "Opened in browser")
-end
-
----@param pr PullRequest
----@param update_title fun(pr: PullRequest, title: string, on_done: fun(ok: boolean, err: string|nil))
----@param on_done fun(ok: boolean)
-function M.edit_title(pr, update_title, on_done)
-	md_editor.open({
-		key = "pr-title-edit-" .. tostring(pr.id),
-		title = " Edit Title ",
-		width_ratio = 0.5,
-		height_ratio = 0.12,
-		initial_text = pr.title or "",
-		on_save = function(text)
-			local title = text and vim.trim(text) or ""
-			if title == "" or title == pr.title then
-				on_done(false)
-				return
+---@param draft boolean
+---@return AtlasPullAction
+local function draft_action(draft)
+	local id = draft and "convert_to_draft" or "ready_for_review"
+	local label = draft and "Convert to draft" or "Mark as ready for review"
+	return {
+		id = id,
+		label = label,
+		icon = draft and icons.get("draft_pr") or icons.get("review", "actions"),
+		is_available = function(context)
+			if not context.pr then
+				return false, "No PR selected"
 			end
-			statusline.notify("loading", "Updating title...")
-			update_title(pr, title, function(ok, err)
+			local write = context.provider.capabilities.write
+			if not write or not write.update then
+				return false, "Provider does not support editing pull requests"
+			end
+			if draft and context.pr.state ~= "open" then
+				return false, "PR is not open"
+			end
+			if not draft and context.pr.state ~= "draft" then
+				return false, "PR is not a draft"
+			end
+			return true
+		end,
+		run = function(context, done)
+			local pr = assert(context.pr)
+			notify(context, "loading", draft and "Converting to draft..." or "Marking as ready...")
+			context.provider.capabilities.write.update(pr, { draft = draft }, function(ok, err)
 				if err or ok == false then
-					statusline.notify("error", "Title update failed: " .. tostring(err or "Unknown error"))
-					on_done(false)
+					local message = tostring(err or "Unknown error")
+					notify(context, "error", label .. " failed: " .. message)
+					done(nil, message)
 					return
 				end
-				pr.title = title
-				statusline.notify("success", "Title updated", 1200)
-				on_done(true)
+				pr.state = draft and "draft" or "open"
+				notify(context, "success", draft and "PR converted to draft" or "PR marked as ready for review", 1200)
+				done({ changed_pr = true, message = label }, nil)
 			end)
+		end,
+	}
+end
+
+---@param id string
+---@param context AtlasPullActionContext
+---@return AtlasPullAction|nil
+function M.find(id, context)
+	local action = utils.find_custom_action(id)
+	if action then
+		return action
+	end
+	local actions = context.provider.capabilities.actions
+	local provider_action = actions and actions.find(id) or nil
+	---@cast provider_action AtlasPullAction|nil
+	return provider_action
+end
+
+---@param id string
+---@param context AtlasPullActionContext
+---@return boolean
+function M.is_available(id, context)
+	return action_runner.is_available(M.find(id, context), context)
+end
+
+---@param id string
+---@param context AtlasPullActionContext
+---@param on_done fun(result: PullsActionResult|nil, err: string|nil)|nil
+---@return boolean handled
+function M.run(id, context, on_done)
+	local action = M.find(id, context)
+	if action then
+		return action_runner.run(action, context, on_done)
+	end
+	if not context.provider.capabilities.actions then
+		return false
+	end
+	return action_runner.reject(context, on_done, string.format("Unknown action: %s", tostring(id)))
+end
+
+---@param context AtlasPullActionContext
+---@param on_done fun(result: PullsActionResult|nil, err: string|nil)|nil
+---@param extra_items { label: string, icon?: string, callback: fun() }[]|nil
+function M.open(context, on_done, extra_items)
+	local actions = context.provider.capabilities.actions
+	local items = {}
+	for _, action in ipairs(actions and actions.items or {}) do
+		if not action.hidden and not utils.find_custom_action(action.id) and M.is_available(action.id, context) then
+			table.insert(items, action)
+		end
+	end
+	for _, action in ipairs(utils.custom_actions()) do
+		if action_runner.is_available(action, context) then
+			table.insert(items, action)
+		end
+	end
+	vim.list_extend(items, extra_items or {})
+	if #items == 0 then
+		if on_done then
+			on_done(nil, "No actions available")
+		end
+		return
+	end
+
+	local target = context.pr and string.format(" for #%s", tostring(context.pr.id)) or ""
+	picker.select({
+		title = string.format("Choose %s action%s", context.provider.name, target),
+		items = items,
+		format_item = function(action)
+			return (action.icon or icons.get("custom", "actions")) .. "  " .. action.label
+		end,
+		on_select = function(action)
+			if not action then
+				if on_done then
+					on_done({ changed_pr = false, message = "Cancelled" }, nil)
+				end
+				return
+			end
+			if action.callback then
+				action.callback()
+			else
+				M.run(action.id, context, on_done)
+			end
 		end,
 	})
 end
 
----@param pr PullRequest
----@param buf integer
-function M.show_details(pr, buf)
-	local info_popup = require("atlas.ui.popups.info")
-	local lines, highlights = require("atlas.pulls.ui.popup").content(pr)
-	info_popup.show({
-		lines = lines,
-		highlights = highlights,
-		source_buf = buf,
-	})
-end
-
----@param pr PullRequest
----@param on_done fun(result: PullsActionResult|nil, err: string|nil)
----@return { cancel: fun() }|nil
-function M.open_pipelines(pr, on_done)
-	local p = provider()
-	if p == nil or p.capabilities.pipelines == nil then
-		local err = "Pipelines are not supported by this provider"
-		statusline.notify("warn", err)
-		on_done(nil, err)
-		return nil
-	end
-
-	require("atlas.pulls.ui.pipelines").open(pr)
-	local message = "Opened Pipelines"
-	statusline.notify("success", message, 1200)
-	on_done({ changed_pr = false, message = message }, nil)
-	return nil
-end
-
----@class PullsRunActionOptions
----@field source "main"|"panel"|"diff"|nil
----@field current_user PullsUser|nil
----@field notify fun(level: "loading"|"success"|"info"|"warn"|"error", message: string, duration: integer|nil)|nil
-
----@param pr PullRequest
----@param action_id string
----@return boolean
-function M.is_action_available(pr, action_id)
-	local provider_module = require("atlas.providers").load(pr.provider, "pulls")
-	local actions = provider_module and provider_module.capabilities.actions
-	if actions == nil then
-		return false
-	end
-	return actions.is_available(action_id, { pr = pr, source = nil })
-end
-
----@param pr PullRequest
----@param action_id string
----@param opts PullsRunActionOptions|nil
----@param on_done fun(result: PullsActionResult|nil, err: string|nil)|nil
-function M.run_action(pr, action_id, opts, on_done)
-	opts = opts or {}
-	local provider_module = require("atlas.providers").load(pr.provider, "pulls")
-	local actions = provider_module and provider_module.capabilities.actions
-	if not actions then
-		if on_done then
-			on_done(nil, "Provider does not support actions")
+M.edit_pr = {
+	id = "edit_pr",
+	label = "Edit PR",
+	icon = icons.get("edit", "actions"),
+	is_available = function(context)
+		if not context.pr then
+			return false, "No PR selected"
 		end
-		return
-	end
-	actions.run(action_id, {
-		pr = pr,
-		source = opts.source,
-		current_user = opts.current_user,
-		notify = opts.notify,
-	}, function(result, err)
-		if opts.source ~= nil and opts.source ~= "diff" and result ~= nil and result.changed_pr then
-			require("atlas.pulls.ui.main.controller").refresh_pr(pr)
-		end
-		if on_done then
-			on_done(result, err)
-		end
-	end)
-end
-
----@param pr PullRequest
----@param source "main"|"panel"|nil
----@param on_done fun(result: PullsActionResult|nil)|nil
-function M.open_actions(pr, source, on_done)
-	local p = provider()
-	local actions = p and p.capabilities.actions
-	if not actions then
-		return
-	end
-	actions.open(
-		{ pr = pr, source = source, current_user = require("atlas.pulls.state").current_user },
-		function(result)
-			if result ~= nil and result.changed_pr then
-				local controller = require("atlas.pulls.ui.main.controller")
-				controller.refresh_pr(pr)
-			end
-			if on_done then
-				on_done(result)
-			end
-		end
-	)
-end
-
----@param opts PullsDiffOpenOptions
----@param on_done fun(err: string|nil)|nil
----@return { cancel: fun() }|nil
-function M.open_diff_range(opts, on_done)
-	return require("atlas.pulls.diff").open_range(opts, on_done)
-end
-
----@param value string
-function M.open_atlas_diff(value)
-	require("atlas.pulls.diff").open_argument(value)
-end
-
----@param pr PullRequest
----@return { cancel: fun() }|nil
-function M.open_diff(pr)
-	local pulls_state = require("atlas.pulls.state")
-	return require("atlas.pulls.diff").open_pr({
-		pr = pr,
-		provider = pulls_state.provider,
-		current_user = pulls_state.current_user,
-	}, function(err, level)
-		if err then
-			statusline.notify(level or "error", "Unable to open diff: " .. tostring(err))
-		end
-	end)
-end
-
----@param pr PullRequest
-function M.checkout(pr)
-	statusline.notify("loading", string.format("Checking out PR #%s", tostring(pr.id or "")))
-	checkout.checkout_pr(pr, function(_, err)
-		vim.schedule(function()
+		local write = context.provider.capabilities.write
+		return write ~= nil and write.update ~= nil, "Provider does not support editing pull requests"
+	end,
+	run = function(context, done)
+		require("atlas.pulls.editor").edit(context.provider, assert(context.pr), function(changed, err)
 			if err then
-				statusline.notify("error", string.format("Checkout failed: %s", tostring(err)))
+				done(nil, err)
 				return
 			end
-			statusline.notify("success", string.format("Checked out PR #%s", tostring(pr.id or "")))
+			done({ changed_pr = changed }, nil)
 		end)
-	end)
-end
+	end,
+}
 
----@param pr PullRequest
-function M.refresh(pr)
-	local controller = require("atlas.pulls.ui.main.controller")
-	controller.refresh_pr(pr)
-end
+M.ready_for_review = draft_action(false)
+M.convert_to_draft = draft_action(true)
 
-function M.refresh_view()
-	local controller = require("atlas.pulls.ui.main.controller")
-	controller.refresh_current_view()
-end
+M.merge = {
+	id = "merge",
+	label = "Merge",
+	icon = icons.get("merge", "actions"),
+	is_available = function(context)
+		return context.pr ~= nil and context.pr.state == "open" and context.provider.capabilities.core.merge ~= nil
+	end,
+	run = function(context, done)
+		local pr = assert(context.pr)
+		local core = context.provider.capabilities.core
+		merge_buffer.open(pr, {
+			on_cancel = function()
+				done({ changed_pr = false, message = "Merge cancelled" }, nil)
+			end,
+			on_submit = function(options, completed)
+				notify(context, "loading", "Merging...")
+				core.merge(pr, options, function(ok, merge_err)
+					if not ok or merge_err then
+						notify(context, "error", "Merge failed: " .. tostring(merge_err or "Unknown error"))
+						completed(false)
+						return
+					end
+					notes.clear_for_pull_request(pr)
+					completed(true)
+					notify(context, "success", "Merge succeeded", 1200)
+					done({ changed_pr = true, message = "Merged" }, nil)
+				end)
+			end,
+		})
+	end,
+}
 
-function M.search()
-	local p = provider()
-	local search = p and p.capabilities.search
-	if not search then
-		return
-	end
-	search()
-end
+M.decline = {
+	id = "decline",
+	label = "Decline",
+	icon = icons.get("close", "actions"),
+	is_available = function(context)
+		return context.pr ~= nil and (context.pr.state == "open" or context.pr.state == "draft")
+	end,
+	run = function(context, done)
+		local pr = assert(context.pr)
+		vim.ui.input({ prompt = string.format("Decline PR #%s? [y/N]: ", tostring(pr.id)) }, function(input)
+			local confirmed = input and vim.trim(input):lower()
+			if confirmed ~= "y" and confirmed ~= "yes" then
+				done({ changed_pr = false, message = "Decline cancelled" }, nil)
+				return
+			end
+			notify(context, "loading", "Declining PR...")
+			context.provider.capabilities.core.decline(pr, function(ok, err)
+				if not ok then
+					local message = tostring(err or "Decline failed")
+					notify(context, "error", message)
+					done(nil, message)
+					return
+				end
+				pr.state = "declined"
+				notify(context, "success", "PR declined", 1200)
+				done({ changed_pr = true, message = "Declined" }, nil)
+			end)
+		end)
+	end,
+}
+
+M.edit_reviewers = {
+	id = "edit_reviewers",
+	label = "Edit reviewers",
+	icon = icons.get("user", "actions"),
+	is_available = function(context)
+		if not context.pr then
+			return false, "No PR selected"
+		end
+		local write = context.provider.capabilities.write
+		if not write or not write.update or not write.fetch_reviewer_candidates then
+			return false, "Provider does not support editing reviewers"
+		end
+		local state = context.pr.state
+		return state == "open" or state == "draft", "PR is not open"
+	end,
+	run = function(context, done)
+		local pr = assert(context.pr)
+		local write = context.provider.capabilities.write
+
+		notify(context, "loading", "Loading reviewers...")
+		write.fetch_reviewer_candidates({
+			repo_slug = pr.repo_full_name,
+			pr = pr,
+		}, function(reviewers, err)
+			if err then
+				notify(context, "error", "Failed to load reviewers: " .. tostring(err))
+				done(nil, err)
+				return
+			end
+
+			reviewers = reviewers or {}
+			if #reviewers == 0 then
+				notify(context, "warn", "No reviewers available")
+				done({ changed_pr = false, message = "No reviewers available" }, nil)
+				return
+			end
+
+			local original = {}
+			for _, reviewer in ipairs(reviewers) do
+				if reviewer.selected then
+					table.insert(original, reviewer)
+				end
+			end
+			notify(context, "success", "Reviewers loaded", 1200)
+
+			picker.multi_select({
+				items = reviewers,
+				selected = original,
+				key = function(reviewer)
+					return reviewer.provider_id
+				end,
+				format_item = function(reviewer)
+					return reviewer.label
+				end,
+				title = string.format("Reviewers for #%s", tostring(pr.id)),
+				on_done = function(chosen)
+					local changed = #chosen ~= #original
+					if not changed then
+						local chosen_ids = {}
+						for _, reviewer in ipairs(chosen) do
+							chosen_ids[reviewer.provider_id] = true
+						end
+						for _, reviewer in ipairs(original) do
+							if not chosen_ids[reviewer.provider_id] then
+								changed = true
+								break
+							end
+						end
+					end
+					if not changed then
+						done({ changed_pr = false, message = "No changes" }, nil)
+						return
+					end
+
+					notify(context, "loading", "Updating reviewers...")
+					write.update(pr, { reviewers = chosen }, function(ok, update_err)
+						if update_err or ok == false then
+							local message = tostring(update_err or "Unknown error")
+							notify(context, "error", "Update reviewers failed: " .. message)
+							done(nil, message)
+							return
+						end
+						notify(context, "success", "Reviewers updated", 1200)
+						done({ changed_pr = true, message = "Reviewers updated" }, nil)
+					end)
+				end,
+			})
+		end)
+	end,
+}
+
+M.browse_repository = {
+	id = "browse_repository",
+	label = "Browse Current Repository",
+	icon = icons.get("overview"),
+	is_available = has_pr,
+	run = function(context, done)
+		local pr = assert(context.pr)
+		repository.open(pr.repo_full_name, context.provider)
+		done({ changed_pr = false }, nil)
+	end,
+}
+
+M.open_pipelines = {
+	id = "open_pipelines",
+	label = "Open Pipelines",
+	icon = icons.get("pipeline", "actions"),
+	is_available = function(context)
+		if not has_pr(context) then
+			return false
+		end
+		return pipeline_api.get(context.provider) ~= nil
+	end,
+	run = function(context, done)
+		pipeline_api.open(assert(context.pr), context.provider)
+		done({ changed_pr = false, message = "Opened Pipelines" }, nil)
+	end,
+}
+
+M.open_diff = {
+	id = "open_diff",
+	label = "Open diff",
+	icon = icons.get("changes", "actions"),
+	is_available = has_pr,
+	run = function(context, done)
+		diff.open_pr(context.pr, function(err)
+			if err then
+				notify(context, "error", "Unable to open diff: " .. tostring(err))
+				done(nil, err)
+				return
+			end
+			done({ changed_pr = false, message = "Opened diff" }, nil)
+		end)
+	end,
+}
+
+M.checkout = {
+	id = "checkout",
+	label = "Checkout PR branch",
+	icon = icons.get("checkout", "actions"),
+	is_available = has_pr,
+	run = function(context, done)
+		local pr = assert(context.pr)
+
+		---@param selected PullRequest
+		local function checkout(selected)
+			notify(context, "loading", string.format("Checking out PR #%s", tostring(selected.id)))
+			git_checkout.checkout_pr(selected, function(_, err)
+				vim.schedule(function()
+					if err then
+						notify(context, "error", string.format("Checkout failed: %s", tostring(err)))
+						done(nil, tostring(err))
+						return
+					end
+					notify(context, "success", string.format("Checked out PR #%s", tostring(selected.id)))
+					done({ changed_pr = false, message = "Checked out PR" }, nil)
+				end)
+			end)
+		end
+
+		if pr.source.commit_hash ~= "" and pr.destination.commit_hash ~= "" then
+			checkout(pr)
+			return
+		end
+
+		notify(context, "loading", "Loading pull request revisions...")
+		context.provider.capabilities.core.fetch_by_refs({ pr }, { force_refresh = false }, function(pulls, err)
+			local fresh = pulls and pulls[1] or nil
+			if fresh == nil then
+				local message = tostring(err or "Unable to load pull request revisions")
+				notify(context, "error", message)
+				done(nil, message)
+				return
+			end
+			checkout(fresh)
+		end)
+	end,
+}
+
+M.copy_id = utils.copy_id
+M.copy_url = utils.copy_url
+M.open_in_browser = utils.open_in_browser
+M.start_review = review.start_review
+M.submit_review = review.submit_review
+M.approve = review.approve
+M.request_changes = review.request_changes
+M.discard_review = review.discard_review
 
 return M

@@ -1,0 +1,529 @@
+local M = {}
+
+local comments_api = require("atlas.pulls.providers.gitlab.api.comments")
+local json = require("atlas.core.json")
+local service = require("atlas.providers.gitlab.client")
+local request_scope = require("atlas.core.requests")
+
+local REVIEW_METADATA_QUERY = [[
+query($path:ID!,$iid:String!,$after:String){
+  project(fullPath:$path){
+    mergeRequest(iid:$iid){
+      diffRefs{baseSha startSha headSha}
+      reviewers(first:100){
+        nodes{id name username mergeRequestInteraction{reviewState}}
+      }
+      approvedBy(first:100){nodes{id name username}}
+      notes(filter:ONLY_ACTIVITY,first:100,after:$after){
+        pageInfo{hasNextPage endCursor}
+        nodes{
+          id
+          system
+          createdAt
+          url
+          author{id name username}
+          systemNoteMetadata{action}
+        }
+      }
+    }
+  }
+}
+]]
+
+local REVIEWERS_QUERY = [[
+query($path:ID!,$iid:String!){
+  project(fullPath:$path){
+    mergeRequest(iid:$iid){
+      reviewers(first:100){
+        nodes{id name username mergeRequestInteraction{reviewState}}
+      }
+      approvedBy(first:100){nodes{id name username}}
+    }
+  }
+}
+]]
+
+local HISTORY_STATES = {
+	approved = "approved",
+	requested_changes = "changes_requested",
+	unapproved = "unapproved",
+}
+
+---@param pr PullRequest
+---@return string project_path, integer|nil iid
+local function project_iid(pr)
+	return pr.repo_full_name, tonumber(pr.id)
+end
+
+---@param path string
+---@param iid integer
+---@return string
+local function metadata_cache_key(path, iid)
+	return string.format("gitlab_pulls:review_metadata:%s!%d", path, iid)
+end
+
+---@param path string
+---@param iid integer
+local function invalidate_review_caches(path, iid)
+	comments_api.invalidate_caches(path, iid)
+	service.delete_memory_cache(string.format("gitlab_pulls:reviewers:%s!%d", path, iid))
+	service.delete_memory_cache(metadata_cache_key(path, iid))
+	service.clear_cache("gitlab_pulls:merge_requests:gql:")
+end
+
+---@param pr PullRequest
+local function invalidate_details_cache(pr)
+	local path, iid = project_iid(pr)
+	if path ~= "" and iid then
+		service.delete_memory_cache(string.format("gitlab_pulls:details:%s!%d", path, iid))
+		service.clear_cache("gitlab_pulls:merge_requests:gql:")
+	end
+end
+
+---@param raw table|nil
+---@return PullsAuthor|nil
+local function to_author(raw)
+	raw = json.safe_table(raw)
+	local username = json.safe_str(raw.username) or ""
+	local name = json.safe_str(raw.name) or ""
+	if username == "" and name == "" then
+		return nil
+	end
+	return {
+		id = json.safe_str(raw.id) or "",
+		name = name ~= "" and name or username,
+		username = username,
+		nickname = username ~= "" and username or nil,
+	}
+end
+
+---@param merge_request table
+---@return PullsReviewer[]
+local function map_reviewers(merge_request)
+	local reviewers = {}
+	local by_id = {}
+	for _, node in ipairs(json.safe_table(json.safe_table(merge_request.reviewers).nodes)) do
+		local author = to_author(node)
+		if author then
+			local interaction = json.safe_table(node.mergeRequestInteraction)
+			local state = (json.safe_str(interaction.reviewState) or ""):lower()
+			local reviewer = vim.tbl_extend("force", author, {
+				role = "reviewer",
+				decision = state == "approved" and "approved"
+					or (state == "requested_changes" and "changes_requested")
+					or (state == "reviewed" and "reviewed")
+					or "pending",
+			})
+			by_id[author.id] = reviewer
+			table.insert(reviewers, reviewer)
+		end
+	end
+	for _, node in ipairs(json.safe_table(json.safe_table(merge_request.approvedBy).nodes)) do
+		local author = to_author(node)
+		if author then
+			local reviewer = by_id[author.id]
+			if reviewer then
+				reviewer.decision = "approved"
+			else
+				table.insert(
+					reviewers,
+					vim.tbl_extend("force", author, {
+						decision = "approved",
+						role = "participant",
+					})
+				)
+			end
+		end
+	end
+	return reviewers
+end
+
+---@param pr PullRequest
+---@param opts { force_refresh: boolean|nil }|nil
+---@param on_done fun(data: { reviewers: PullsReviewer[], history: PullsReviewHistoryEntry[], diff_refs: table|nil }|nil, err: string|nil)
+---@return { cancel: fun() }|nil
+local function fetch_metadata(pr, opts, on_done)
+	opts = opts or {}
+	local path, iid = project_iid(pr)
+	if path == "" or iid == nil then
+		on_done(nil, "Invalid MR identifier")
+		return nil
+	end
+
+	local cache_key = metadata_cache_key(path, iid)
+	if not opts.force_refresh then
+		local cached, ok = service.get_memory_cache(cache_key)
+		if ok then
+			on_done(cached, nil)
+			return nil
+		end
+	end
+
+	local reviewers, history = {}, {}
+	local after
+	local requests = request_scope.new()
+
+	local function fetch_page()
+		requests.run(function(done)
+			return service.graphql(
+				REVIEW_METADATA_QUERY,
+				{
+					path = path,
+					iid = tostring(iid),
+					after = after,
+				},
+				done,
+				{
+					action = "Fetch MR review metadata",
+					project_path = path,
+					iid = iid,
+				}
+			)
+		end, function(result, err)
+			if err then
+				on_done(nil, err)
+				return
+			end
+
+			local project = json.nilify(result and result.project)
+			local merge_request = project and json.nilify(project.mergeRequest)
+			if not merge_request then
+				on_done(nil, "GitLab did not return the merge request")
+				return
+			end
+
+			if after == nil then
+				reviewers = map_reviewers(merge_request)
+			end
+
+			local notes = json.safe_table(merge_request.notes)
+			for _, note in ipairs(json.safe_table(notes.nodes)) do
+				local metadata = json.safe_table(note.systemNoteMetadata)
+				local state = note.system == true and HISTORY_STATES[json.safe_str(metadata.action) or ""] or nil
+				if state then
+					table.insert(history, {
+						id = json.safe_str(note.id),
+						author = to_author(note.author),
+						state = state,
+						submitted_on = json.safe_str(note.createdAt) or "",
+						body = nil,
+						commit_hash = nil,
+						url = json.safe_str(note.url),
+					})
+				end
+			end
+
+			local page_info = json.safe_table(notes.pageInfo)
+			local end_cursor = json.safe_str(page_info.endCursor) or ""
+			if page_info.hasNextPage == true and end_cursor ~= "" then
+				after = end_cursor
+				fetch_page()
+				return
+			end
+
+			table.sort(history, function(a, b)
+				if a.submitted_on == b.submitted_on then
+					return tostring(a.id or "") < tostring(b.id or "")
+				end
+				return a.submitted_on < b.submitted_on
+			end)
+			local refs = json.safe_table(merge_request.diffRefs)
+			local data = {
+				reviewers = reviewers,
+				history = history,
+				diff_refs = {
+					base_sha = json.safe_str(refs.baseSha),
+					start_sha = json.safe_str(refs.startSha),
+					head_sha = json.safe_str(refs.headSha),
+				},
+			}
+			service.set_memory_cache(cache_key, data)
+			on_done(data, nil)
+		end)
+	end
+
+	fetch_page()
+	return requests
+end
+
+---@param refs GitLabPullRequestDiffRefs|nil
+---@return boolean
+local function complete_diff_refs(refs)
+	return refs ~= nil and (refs.base_sha or "") ~= "" and (refs.start_sha or "") ~= "" and (refs.head_sha or "") ~= ""
+end
+
+---@param comments PullsComment[]
+---@param current table|nil
+local function mark_outdated(comments, current)
+	if not complete_diff_refs(current) then
+		return
+	end
+	for _, comment in ipairs(comments) do
+		local refs = (comment._raw or {}).diff_refs
+		if
+			complete_diff_refs(refs)
+			and (
+				refs.base_sha ~= current.base_sha
+				or refs.start_sha ~= current.start_sha
+				or refs.head_sha ~= current.head_sha
+			)
+		then
+			comment.outdated = true
+			comment.state = comment.state or "OUTDATED"
+		end
+	end
+end
+
+---@param pr PullRequest
+---@param opts { force_refresh: boolean|nil }|nil
+---@param on_done fun(data: PullsReviewData|nil, err: string|nil)
+---@param fetch_comments function
+---@return { cancel: fun() }
+local function fetch_review(pr, opts, on_done, fetch_comments)
+	---@cast pr GitLabPullRequest
+	local requests = request_scope.new()
+	requests.all({
+		comments = function(done)
+			return fetch_comments(pr, opts, done)
+		end,
+		metadata = function(done)
+			return fetch_metadata(pr, opts, done)
+		end,
+	}, function(values, errors)
+		if errors.comments or errors.metadata then
+			on_done(nil, errors.comments or errors.metadata)
+			return
+		end
+
+		local metadata = values.metadata
+		local comments = {}
+		local has_pending = false
+		for _, comment in ipairs(values.comments) do
+			has_pending = has_pending or comment.pending == true
+			if comment.inline or comment.file then
+				table.insert(comments, comment)
+			end
+		end
+		mark_outdated(comments, metadata.diff_refs)
+		if complete_diff_refs(metadata.diff_refs) then
+			pr.diff_refs = metadata.diff_refs
+		end
+		on_done({
+			review = { id = nil, commit_hash = nil, pending = has_pending },
+			comments = comments,
+			tasks = {},
+			reviewers = metadata.reviewers,
+			history = metadata.history,
+		}, nil)
+	end)
+	return requests
+end
+
+---@param pr PullRequest
+---@param opts { force_refresh?: boolean }|nil
+---@param on_done fun(data: PullsReviewData|nil, err: string|nil)
+---@return { cancel: fun() }
+function M.fetch(pr, opts, on_done)
+	return fetch_review(pr, opts, on_done, comments_api.fetch_review_comments)
+end
+
+---@param pr PullRequest
+---@param opts { force_refresh?: boolean }|nil
+---@param on_done fun(data: PullsReviewData|nil, err: string|nil)
+---@return { cancel: fun() }
+function M.fetch_threads(pr, opts, on_done)
+	-- Requires GitLab 19.1+ for comment diff snippets.
+	return fetch_review(pr, opts, on_done, comments_api.fetch_review_threads)
+end
+
+---@param pr PullRequest
+---@param _review PullsReview
+---@param on_done fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.discard(pr, _review, on_done)
+	local path, iid = project_iid(pr)
+	if path == "" or iid == nil then
+		on_done(false, "Invalid MR identifier")
+		return nil
+	end
+
+	local prefix = string.format("/projects/%s/merge_requests/%d/draft_notes", service.url_encode(path), iid)
+	local requests = request_scope.new()
+	local function delete_next(drafts, index)
+		local draft = drafts[index]
+		if not draft then
+			invalidate_review_caches(path, iid)
+			on_done(true, nil)
+			return
+		end
+		requests.run(function(done)
+			return service.request("DELETE", prefix .. "/" .. tostring(draft.id), nil, done, {
+				action = "Delete MR draft comment",
+				project_path = path,
+				iid = iid,
+				draft_note_id = tostring(draft.id),
+			})
+		end, function(_, err)
+			if err then
+				on_done(false, err)
+				return
+			end
+			delete_next(drafts, index + 1)
+		end)
+	end
+
+	requests.run(function(done)
+		return service.fetch_all_pages(prefix, done, {
+			action = "Fetch MR draft comments",
+			project_path = path,
+			iid = iid,
+		})
+	end, function(drafts, err)
+		if err then
+			on_done(false, err)
+			return
+		end
+		delete_next(drafts or {}, 1)
+	end)
+	return requests
+end
+
+---@param pr PullRequest
+---@param reviewer_state "reviewed"|"requested_changes"|nil
+---@param body string|nil
+---@param on_done fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }|nil
+local function publish(pr, reviewer_state, body, on_done)
+	local path, iid = project_iid(pr)
+	if path == "" or iid == nil then
+		on_done(false, "Invalid MR identifier")
+		return nil
+	end
+
+	local payload
+	if body and vim.trim(body) ~= "" then
+		payload = { note = body }
+	end
+	if reviewer_state then
+		payload = payload or {}
+		payload.reviewer_state = reviewer_state
+	end
+
+	local endpoint =
+		string.format("/projects/%s/merge_requests/%d/draft_notes/bulk_publish", service.url_encode(path), iid)
+	return service.request("POST", endpoint, payload, function(_, err)
+		if err then
+			on_done(false, err)
+			return
+		end
+		invalidate_review_caches(path, iid)
+		on_done(true, nil)
+	end, {
+		action = "Publish MR review",
+		project_path = path,
+		iid = iid,
+	})
+end
+
+---@param pr PullRequest
+---@param on_done fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }|nil
+local function approve_pull_request(pr, on_done)
+	local path, iid = project_iid(pr)
+	if path == "" or iid == nil then
+		on_done(false, "Invalid MR identifier")
+		return nil
+	end
+	local endpoint = string.format("/projects/%s/merge_requests/%d/approve", service.url_encode(path), iid)
+	return service.request("POST", endpoint, nil, function(_, err)
+		if err then
+			on_done(false, err)
+			return
+		end
+		invalidate_details_cache(pr)
+		on_done(true, nil)
+	end, {
+		action = "Approve MR",
+		project_path = path,
+		iid = iid,
+	})
+end
+
+---@param pr PullRequest
+---@param _review PullsReview|nil
+---@param body string
+---@param on_done fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.submit(pr, _review, body, on_done)
+	return publish(pr, "reviewed", body, on_done)
+end
+
+---@param pr PullRequest
+---@param _review PullsReview|nil
+---@param body string
+---@param on_done fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }
+function M.approve(pr, _review, body, on_done)
+	local requests = request_scope.new()
+	requests.run(function(done)
+		return publish(pr, "reviewed", body, done)
+	end, function(ok, err)
+		if not ok then
+			on_done(false, err)
+			return
+		end
+		requests.run(function(done)
+			return approve_pull_request(pr, done)
+		end, on_done)
+	end)
+	return requests
+end
+
+---@param pr PullRequest
+---@param _review PullsReview|nil
+---@param body string
+---@param on_done fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.request_changes(pr, _review, body, on_done)
+	return publish(pr, "requested_changes", body, on_done)
+end
+
+---@param pr PullRequest
+---@param opts { force_refresh?: boolean }|nil
+---@param on_done fun(reviewers: PullsReviewer[]|nil, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.fetch_reviewers(pr, opts, on_done)
+	opts = opts or {}
+	local path, iid = project_iid(pr)
+	if path == "" or iid == nil then
+		on_done(nil, "Invalid MR identifier")
+		return nil
+	end
+
+	local cache_key = string.format("gitlab_pulls:reviewers:%s!%d", path, iid)
+	if opts.force_refresh ~= true then
+		local cached, ok = service.get_memory_cache(cache_key)
+		if ok then
+			on_done(cached, nil)
+			return nil
+		end
+	end
+
+	return service.graphql(REVIEWERS_QUERY, { path = path, iid = tostring(iid) }, function(result, err)
+		if err then
+			on_done(nil, err)
+			return
+		end
+		local project = json.nilify(result and result.project)
+		local merge_request = project and json.nilify(project.mergeRequest)
+		if not merge_request then
+			on_done(nil, "GitLab did not return the merge request")
+			return
+		end
+		local reviewers = map_reviewers(merge_request)
+		service.set_memory_cache(cache_key, reviewers)
+		on_done(reviewers, nil)
+	end, { action = "Fetch MR reviewers", project_path = path, iid = iid })
+end
+
+return M

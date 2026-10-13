@@ -1,23 +1,64 @@
 -- Example:
 --   require("atlas").setup({
+--     providers = {
+--       ---@type AtlasGitLabConfig
+--       gitlab = {
+--         base_url = "https://gitlab.com",
+--         token    = vim.env.GITLAB_TOKEN,
+--         cache_ttl = 300, -- Seconds; 0 disables caching.
+--         -- CI options: https://github.com/emrearmagan/atlas.nvim#pipeline-configuration
+--       },
+--     },
 --     pulls = {
---       providers = {
---         gitlab = {
---           base_url = "https://gitlab.com",
---           token    = vim.env.GITLAB_TOKEN,
---           cache_ttl = 300,
---           views = {
---             { name = "Assigned",  key = "1", scope = "assigned_to_me", state = "opened" },
---             { name = "Created",   key = "2", scope = "created_by_me",  state = "opened" },
---             { name = "Reviewing", key = "3", scope = "all",            state = "opened",
---               extra_params = { reviewer_id = "Me" } },
+--       ---@type AtlasGitLabPullsConfig
+--       gitlab = {
+--         views = {
+--           {
+--             name = "Waiting for review",
+--             key = "1",
+--             layout = "compact", -- "compact", "grouped", or "plain".
+--             scope = "reviews_for_me",
+--             state = "opened", -- "opened", "closed", "merged", or "all".
+--             review_states = { "UNREVIEWED", "REVIEW_STARTED" },
+--             -- current_repo = true, -- Local repository; alternative to project/group.
+--             -- project = "group/project", -- Full project path.
+--             -- group = "group/subgroup", -- Full group path.
+--             -- labels = "bug,backend",
+--             -- milestone = "v1.0",
+--             -- assignee_username = "your-user",
+--             -- author_username = "your-user",
+--             -- source_branch = "feature",
+--             -- target_branch = "main",
+--             -- search = "fix",
+--             -- order_by = "updated_at",
+--             -- sort = "desc", -- "asc" or "desc".
 --           },
---           bookmarks = {
---             -- key   = "S",      -- default
---             -- label = "Search", -- default
---             items = {
---               ["Reviewing"]   = { scope = "all", extra_params = { reviewer_id = "Me" } },
---               ["Merged by me"] = { scope = "all", author_username = "me" },
+--           {
+--             name = "Assigned to me",
+--             key = "2",
+--             scope = "assigned_to_me",
+--             state = "opened",
+--           },
+--           {
+--             name = "Created by me",
+--             key = "3",
+--             scope = "created_by_me",
+--             state = "opened",
+--           },
+--         },
+--         bookmarks = {
+--           -- key   = "S",      -- default
+--           -- label = "Search", -- default
+--           items = {
+--             ["Reviewed by me"] = {
+--               scope = "reviews_for_me",
+--               state = "opened",
+--               review_states = { "REVIEWED", "REQUESTED_CHANGES", "APPROVED" },
+--             },
+--             ["Changes requested on mine"] = {
+--               scope = "created_by_me",
+--               state = "opened",
+--               review_states = { "REQUESTED_CHANGES" },
 --             },
 --           },
 --         },
@@ -25,38 +66,35 @@
 --     },
 --   })
 --
--- View options map directly to GitLab API:
---   scope:    "created_by_me" | "assigned_to_me" | "all"
---   labels, milestone, assignee_username, author_username, search
---   order_by: "created_at" | "updated_at" | "title" | ...
---   sort:     "asc" | "desc"
---
--- Anything not covered above can be passed via `extra_params = { key = "value", ... }`.
--- TODO: It should work in theory, but i have not tested it yet...
+-- scope = "all" requires project, group, or current_repo.
+-- TODO: Self-hosted GitLab should work in theory, but I have not tested it yet.
+
+---@alias AtlasGitLabReviewState "UNREVIEWED"|"REVIEW_STARTED"|"REVIEWED"|"REQUESTED_CHANGES"|"APPROVED"|"UNAPPROVED"
 
 ---@class AtlasGitLabPullsSearchConfig
----@field scope "created_by_me"|"assigned_to_me"|"all"|nil
----@field project string|number|nil
----@field group string|number|nil
+---@field scope "created_by_me"|"assigned_to_me"|"reviews_for_me"|"all"|nil
+---@field project string|nil
+---@field group string|nil
+---@field state "opened"|"closed"|"merged"|"all"|nil
+---@field review_states AtlasGitLabReviewState[]|nil
 ---@field labels string|nil
 ---@field milestone string|nil
 ---@field assignee_username string|nil
 ---@field author_username string|nil
----@field search string|nil
+---@field source_branch string|nil
+---@field target_branch string|nil
 ---@field sort "asc"|"desc"|nil
 ---@field order_by "created_at"|"updated_at"|"title"|nil
----@field extra_params table<string, string>|nil
 
 ---@class AtlasGitLabPullsViewConfig : AtlasPullsViewConfig, AtlasGitLabPullsSearchConfig
+
+---@class AtlasGitLabPullsBookmarkConfig : AtlasPullsBookmarkConfig, AtlasGitLabPullsSearchConfig
 
 ---@class AtlasGitLabPullsBookmarksConfig
 ---@field key string|nil    -- default "S"
 ---@field label string|nil  -- default "Search"
----@field items table<string, AtlasGitLabPullsSearchConfig>|nil
+---@field items table<string, AtlasGitLabPullsBookmarkConfig>|nil
 
 ---@class AtlasGitLabPullsConfig
----@field base_url string
----@field token string
----@field cache_ttl number|nil
 ---@field views AtlasGitLabPullsViewConfig[]|nil
 ---@field bookmarks AtlasGitLabPullsBookmarksConfig|nil

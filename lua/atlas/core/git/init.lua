@@ -1,50 +1,205 @@
 local M = {}
 
-local function trim(s)
-	if type(s) ~= "string" then
-		return ""
-	end
-	return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+local logger = require("atlas.core.logger")
+local providers = require("atlas.providers")
+local requests = require("atlas.core.requests")
+
+local function trim(value)
+	return vim.trim(value or "")
 end
 
+local function redact(value)
+	return tostring(value or ""):gsub("(%a[%w+.-]*://)[^/@%s]+@", "%1***@")
+end
+
+---@param res vim.SystemCompleted
+---@param context table
+local function log_failure(res, context)
+	if res.code == 0 then
+		return
+	end
+	context.code = res.code
+	context.error = redact(trim(res.stderr))
+	logger.logerror("git failed", context)
+end
+
+---@param res vim.SystemCompleted
+---@param fallback string
+---@return boolean, string|nil
+local function command_result(res, fallback)
+	if res.code == 0 then
+		return true, nil
+	end
+	local err = trim(res.stderr)
+	return false, err ~= "" and err or fallback
+end
+
+---@param line string
+---@return string|nil label
+---@return integer|nil percent
+local function parse_progress(line)
+	line = trim(line):gsub("^remote:%s*", "")
+	local label, percent = line:match("^([^:]+):%s*(%d+)%%")
+	return label and trim(label) or nil, percent and tonumber(percent) or nil
+end
+
+---@class AtlasGitRunOpts: vim.SystemOpts
+---@field console? boolean
+
 ---@param args string[] Arguments after `git`.
----@param opts vim.SystemOpts|nil
+---@param opts AtlasGitRunOpts|nil
 ---@param on_done fun(res: vim.SystemCompleted)
+---@param on_progress (fun(label: string, percent: integer))|nil
 ---@return { cancel: fun() }
-function M.run(args, opts, on_done)
+function M.run(args, opts, on_done, on_progress)
 	local cancelled = false
-	local finished = false
-	local handle = vim.system(vim.list_extend({ "git" }, args), opts or {}, function(res)
+	local system_opts = vim.tbl_extend("force", {}, opts or {})
+	local command = vim.list_extend({ "git" }, args)
+	local context = { command = vim.tbl_map(redact, command), cwd = system_opts.cwd }
+	logger.loginfo("git", context)
+	---@type AtlasConsoleOutput|nil
+	local output
+	if system_opts.console then
+		local console = require("atlas.ui.console")
+		output = console.start(table.concat(context.command, " "), system_opts.cwd)
+		console.open(false, 300)
+	end
+	system_opts.console = nil
+	local stdout = {}
+	local stderr = {}
+	local pending = ""
+	local last_progress = ""
+	local console_pending = { stdout = "", stderr = "" }
+
+	---@param stream "stdout"|"stderr"
+	---@param data string|nil
+	local function write_output(stream, data)
+		if not output then
+			return
+		end
+		local text = console_pending[stream] .. (data or "")
+		local boundary = #text
+		if data then
+			boundary = text:match(".*()[\r\n]")
+		end
+		if boundary then
+			output:write(redact(text:sub(1, boundary)))
+			text = text:sub(boundary + 1)
+		end
+		console_pending[stream] = text
+	end
+
+	---@param report fun(label: string, percent: integer)
+	local function report_progress(line, report)
+		local label, percent = parse_progress(line)
+		if not label or percent == nil then
+			return
+		end
+		local progress = label .. ":" .. percent
+		if progress == last_progress then
+			return
+		end
+		last_progress = progress
 		vim.schedule(function()
+			if not cancelled then
+				report(label, percent)
+			end
+		end)
+	end
+
+	if output then
+		system_opts.stdout = function(_, data)
+			if data then
+				table.insert(stdout, data)
+				write_output("stdout", data)
+			end
+		end
+	end
+
+	if on_progress or output then
+		system_opts.stderr = function(_, data)
+			if not data then
+				return
+			end
+			table.insert(stderr, data)
+			write_output("stderr", data)
+			if not on_progress then
+				return
+			end
+			pending = pending .. data
+			while true do
+				local boundary = pending:find("[\r\n]")
+				if not boundary then
+					break
+				end
+				report_progress(pending:sub(1, boundary - 1), on_progress)
+				pending = pending:sub(boundary + 1)
+			end
+		end
+	end
+
+	local function finish(res)
+		if on_progress and pending ~= "" then
+			report_progress(pending, on_progress)
+		end
+		if output then
+			res.stdout = table.concat(stdout)
+			if system_opts.text then
+				res.stdout = res.stdout:gsub("\r\n", "\n")
+			end
+		end
+		if on_progress or output then
+			res.stderr = #stderr > 0 and table.concat(stderr) or res.stderr or ""
+			if system_opts.text then
+				res.stderr = res.stderr:gsub("\r\n", "\n")
+			end
+		end
+		if not cancelled then
+			log_failure(res, context)
+			if output then
+				write_output("stdout", nil)
+				write_output("stderr", nil)
+				output:finish(res.code)
+			end
+		end
+		vim.schedule(function()
+			if not cancelled then
+				on_done(res)
+			end
+		end)
+	end
+
+	local ok, result = pcall(vim.system, command, system_opts, finish)
+	---@type vim.SystemObj|nil
+	local handle = ok and result or nil
+	if not ok then
+		if output then
+			output:write(redact(tostring(result)))
+		end
+		finish({ code = -1, signal = 0, stdout = "", stderr = tostring(result) })
+	end
+	return {
+		cancel = function()
 			if cancelled then
 				return
 			end
-			finished = true
-			on_done(res)
-		end)
-	end)
-	return {
-		cancel = function()
-			if cancelled or finished then
-				return
-			end
 			cancelled = true
-			pcall(handle.kill, handle, 9)
+			if output then
+				write_output("stdout", nil)
+				write_output("stderr", nil)
+				output:finish(nil)
+			end
+			if handle then
+				pcall(handle.kill, handle, 9)
+			end
 		end,
 	}
 end
 
----@param cmd string[]
----@param cwd string
----@param on_done fun(res: vim.SystemCompleted)
-local function run(cmd, cwd, on_done)
-	vim.system(cmd, { cwd = cwd, text = true }, on_done)
-end
-
 ---@return string
-local function default_cwd()
+function M.default_cwd()
 	local buf_name = vim.api.nvim_buf_get_name(0)
-	if type(buf_name) == "string" and buf_name ~= "" then
+	if buf_name ~= "" then
 		local dir = vim.fn.fnamemodify(buf_name, ":h")
 		if vim.fn.isdirectory(dir) == 1 then
 			return dir
@@ -54,326 +209,263 @@ local function default_cwd()
 end
 
 ---@param cwd string|nil
----@return string|nil root, string|nil err
-function M.repo_root(cwd)
-	cwd = cwd or default_cwd()
-	local res = vim.system({ "git", "-C", cwd, "rev-parse", "--show-toplevel" }, { text = true }):wait()
-	if res.code ~= 0 then
-		return nil, "Not in a git repository"
-	end
-	local root = trim(res.stdout)
-	if root == "" then
-		return nil, "Not in a git repository"
-	end
-	return root, nil
+---@param on_done fun(root: string|nil, err: string|nil)
+---@return { cancel: fun() }
+function M.repo_root(cwd, on_done)
+	cwd = cwd or M.default_cwd()
+	return M.run({ "-C", cwd, "rev-parse", "--show-toplevel" }, { text = true }, function(res)
+		on_done(res.code == 0 and trim(res.stdout) or nil, res.code ~= 0 and "Not in a git repository" or nil)
+	end)
 end
 
 ---@param root string
----@return string|nil branch, string|nil err
-function M.current_branch(root)
-	local res = vim.system({ "git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD" }, { text = true }):wait()
-	if res.code ~= 0 then
-		return nil, "Failed to detect current branch"
-	end
-	local branch = trim(res.stdout)
-	if branch == "" or branch == "HEAD" then
-		return nil, "Detached HEAD — checkout a branch first"
-	end
-	return branch, nil
+---@param on_done fun(branch: string|nil, err: string|nil)
+---@return { cancel: fun() }
+function M.current_branch(root, on_done)
+	return M.run({ "-C", root, "rev-parse", "--abbrev-ref", "HEAD" }, { text = true }, function(res)
+		if res.code ~= 0 then
+			on_done(nil, "Failed to detect current branch")
+			return
+		end
+		local branch = trim(res.stdout)
+		if branch == "HEAD" then
+			on_done(nil, "Detached HEAD - checkout a branch first")
+			return
+		end
+		on_done(branch, nil)
+	end)
 end
 
 ---@param root string
 ---@param rev string
----@return boolean
-function M.rev_exists(root, rev)
-	if root == "" or rev == "" then
-		return false
-	end
-	local res = vim.system({ "git", "-C", root, "rev-parse", "--verify", "--quiet", rev }, { text = true }):wait()
-	return res.code == 0
+---@param on_done fun(exists: boolean)
+---@return { cancel: fun() }
+function M.rev_exists(root, rev, on_done)
+	return M.run(
+		{ "-C", root, "rev-parse", "--verify", "--quiet", rev .. "^{commit}" },
+		{ text = true, env = { GIT_NO_LAZY_FETCH = "1" } },
+		function(res)
+			on_done(res.code == 0)
+		end
+	)
 end
 
 ---@param root string
----@param revision string
----@return string|nil
-function M.resolve_revision(root, revision)
-	local res = vim.system(
-		{ "git", "-C", root, "rev-parse", "--verify", "--end-of-options", revision .. "^{commit}" },
-		{ text = true }
-	):wait()
-	local hash = trim(res.stdout)
-	return res.code == 0 and hash ~= "" and hash or nil
+---@param commits string[]
+---@param on_done fun(exists: boolean[]|nil, err: string|nil)
+---@return { cancel: fun() }
+function M.check_commits(root, commits, on_done)
+	local queries = {}
+	for index, commit in ipairs(commits) do
+		queries[index] = commit .. "^{commit}"
+	end
+	return M.run({ "-C", root, "cat-file", "--batch-check=%(objecttype)" }, {
+		text = true,
+		stdin = table.concat(queries, "\n") .. "\n",
+		env = { GIT_NO_LAZY_FETCH = "1" },
+	}, function(res)
+		local ok, err = command_result(res, "Failed to check commits")
+		if not ok then
+			on_done(nil, err)
+			return
+		end
+		local exists = {}
+		for index, result in ipairs(vim.split(res.stdout or "", "\n", { plain = true, trimempty = true })) do
+			exists[index] = trim(result) == "commit"
+		end
+		on_done(exists, nil)
+	end)
 end
 
 ---@param root string
 ---@param base string
 ---@param head string
----@return string|nil base_revision
----@return string|nil head_revision
----@return string|nil err
-function M.diff_revisions(root, base, head)
+---@param on_done fun(base: string|nil, head: string|nil, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.diff_revisions(root, base, head, on_done)
 	base = trim(base)
 	head = trim(head)
 	if base == "" or head == "" then
-		return nil, nil, "Base and head branches are required"
+		on_done(nil, nil, "Base and head branches are required")
+		return nil
 	end
 
-	local base_revision = base
 	local remote_base = base:match("^origin/") and base or "origin/" .. base
-	if M.rev_exists(root, remote_base) then
-		base_revision = remote_base
-	elseif not M.rev_exists(root, base) then
-		return nil, nil, "Base branch not found: " .. base
-	end
-	if not M.rev_exists(root, head) then
-		return nil, nil, "Head branch not found: " .. head
-	end
-	return base_revision, head, nil
-end
-
----@param root string
----@param base string
----@param head string
----@return string|nil range
----@return string|nil err
-function M.commit_range(root, base, head)
-	local base_revision, head_revision, err = M.diff_revisions(root, base, head)
-	if not base_revision or not head_revision then
-		return nil, err
-	end
-	return base_revision .. ".." .. head_revision
+	return M.check_commits(root, { remote_base, base, head }, function(exists, err)
+		if not exists then
+			on_done(nil, nil, err)
+		elseif not exists[1] and not exists[2] then
+			on_done(nil, nil, "Base branch not found: " .. base)
+		elseif not exists[3] then
+			on_done(nil, nil, "Head branch not found: " .. head)
+		else
+			on_done(exists[1] and remote_base or base, head, nil)
+		end
+	end)
 end
 
 ---@param root string
 ---@param range string
----@return { hash: string, subject: string }[]
-function M.commits_for_range(root, range)
-	local res = vim.system({ "git", "-C", root, "log", "--reverse", "--format=%h %s", range }, { text = true }):wait()
-	if res.code ~= 0 then
-		return {}
-	end
-
-	local commits = {}
-	for line in tostring(res.stdout or ""):gmatch("[^\r\n]+") do
-		local hash, subject = line:match("^(%S+)%s+(.+)$")
-		hash = trim(hash)
-		subject = trim(subject)
-		if hash ~= "" and subject ~= "" then
-			table.insert(commits, { hash = hash, subject = subject })
+---@param on_done fun(commits: { hash: string, subject: string }[]|nil, err: string|nil)
+---@return { cancel: fun() }
+function M.commits_for_range(root, range, on_done)
+	return M.run({ "-C", root, "log", "--reverse", "--format=%h %s", range }, { text = true }, function(res)
+		local ok, err = command_result(res, "Failed to load commits")
+		if not ok then
+			on_done(nil, err)
+			return
 		end
-	end
-	return commits
+		local commits = {}
+		for line in (res.stdout or ""):gmatch("[^\r\n]+") do
+			local hash, subject = line:match("^(%S+)%s+(.+)$")
+			if hash and subject then
+				table.insert(commits, { hash = hash, subject = trim(subject) })
+			end
+		end
+		on_done(commits, nil)
+	end)
 end
 
 ---@param root string
 ---@param base string
 ---@param head string
----@return string[]|nil lines
----@return string|nil err
-function M.diff_stat(root, base, head)
-	local base_revision, head_revision, revision_err = M.diff_revisions(root, base, head)
-	if not base_revision or not head_revision then
-		return nil, revision_err
-	end
-	local range = base_revision .. "..." .. head_revision
-	local res = vim.system({ "git", "-C", root, "diff", "--find-renames", "--stat", range, "--" }, { text = true })
-		:wait()
-	if res.code ~= 0 then
-		local err = trim(res.stderr)
-		return nil, err ~= "" and err or "Failed to load diff statistics"
-	end
-
-	local lines = {}
-	for line in tostring(res.stdout or ""):gmatch("[^\r\n]+") do
-		table.insert(lines, line)
-	end
-	return lines, nil
+---@param on_done fun(lines: string[]|nil, err: string|nil)
+---@return { cancel: fun() }
+function M.diff_stat(root, base, head, on_done)
+	return M.run(
+		{ "-C", root, "diff", "--find-renames", "--stat", base .. "..." .. head, "--" },
+		{ text = true },
+		function(res)
+			local ok, err = command_result(res, "Failed to load diff statistics")
+			on_done(ok and vim.split(res.stdout or "", "\n", { plain = true, trimempty = true }) or nil, err)
+		end
+	)
 end
 
 ---@param root string
 ---@param remote string|nil  -- defaults to "origin"
----@return string|nil url, string|nil err
-function M.remote_url(root, remote)
+---@param on_done fun(url: string|nil, err: string|nil)
+---@return { cancel: fun() }
+function M.remote_url(root, remote, on_done)
 	remote = remote or "origin"
-	local res = vim.system({ "git", "-C", root, "remote", "get-url", remote }, { text = true }):wait()
-	if res.code ~= 0 then
-		return nil, string.format("Remote '%s' is not configured", remote)
-	end
-	local url = trim(res.stdout)
-	if url == "" then
-		return nil, string.format("Remote '%s' has no URL", remote)
-	end
-	return url, nil
+	return M.run({ "-C", root, "remote", "get-url", remote }, { text = true }, function(res)
+		on_done(
+			res.code == 0 and trim(res.stdout) or nil,
+			res.code ~= 0 and string.format("Remote '%s' is not configured", remote) or nil
+		)
+	end)
 end
 
----@class AtlasGitRemoteInfo
----@field host string -- e.g. "github.com" / "bitbucket.org" / "gitlab.com"
----@field provider string
----@field slug string -- "owner/repo" or nested "group/subgroup/repo" (without .git)
----@field owner string
----@field repo string
----@field url string -- original remote URL
-
----@param url string
----@return AtlasGitRemoteInfo|nil info, string|nil err
-function M.parse_remote_url(url)
-	if type(url) ~= "string" or url == "" then
-		return nil, "Empty remote URL"
+---@param remote string
+---@return AtlasTarget|nil target, string|nil err
+function M.parse_remote_url(remote)
+	local target, err = providers.resolve(remote)
+	if target and target.entity == "repo" then
+		return target
 	end
-
-	local host, path
-	-- ssh form: git@github.com:owner/repo.git
-	host, path = url:match("^[%w_-]+@([^:]+):(.+)$")
-	if host == nil then
-		-- https form: https://github.com/owner/repo(.git)
-		host, path = url:match("^https?://[^/]-([^/@]+)/(.+)$")
-		if host == nil then
-			-- git:// or ssh://
-			host, path = url:match("^[%w]+://[^/]-([^/@]+)/(.+)$")
-		end
-	end
-
-	if host == nil or path == nil then
-		return nil, string.format("Could not parse remote URL: %s", url)
-	end
-
-	path = path:gsub("%.git$", "")
-	local owner, repo = path:match("^([^/]+)/(.+)$")
-	if owner == nil or repo == nil then
-		return nil, string.format("Could not parse owner/repo from: %s", url)
-	end
-
-	local provider = require("atlas.providers.resolve").provider_for_host(host) or "unknown"
-
-	return {
-		host = host,
-		provider = provider,
-		slug = owner .. "/" .. repo,
-		owner = owner,
-		repo = repo,
-		url = url,
-	},
-		nil
+	return nil, err or "Expected a supported Git repository remote"
 end
 
 ---@param cwd string|nil
----@return AtlasGitRemoteInfo|nil
-function M.local_repository(cwd)
-	local root = M.repo_root(cwd)
-	local remote_url = root and M.remote_url(root, "origin") or nil
-	local info = remote_url and M.parse_remote_url(remote_url) or nil
-	return info and info.provider ~= "unknown" and info or nil
+---@param on_done fun(target: AtlasTarget|nil, err: string|nil)
+---@return { cancel: fun() }
+function M.local_repository(cwd, on_done)
+	return M.remote_url(cwd or M.default_cwd(), "origin", function(remote, err)
+		if not remote then
+			on_done(nil, err)
+			return
+		end
+		on_done(M.parse_remote_url(remote))
+	end)
 end
 
 ---@param root string
 ---@param remote string|nil
----@return string|nil branch, string|nil err
-function M.default_branch(root, remote)
+---@param on_done fun(branch: string|nil, err: string|nil)
+---@return { cancel: fun() }
+function M.default_branch(root, remote, on_done)
 	remote = remote or "origin"
-
-	local res = vim.system({ "git", "-C", root, "symbolic-ref", "refs/remotes/" .. remote .. "/HEAD" }, { text = true })
-		:wait()
-	if res.code == 0 then
-		local ref = trim(res.stdout)
-		local branch = ref:match("refs/remotes/[^/]+/(.+)$")
-		if branch and branch ~= "" then
-			return branch, nil
+	local scope = requests.new()
+	scope.run(function(done)
+		return M.run({ "-C", root, "symbolic-ref", "refs/remotes/" .. remote .. "/HEAD" }, { text = true }, done)
+	end, function(res)
+		local branch = res.code == 0 and trim(res.stdout):match("refs/remotes/[^/]+/(.+)$") or nil
+		if branch then
+			on_done(branch, nil)
+			return
 		end
-	end
-
-	res = vim.system({ "git", "-C", root, "ls-remote", "--symref", remote, "HEAD" }, { text = true }):wait()
-	if res.code == 0 then
-		local ref = res.stdout:match("ref: refs/heads/([^%s]+)%s+HEAD")
-		if ref and ref ~= "" then
-			return ref, nil
-		end
-	end
-
-	return nil, "Could not determine default branch"
+		scope.run(function(done)
+			return M.run({ "-C", root, "ls-remote", "--symref", remote, "HEAD" }, { text = true }, done)
+		end, function(result)
+			local name = result.code == 0 and (result.stdout or ""):match("ref: refs/heads/([^%s]+)%s+HEAD") or nil
+			on_done(name, not name and "Could not determine default branch" or nil)
+		end)
+	end)
+	return scope
 end
 
 ---@param root string
 ---@param remote string
----@return string[] branches
-function M.list_remote_branches(root, remote)
+---@param on_done fun(branches: string[]|nil, err: string|nil)
+---@return { cancel: fun() }
+function M.list_remote_branches(root, remote, on_done)
 	remote = remote or "origin"
-	local res = vim.system({ "git", "-C", root, "branch", "-r", "--format=%(refname:short)" }, { text = true }):wait()
-	if res.code ~= 0 then
-		return {}
-	end
-	local prefix = remote .. "/"
-	local out = {}
-	local seen = {}
-	for line in (res.stdout or ""):gmatch("[^\r\n]+") do
-		local name = trim(line)
-		if name ~= "" and name:sub(1, #prefix) == prefix then
-			local short = name:sub(#prefix + 1)
-			if short ~= "HEAD" and not seen[short] then
-				seen[short] = true
-				table.insert(out, short)
+	return M.run({ "-C", root, "branch", "-r", "--format=%(refname:short)" }, { text = true }, function(res)
+		local ok, err = command_result(res, "Failed to list remote branches")
+		if not ok then
+			on_done(nil, err)
+			return
+		end
+		local prefix = remote .. "/"
+		local out = {}
+		for line in (res.stdout or ""):gmatch("[^\r\n]+") do
+			local name = trim(line)
+			if name:sub(1, #prefix) == prefix then
+				local short = name:sub(#prefix + 1)
+				if short ~= "HEAD" then
+					table.insert(out, short)
+				end
 			end
 		end
-	end
-	return out
+		on_done(out, nil)
+	end)
 end
 
 ---@param root string
----@param branch string
----@param remote string|nil
----@return boolean
-function M.branch_exists_on_remote(root, branch, remote)
-	remote = remote or "origin"
-	local res = vim.system(
-		{ "git", "-C", root, "ls-remote", "--exit-code", "--heads", remote, branch },
-		{ text = true }
-	)
-		:wait()
-	return res.code == 0
-end
-
----@param root string
----@return boolean
-function M.is_inside_work_tree(root)
-	local res = vim.system({ "git", "-C", root, "rev-parse", "--is-inside-work-tree" }, { text = true }):wait()
-	return res.code == 0
+---@param on_done fun(inside: boolean)
+---@return { cancel: fun() }
+function M.is_inside_work_tree(root, on_done)
+	return M.run({ "-C", root, "rev-parse", "--is-inside-work-tree" }, { text = true }, function(res)
+		on_done(res.code == 0)
+	end)
 end
 
 ---@param root string
 ---@param remote string
 ---@param refs string[]
 ---@param on_done fun(ok: boolean, err: string|nil)
+---@param opts { console?: boolean, on_progress?: fun(label: string, percent: integer) }|nil
 ---@return { cancel: fun() }
-function M.fetch_refs(root, remote, refs, on_done)
+function M.fetch_refs(root, remote, refs, on_done, opts)
+	opts = opts or {}
 	local args = { "fetch", "--no-tags", remote }
+	if opts.on_progress or opts.console then
+		table.insert(args, 2, "--progress")
+	end
 	vim.list_extend(args, refs)
 
-	return M.run(args, { cwd = root, text = true }, function(res)
-		if res.code ~= 0 then
-			local err = trim(res.stderr)
-			if err == "" then
-				err = string.format("git fetch failed with code %d", res.code)
-			end
-			on_done(false, err)
-			return
-		end
-		on_done(true, nil)
-	end)
+	return M.run(args, { cwd = root, text = true, console = opts.console }, function(res)
+		on_done(command_result(res, string.format("git fetch failed with code %d", res.code)))
+	end, opts.on_progress)
 end
 
 ---@param root string
 ---@param branch string
 ---@param on_done fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }
 function M.checkout_branch(root, branch, on_done)
-	run({ "git", "checkout", branch }, root, function(res)
-		if res.code ~= 0 then
-			local err = trim(res.stderr)
-			if err == "" then
-				err = "git checkout branch failed"
-			end
-			on_done(false, err)
-			return
-		end
-		on_done(true, nil)
+	return M.run({ "checkout", branch }, { cwd = root, text = true }, function(res)
+		on_done(command_result(res, "git checkout branch failed"))
 	end)
 end
 
@@ -381,17 +473,10 @@ end
 ---@param branch string
 ---@param start_point string
 ---@param on_done fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }
 function M.checkout_new_branch(root, branch, start_point, on_done)
-	run({ "git", "checkout", "-b", branch, start_point }, root, function(res)
-		if res.code ~= 0 then
-			local err = trim(res.stderr)
-			if err == "" then
-				err = "git checkout branch failed"
-			end
-			on_done(false, err)
-			return
-		end
-		on_done(true, nil)
+	return M.run({ "checkout", "-b", branch, start_point }, { cwd = root, text = true }, function(res)
+		on_done(command_result(res, "git checkout branch failed"))
 	end)
 end
 
@@ -399,22 +484,15 @@ end
 ---@param branch string
 ---@param remote string|nil
 ---@param on_done fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }
 function M.push_branch(root, branch, remote, on_done)
 	remote = remote or "origin"
-	run(
-		{ "git", "-C", root, "push", "-u", remote, branch },
-		root,
-		vim.schedule_wrap(function(res)
-			if res.code ~= 0 then
-				local err = trim(res.stderr)
-				if err == "" then
-					err = string.format("git push failed with code %d", res.code)
-				end
-				on_done(false, err)
-				return
-			end
-			on_done(true, nil)
-		end)
+	return M.run(
+		{ "push", "--progress", "-u", remote, branch },
+		{ cwd = root, text = true, console = true },
+		function(res)
+			on_done(command_result(res, string.format("git push failed with code %d", res.code)))
+		end
 	)
 end
 

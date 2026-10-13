@@ -11,18 +11,9 @@ local utils = require("atlas.ui.shared.utils")
 ---@field hidden? boolean
 ---@field index? number
 
----@class AtlasHelpCommandItem
----@field name string
----@field desc string
----@field callback? function|string
----@field opts? table
----@field hidden? boolean
----@field index? number
-
 ---@class AtlasHelpGroupOpts
 ---@field buffer integer
 ---@field index? number
----@field add_to_registry? boolean
 
 ---@class AtlasHelpToggleOpts
 ---@field buffer? integer
@@ -43,11 +34,11 @@ local function ensure_state(bufnr)
 	if not state.buffers[bufnr] then
 		state.buffers[bufnr] = {
 			keys = {},
-			commands = {},
 			group_opts = {},
+			mapped = {},
 		}
 
-		vim.api.nvim_create_autocmd("BufWipeout", {
+		state.buffers[bufnr].cleanup = vim.api.nvim_create_autocmd("BufWipeout", {
 			buffer = bufnr,
 			callback = function()
 				state.buffers[bufnr] = nil
@@ -128,6 +119,10 @@ function M.register(group, items, opts)
 		if item.callback then
 			for _, k in ipairs(keys) do
 				vim.keymap.set(mode, k, item.callback, key_opts)
+				for _, map_mode in ipairs(normalize_keys(mode)) do
+					bstate.mapped[map_mode] = bstate.mapped[map_mode] or {}
+					bstate.mapped[map_mode][k] = true
+				end
 			end
 		end
 
@@ -145,40 +140,23 @@ function M.register(group, items, opts)
 	end
 end
 
----@param group string The name of the group
----@param items AtlasHelpCommandItem[]
----@param opts AtlasHelpGroupOpts
-function M.register_command(group, items, opts)
-	local bufnr = require_buffer(opts, "help.register_command")
-
-	local bstate = ensure_state(bufnr)
-	if not bstate.commands[group] then
-		bstate.commands[group] = {}
-		bstate.group_opts[group] = {}
+-- Drop every mapping and help entry Atlas registered on a buffer. Needed for buffers that outlive
+-- the view that mapped them, such as the worktree files behind a diff's head side.
+---@param bufnr integer
+function M.remove_buffer(bufnr)
+	local bstate = state.buffers[bufnr]
+	if not bstate then
+		return
 	end
-
-	if opts.index then
-		bstate.group_opts[group].index = opts.index
-	end
-
-	for _, item in ipairs(items) do
-		local cmd_opts = item.opts or {}
-		cmd_opts.desc = item.desc
-
-		if item.callback then
-			vim.api.nvim_buf_create_user_command(bufnr, item.name, item.callback, cmd_opts)
-		end
-
-		if not item.hidden then
-			remove_existing_entry(bstate.commands[group], "name", item.name)
-
-			table.insert(bstate.commands[group], {
-				name = item.name,
-				desc = item.desc,
-				index = item.index or DEFAULT_INDEX,
-			})
+	pcall(vim.api.nvim_del_autocmd, bstate.cleanup)
+	if vim.api.nvim_buf_is_valid(bufnr) then
+		for mode, keys in pairs(bstate.mapped) do
+			for key in pairs(keys) do
+				pcall(vim.keymap.del, mode, key, { buffer = bufnr })
+			end
 		end
 	end
+	state.buffers[bufnr] = nil
 end
 
 ---@param group string The name of the group
@@ -195,8 +173,13 @@ function M.remove(group, items, opts)
 		local mode = item.mode or "n"
 		local keys = normalize_keys(item.key)
 
-		for _, key in ipairs(keys) do
-			pcall(vim.keymap.del, mode, key, { buffer = bufnr })
+		for _, map_mode in ipairs(normalize_keys(mode)) do
+			for _, key in ipairs(keys) do
+				pcall(vim.keymap.del, map_mode, key, { buffer = bufnr })
+				if bstate.mapped[map_mode] then
+					bstate.mapped[map_mode][key] = nil
+				end
+			end
 		end
 
 		local display_key = table.concat(keys, KEY_SEPARATOR)
@@ -205,9 +188,7 @@ function M.remove(group, items, opts)
 
 	if #bstate.keys[group] == 0 then
 		bstate.keys[group] = nil
-		if not bstate.commands[group] then
-			bstate.group_opts[group] = nil
-		end
+		bstate.group_opts[group] = nil
 	end
 end
 
@@ -219,64 +200,35 @@ local function group_index(bstate, group_name)
 	return (opts and opts.index) or DEFAULT_INDEX
 end
 
----@param group table
----@param item table
----@return string
-local function group_item_left(group, item)
-	return group.is_cmd and item.name or item.key
-end
-
 ---@param bstate table
 ---@return table[]
-local function collect_all_groups(bstate)
-	local all_groups = {}
+local function collect_groups(bstate)
+	local groups = {}
 
 	for group_name, items in pairs(bstate.keys) do
-		table.insert(all_groups, {
-			name = group_name,
-			items = items,
-			is_cmd = false,
-			index = group_index(bstate, group_name),
-		})
+		if #items > 0 then
+			table.sort(items, function(a, b)
+				if a.index == b.index then
+					return a.key < b.key
+				end
+				return a.index < b.index
+			end)
+			table.insert(groups, {
+				name = group_name,
+				items = items,
+				index = group_index(bstate, group_name),
+			})
+		end
 	end
 
-	for group_name, items in pairs(bstate.commands) do
-		table.insert(all_groups, {
-			name = group_name,
-			items = items,
-			is_cmd = true,
-			index = group_index(bstate, group_name),
-		})
-	end
-
-	table.sort(all_groups, function(a, b)
+	table.sort(groups, function(a, b)
 		if a.index == b.index then
 			return a.name < b.name
 		end
 		return a.index < b.index
 	end)
 
-	return all_groups
-end
-
----@param all_groups table[]
----@return table[]
-local function collect_valid_groups(all_groups)
-	local valid_groups = {}
-
-	for _, group in ipairs(all_groups) do
-		if #group.items > 0 then
-			table.sort(group.items, function(a, b)
-				if a.index == b.index then
-					return group_item_left(group, a) < group_item_left(group, b)
-				end
-				return a.index < b.index
-			end)
-			table.insert(valid_groups, group)
-		end
-	end
-
-	return valid_groups
+	return groups
 end
 
 ---@param valid_groups table[]
@@ -289,7 +241,7 @@ local function build_render_items(valid_groups)
 		for item_index, item in ipairs(group.items) do
 			table.insert(render_items, {
 				type = "item",
-				left = group_item_left(group, item),
+				left = item.key,
 				right = item.desc,
 				group_index = i,
 				item_index = item_index,
@@ -367,27 +319,23 @@ local function get_layout(bufnr, max_width)
 		return { lines = {}, highlights = {}, height = 0 }
 	end
 
-	local valid_groups = collect_valid_groups(collect_all_groups(bstate))
+	local valid_groups = collect_groups(bstate)
 	if #valid_groups == 0 then
 		return { lines = { "  No bindings registered  " }, highlights = {}, height = 1 }
 	end
 
 	local lines = { "" }
 	local highlights = {}
-	local height = 1
 
 	local render_items = build_render_items(valid_groups)
 	local num_cols, col_width, key_widths = columns_for(render_items, max_width)
 
 	local current_line = ""
-	local line_idx = 1
 	local col_idx = 0
 
 	local function flush_line()
 		if current_line ~= "" then
 			table.insert(lines, current_line)
-			height = height + 1
-			line_idx = line_idx + 1
 			current_line = ""
 			col_idx = 0
 		end
@@ -395,8 +343,6 @@ local function get_layout(bufnr, max_width)
 
 	local function add_empty_line()
 		table.insert(lines, "")
-		height = height + 1
-		line_idx = line_idx + 1
 		col_idx = 0
 	end
 
@@ -410,7 +356,7 @@ local function get_layout(bufnr, max_width)
 			end
 
 			local txt = render_item.text
-			add_highlight(highlights, "Title", line_idx, 2, 2 + #txt)
+			add_highlight(highlights, "Title", #lines, 2, 2 + #txt)
 			current_line = "  " .. txt
 			flush_line()
 		else
@@ -441,12 +387,12 @@ local function get_layout(bufnr, max_width)
 			local pad_len = math.max(0, content_width - display_width(display_str))
 
 			local start_col = #current_line + 2
-			add_highlight(highlights, "Special", line_idx, start_col, start_col + #left_str)
+			add_highlight(highlights, "Special", #lines, start_col, start_col + #left_str)
 			if right_str ~= "" then
 				add_highlight(
 					highlights,
 					"Comment",
-					line_idx,
+					#lines,
 					start_col + #padded_left,
 					start_col + #padded_left + #right_str
 				)
@@ -462,7 +408,7 @@ local function get_layout(bufnr, max_width)
 		add_empty_line()
 	end
 
-	return { lines = lines, highlights = highlights, height = height }
+	return { lines = lines, highlights = highlights, height = #lines }
 end
 
 local function cleanup_ui()

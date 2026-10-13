@@ -1,11 +1,8 @@
 local M = {}
 
-local service = require("atlas.issues.providers.jira.api.service")
+local service = require("atlas.providers.jira.client")
 local normalizer = require("atlas.issues.providers.jira.api.mapper")
-local markdown = require("atlas.issues.providers.jira.converted.markdown")
-local config = require("atlas.issues.providers.jira.api.config")
-
-local PANEL_CACHE_TTL = 300
+local markdown = require("atlas.formats.adf.from_markdown")
 
 ---@param raw table
 ---@param issue_key string
@@ -18,18 +15,14 @@ local function map_comments(raw, issue_key)
 end
 
 ---@param issue_key string
----@param start_at number|nil
----@param max_results number|nil
 ---@param callback fun(comments: IssueComment[]|nil, err: string|nil)
----@param opts { force_load?: boolean }|nil
+---@param opts { force_refresh?: boolean }|nil
 ---@return { job_id: integer, cancel: fun() }|nil
-function M.get_comments_page(issue_key, start_at, max_results, callback, opts)
+function M.get_comments(issue_key, callback, opts)
 	opts = opts or {}
-	local start = tonumber(start_at) or 0
-	local size = tonumber(max_results) or 100
-	local cache_key = string.format("jira:panel:comments:%s:start:%d:size:%d", issue_key, start, size)
+	local cache_key = "jira:panel:comments:" .. issue_key
 
-	if not opts.force_load then
+	if not opts.force_refresh then
 		local cached, ok = service.get_memory_cache(cache_key)
 		if ok then
 			callback(cached, nil)
@@ -37,7 +30,7 @@ function M.get_comments_page(issue_key, start_at, max_results, callback, opts)
 		end
 	end
 
-	local endpoint = string.format("/issue/%s/comment?startAt=%d&maxResults=%d", issue_key, start, size)
+	local endpoint = string.format("/issue/%s/comment?maxResults=100", issue_key)
 
 	return service.request("GET", endpoint, nil, function(result, err)
 		if err or not result then
@@ -46,13 +39,48 @@ function M.get_comments_page(issue_key, start_at, max_results, callback, opts)
 		end
 
 		local comments = map_comments(result, issue_key)
-		service.set_memory_cache(cache_key, comments, PANEL_CACHE_TTL)
+		service.set_memory_cache(cache_key, comments)
 		callback(comments, nil)
 	end, {
-		action = "Fetch comments page",
+		action = "Fetch comments",
 		issue_key = issue_key,
-		start_at = start,
-		max_results = size,
+	})
+end
+
+---@param issue_key string
+---@param comment string
+---@param comment_id string|nil
+---@param parent_id string|number|nil
+---@param callback fun(comment: IssueComment|nil, err: string|nil)
+---@return { job_id: integer, cancel: fun() }|nil
+local function write_comment(issue_key, comment, comment_id, parent_id, callback)
+	if vim.trim(comment) == "" then
+		callback(nil, "Comment cannot be empty")
+		return nil
+	end
+
+	local endpoint = string.format("/issue/%s/comment", issue_key)
+	if comment_id then
+		endpoint = endpoint .. "/" .. comment_id
+	end
+	local payload = { body = service.is_server() and comment or markdown.to_adf(comment) }
+	if parent_id ~= nil and tostring(parent_id) ~= "" then
+		payload.parentId = tostring(parent_id)
+	end
+
+	return service.request(comment_id and "PUT" or "POST", endpoint, payload, function(result, err)
+		if err or not result then
+			callback(nil, err or "Empty response")
+			return
+		end
+
+		service.clear_memory_cache()
+		local comments = map_comments({ comments = { result } }, issue_key)
+		callback(comments[1], nil)
+	end, {
+		action = comment_id and "Edit comment" or "Add comment",
+		issue_key = issue_key,
+		comment_id = comment_id,
 	})
 end
 
@@ -62,41 +90,7 @@ end
 ---@param callback fun(comment: IssueComment|nil, err: string|nil)
 ---@return { job_id: integer, cancel: fun() }|nil
 function M.add_comment(issue_key, comment, opts, callback)
-	local body = comment
-	if vim.trim(body) == "" then
-		callback(nil, "Comment cannot be empty")
-		return nil
-	end
-
-	local endpoint = string.format("/issue/%s/comment", issue_key)
-	local payload = { body = "" }
-	if config.jira_config().api_type == "cloud" then
-		payload.body = markdown.to_adf(body)
-	else
-		payload.body = body
-	end
-
-	local parent_id = opts and opts.parent_id or nil
-	if parent_id ~= nil then
-		local pid = tostring(parent_id)
-		if pid ~= "" then
-			payload.parentId = pid
-		end
-	end
-
-	return service.request("POST", endpoint, payload, function(result, err)
-		if err or not result then
-			callback(nil, err or "Empty response")
-			return
-		end
-
-		service.clear_memory_cache()
-		local comments = map_comments({ comments = { result } }, issue_key)
-		callback(comments[1], nil)
-	end, {
-		action = "Add comment",
-		issue_key = issue_key,
-	})
+	return write_comment(issue_key, comment, nil, opts and opts.parent_id or nil, callback)
 end
 
 ---@param issue_key string
@@ -105,44 +99,12 @@ end
 ---@param callback fun(comment: IssueComment|nil, err: string|nil)
 ---@return { job_id: integer, cancel: fun() }|nil
 function M.edit_comment(issue_key, comment_id, comment, callback)
-	if type(callback) ~= "function" then
-		return nil
-	end
-
 	local id = tostring(comment_id or "")
 	if id == "" then
 		callback(nil, "Missing comment id")
 		return nil
 	end
-
-	local body = type(comment) == "string" and comment or ""
-	if vim.trim(body) == "" then
-		callback(nil, "Comment cannot be empty")
-		return nil
-	end
-
-	local endpoint = string.format("/issue/%s/comment/%s", issue_key, id)
-	local payload = { body = "" }
-	if config.jira_config().api_type == "cloud" then
-		payload.body = markdown.to_adf(body)
-	else
-		payload.body = body
-	end
-
-	return service.request("PUT", endpoint, payload, function(result, err)
-		if err or not result then
-			callback(nil, err or "Empty response")
-			return
-		end
-
-		service.clear_memory_cache()
-		local comments = map_comments({ comments = { result } }, issue_key)
-		callback(comments[1], nil)
-	end, {
-		action = "Edit comment",
-		issue_key = issue_key,
-		comment_id = id,
-	})
+	return write_comment(issue_key, comment, id, nil, callback)
 end
 
 ---@param issue_key string

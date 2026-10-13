@@ -1,0 +1,366 @@
+local M = {}
+
+local notify = require("atlas.core.notify")
+local resolver = require("atlas.core.keymaps")
+local utils = require("atlas.ui.shared.utils")
+local actions = require("atlas.pulls.actions")
+local controller = require("atlas.pulls.ui.dashboard.controller")
+local registrations = {}
+
+---@return PullRequest|nil, AtlasRepository|nil
+local function selected_pr()
+	local navigation = require("atlas.ui.navigation")
+	local node = navigation.current_item()
+	if type(node) ~= "table" then
+		return nil, nil
+	end
+	if (node.kind == "pr" or node.kind == "pr_meta") and type(node.pr) == "table" then
+		return node.pr, node.repo
+	end
+	return nil, nil
+end
+
+---@param action_id AtlasKeymapActionId|string
+---@param map_item table
+---@return table|nil
+local function item(action_id, map_item)
+	local keys = resolver.resolve(action_id)
+	if keys == nil then
+		return nil
+	end
+
+	map_item.key = #keys == 1 and keys[1] or keys
+	return map_item
+end
+
+---@param buf integer
+---@param views AtlasPullsViewConfig[]
+function M.register(buf, views)
+	local help = require("atlas.ui.popups.help")
+	M.remove(buf)
+	local state = require("atlas.pulls.state")
+	local function context(pr)
+		return { provider = state.provider, pr = pr, current_user = state.current_user, buf = buf }
+	end
+	local function on_result(pr)
+		return function(result)
+			if pr ~= nil and result ~= nil and result.changed_pr then
+				controller.refresh_pr(pr)
+			end
+		end
+	end
+	---@param id AtlasPullActionId
+	---@param needs_pr boolean
+	local function run_action(id, needs_pr)
+		local pr = selected_pr()
+
+		if needs_pr and not pr then
+			notify.warn("No PR selected")
+			return
+		end
+		if state.provider then
+			actions.run(id, context(pr), on_result(pr))
+		end
+	end
+
+	local general = {}
+	local filters = {}
+
+	for _, view in ipairs(views) do
+		if view ~= state.bookmarks.tab and view.key ~= nil and view.key ~= "" then
+			local v = view
+			table.insert(general, {
+				key = v.key,
+				desc = string.format("Switch to %s", v.name),
+				hidden = true,
+				callback = function()
+					controller.switch_view(v)
+				end,
+			})
+		end
+	end
+
+	local bookmark_view = state.bookmarks.tab
+	---@cast bookmark_view AtlasPullsViewConfig
+	table.insert(general, {
+		key = bookmark_view.key,
+		desc = "Switch to bookmarks",
+		hidden = true,
+		callback = function()
+			if next(state.bookmarks.items) ~= nil or #state.starred_items > 0 then
+				controller.switch_view(bookmark_view)
+			end
+		end,
+	})
+
+	utils.insert_if(
+		general,
+		item("ui.select", {
+			desc = "Run bookmark",
+			index = 2,
+			callback = function()
+				local navigation = require("atlas.ui.navigation")
+				local node = navigation.current_item()
+				if type(node) == "table" and (node.kind == "bookmark" or node.kind == "starred") then
+					controller.select_bookmark(node)
+				end
+			end,
+		})
+	)
+
+	for index, status in ipairs(state.available_states) do
+		local value = status
+		utils.insert_if(
+			filters,
+			item("pulls.filters." .. value, {
+				desc = string.format("Toggle %s filter", value),
+				index = 10 + index,
+				callback = function()
+					controller.toggle_status_filter(value)
+				end,
+			})
+		)
+	end
+
+	if state.provider then
+		utils.insert_if(
+			general,
+			item("ui.open_actions", {
+				desc = "Open PR actions",
+				index = 1,
+				callback = function()
+					local pr = selected_pr()
+					if state.provider then
+						actions.open(context(pr), on_result(pr))
+					end
+				end,
+			})
+		)
+	end
+
+	utils.insert_if(
+		general,
+		item("ui.open_in_browser", {
+			desc = "Open PR in browser",
+			index = 7,
+			opts = { nowait = true },
+			callback = function()
+				run_action("open_in_browser", true)
+			end,
+		})
+	)
+
+	utils.insert_if(
+		general,
+		item("ui.copy_url", {
+			desc = "Copy PR URL",
+			index = 9,
+			opts = { nowait = true },
+			callback = function()
+				run_action("copy_url", true)
+			end,
+		})
+	)
+
+	utils.insert_if(
+		general,
+		item("ui.copy_id", {
+			desc = "Copy PR ID",
+			index = 8,
+			opts = { nowait = true },
+			callback = function()
+				run_action("copy_id", true)
+			end,
+		})
+	)
+
+	utils.insert_if(
+		general,
+		item("pulls.edit_pr", {
+			desc = "Edit PR",
+			index = 5,
+			opts = { nowait = true },
+			callback = function()
+				run_action("edit_pr", true)
+			end,
+		})
+	)
+
+	utils.insert_if(
+		general,
+		item("ui.show_details", {
+			desc = "Show PR details",
+			index = 3,
+			opts = { nowait = true },
+			callback = function()
+				controller.show_pr_details(buf)
+			end,
+		})
+	)
+
+	utils.insert_if(
+		general,
+		item("ui.toggle_star", {
+			desc = "Star or unstar PR",
+			index = 30,
+			callback = function()
+				local pr = selected_pr()
+				if pr == nil then
+					notify.warn("No PR selected")
+					return
+				end
+				controller.toggle_star(pr)
+			end,
+		})
+	)
+
+	utils.insert_if(
+		general,
+		item("pulls.open_diff", {
+			desc = "Open PR diff",
+			index = 4,
+			opts = { nowait = true },
+			callback = function()
+				run_action("open_diff", true)
+			end,
+		})
+	)
+
+	utils.insert_if(
+		general,
+		item("pulls.checkout", {
+			desc = "Checkout PR branch",
+			index = 6,
+			opts = { nowait = true },
+			callback = function()
+				run_action("checkout", true)
+			end,
+		})
+	)
+
+	local search_available = state.provider and actions.is_available("search", context(nil))
+
+	if search_available then
+		utils.insert_if(
+			filters,
+			item("ui.search", {
+				desc = "Search",
+				index = 1,
+				callback = function()
+					run_action("search", false)
+				end,
+			})
+		)
+	end
+
+	utils.insert_if(
+		filters,
+		item("ui.edit_search", {
+			desc = "Edit current search",
+			index = 2,
+			callback = function()
+				run_action("edit_search", false)
+			end,
+		})
+	)
+
+	utils.insert_if(
+		general,
+		item("ui.refresh", {
+			desc = "Refetch selected PR",
+			index = 80,
+			callback = function()
+				local pr = selected_pr()
+				if pr == nil then
+					notify.warn("No PR selected")
+					return
+				end
+				controller.refresh_pr(pr)
+			end,
+		})
+	)
+
+	utils.insert_if(
+		general,
+		item("ui.refresh_view", {
+			desc = "Refresh current view",
+			index = 81,
+			callback = controller.refresh_view,
+		})
+	)
+
+	utils.insert_if(
+		general,
+		item("ui.previous_page", {
+			desc = "Previous page",
+			index = 15,
+			callback = controller.previous_page,
+		})
+	)
+
+	utils.insert_if(
+		general,
+		item("ui.next_page", {
+			desc = "Next page",
+			index = 16,
+			callback = controller.next_page,
+		})
+	)
+
+	utils.insert_if(
+		general,
+		item("pulls.open_repository", {
+			desc = "Open repository browser",
+			index = 40,
+			opts = { nowait = true, silent = true },
+			callback = function()
+				local node = require("atlas.ui.navigation").current_item()
+				local repo = type(node) == "table" and node.repo or nil
+				if repo == nil then
+					notify.warn("No repository selected")
+					return
+				end
+				if state.provider == nil then
+					notify.warn("Repository provider unavailable")
+					return
+				end
+				require("atlas.ui.repository").open(repo.full_name, state.provider)
+			end,
+		})
+	)
+
+	local custom = resolver.custom_items("pulls", function(callback)
+		local pr = selected_pr()
+		if state.provider then
+			return callback(context(pr), function(result)
+				if pr and result and result.changed_pr then
+					controller.refresh_pr(pr)
+				end
+			end)
+		end
+	end)
+
+	registrations[buf] = {
+		{ group = "General", items = general, index = 1 },
+		{ group = "Filters", items = filters, index = 2 },
+		{ group = "Custom", items = custom, index = 3 },
+	}
+	for _, registration in ipairs(registrations[buf]) do
+		help.register(registration.group, registration.items, { index = registration.index, buffer = buf })
+	end
+end
+
+---@param buf integer
+function M.remove(buf)
+	local registered = registrations[buf]
+	if registered == nil then
+		return
+	end
+	local help = require("atlas.ui.popups.help")
+	for _, registration in ipairs(registered) do
+		help.remove(registration.group, registration.items, { buffer = buf })
+	end
+	registrations[buf] = nil
+end
+
+return M

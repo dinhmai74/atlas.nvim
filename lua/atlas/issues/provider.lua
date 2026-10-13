@@ -1,116 +1,95 @@
---------------------------------------------------------------------------------
--- Main render result
---------------------------------------------------------------------------------
-
----@class IssuesMainRenderResult
----@field lines string[]
----@field spans table[]
----@field line_map table<integer, table>
-
---------------------------------------------------------------------------------
 -- Provider Interface
 --------------------------------------------------------------------------------
 
----@class IssuesFetchOpts
----@field force_load boolean|nil
----@field force_refresh boolean|nil
----@field max_results number|nil
----@field next_page_token string|nil
----@field layout "plain"|"compact"|nil
----@field with_relationships boolean|nil
-
 ---@class IssuesViewConfig : AtlasIssuesViewConfig
----@field _kind "bookmarks"|nil
----@field _bookmarks table<string, any>|nil
+
+---@class AtlasIssuesBookmarkConfig
+---@field layout AtlasIssuesViewLayout|nil
+
+---@class IssuesFetchOpts
+---@field force_refresh boolean|nil
+---@field pagelen number|nil
+---@field cursor string|nil
+
+---@class IssuesPage
+---@field items Issue[]
+---@field query string|nil
+---@field next_cursor string|nil
+---@field total_pages integer|nil
 
 ---@class IssuesProvider
 ---@field id string
 ---@field name string
 ---@field icon string
 ---@field hl_group string
----@field resolve fun(value: string, parsed: AtlasParsedUrl|nil): AtlasTarget|nil, string|nil
----@field search_view fun(target: AtlasTarget): IssuesViewConfig
----@field issue_key fun(target: AtlasTarget): string|nil
----@field target (fun(info: AtlasGitRemoteInfo, domain: AtlasDomain, entity: AtlasEntity, number: integer, base_url: string): AtlasTarget)|nil
----@field repositories (fun(options: table): string[])|nil
+---@field views fun(): IssuesViewConfig[]
+---@field view_for_target fun(target: AtlasTarget): IssuesViewConfig
+---@field issue_ref fun(target: AtlasTarget): IssueRef|nil
 ---@field capabilities IssuesProviderCapabilities
 
----@class IssuesProviderCapabilities
+---@class IssuesProviderCapabilities : AtlasProviderCapabilities
 ---@field core IssuesCoreCapability
 ---@field comments IssuesCommentsCapability|nil
----@field notifications AtlasNotificationsCapability|nil
----@field search (fun(on_done: fun(result: table|nil, err: string|nil)|nil))|nil
----@field create_issue (fun())|nil
----@field actions IssuesActionsCapability|nil
 ---@field ui IssuesUICapability|nil
 
 ---@class IssuesCoreCapability
----@field fetch_user fun(on_done: fun(user: IssueUser|nil, err: string|nil)): { cancel: fun() }|nil
----@field fetch_issues fun(view: IssuesViewConfig, opts: IssuesFetchOpts, on_done: fun(issues: Issue[], next_page_token: string|nil, is_last: boolean, err: string|nil)): { cancel: fun() }|nil
----@field fetch_issue fun(issue_key: string, opts: IssuesFetchOpts|nil, on_done: fun(issue: Issue|nil, err: string|nil)): { cancel: fun() }|nil
----@field views fun(): IssuesViewConfig[]
----@field refresh fun()|nil
+---@field fetch_issues fun(view: IssuesViewConfig, opts: IssuesFetchOpts, on_done: fun(page: IssuesPage, err: string|nil)): { cancel: fun() }|nil
+---@field fetch_by_refs fun(refs: IssueRef[], opts: IssuesFetchOpts, on_done: fun(issues: Issue[], err: string|nil)): { cancel: fun() }|nil
+---@field fetch_issue fun(ref: IssueRef, opts: IssuesFetchOpts|nil, on_done: fun(details: IssueDetails|nil, err: string|nil)): { cancel: fun() }|nil
+---@field fetch_links (fun(issue: Issue, opts: { force_refresh: boolean|nil }|nil, on_done: fun(links: AtlasRelatedItem[]|nil, err: string|nil)): { cancel: fun() }|nil)|nil
 
 ---@class IssuesCommentsCapability
 ---@field fetch_activity (fun(issue: Issue, opts: IssuesFetchOpts|nil, on_done: fun(entries: IssueActivityEntry[]|nil, err: string|nil)): { cancel: fun() }|nil)|nil
----@field fetch_conversation (fun(issue: Issue, opts: { force_refresh: boolean|nil }|nil, on_done: fun(result: { comments: IssueComment[], events: IssueActivityEntry[], reaction_options: IssueReactionOption[]|nil }|nil, err: string|nil)): { cancel: fun() }|nil)|nil
----@field add_comment (fun(issue: Issue, content: string, on_done: fun(comment: IssueComment|nil, err: string|nil)): { cancel: fun() }|nil)|nil
----@field reply_comment (fun(issue: Issue, parent: IssueComment, content: string, on_done: fun(comment: IssueComment|nil, err: string|nil)): { cancel: fun() }|nil)|nil
----@field edit_comment (fun(issue: Issue, comment_id: string, content: string, on_done: fun(comment: IssueComment|nil, err: string|nil)): { cancel: fun() }|nil)|nil
----@field delete_comment (fun(issue: Issue, comment_id: string, on_done: fun(ok: boolean, err: string|nil)): { cancel: fun() }|nil)|nil
----@field add_reaction (fun(issue: Issue, comment: IssueComment, key: string, on_done: fun(ok: boolean, err: string|nil)): { cancel: fun() }|nil)|nil
----@field comment_completion (fun(): AtlasMarkdownCompletionProvider|nil)|nil
+---@field fetch_conversation (fun(issue: Issue, opts: { force_refresh: boolean|nil }|nil, on_done: fun(items: IssueConversationItem[]|nil, err: string|nil)): { cancel: fun() }|nil)|nil
+---@field add_comment (fun(issue: Issue, content: string, opts: { parent?: IssueComment }|nil, on_done: fun(comment: IssueComment|nil, err: string|nil)): { cancel: fun() }|nil)|nil
+---@field edit_comment (fun(issue: Issue, comment: IssueComment, content: string, on_done: fun(comment: IssueComment|nil, err: string|nil)): { cancel: fun() }|nil)|nil
+---@field delete_comment (fun(issue: Issue, comment: IssueComment, on_done: fun(ok: boolean, err: string|nil)): { cancel: fun() }|nil)|nil
+---@field add_reaction (fun(issue: Issue, item: IssueConversationItem, key: string, on_done: fun(ok: boolean, err: string|nil)): { cancel: fun() }|nil)|nil
+---@field reaction_options IssueReactionOption[]|nil
 
----@class IssuesActionsCapability
----@field run fun(action_id: string, ctx: table, on_done: fun(result: table|nil, err: string|nil))
----@field open fun(ctx: { issue: Issue|nil, source: "main"|"panel"|nil }, on_done: fun(result: table|nil, err: string|nil))
+---@class IssuesActionResult
+---@field issue_key string|nil
+---@field removed boolean|nil
+---@field message string|nil
 
 ---@class IssuesUICapability
----@field setup fun()|nil
----@field render (fun(groups: IssuesGroup[], layout: "plain"|"compact", opts: { width: integer }): IssuesMainRenderResult)|nil
----@field format_row (fun(issue: Issue, is_child: boolean): table|nil)|nil
----@field cell_hl (fun(row: table, col: table, ctx: { text: string, padded: string, width: integer }): table[]|nil)|nil
----@field issue_popup_content (fun(issue: Issue): string[], AtlasUIHighlight[])|nil
----@field panel IssuesProviderPanel|nil
+---@field detail IssuesProviderDetail|nil
+---@field repository { pages: fun(pages: table<string, RepositoryPage>): RepositoryPage[] }|nil
 
 --------------------------------------------------------------------------------
--- Panel interface
+-- Detail interface
 --------------------------------------------------------------------------------
 
----@class IssuesProviderPanel
----@field header_rows (fun(issue: Issue): IssuesPanelHeaderRow[])|nil
----@field chips (fun(issue: Issue): IssuesPanelChip[])|nil
----@field tabs (fun(): IssuesPanelTab[])|nil
----@field fetches (fun(issue: Issue, refresh: fun(), opts: { force_load?: boolean }|nil))|nil
----@field is_loading (fun(issue: Issue): boolean)|nil
+---@class IssuesProviderDetail
+---@field header_fields (fun(issue: Issue, details: IssueDetails|nil, loading: boolean): IssuesDetailHeaderField[])|nil
+---@field chips (fun(issue: Issue, details: IssueDetails|nil, loading: boolean): IssuesDetailChip[])|nil
+---@field tabs (fun(): IssuesDetailTabDefinition[])|nil
 
 --------------------------------------------------------------------------------
--- Panel types
+-- Detail types
 --------------------------------------------------------------------------------
 
----@class IssuesPanelHeaderRow
----@field k1 string
----@field v1 string
----@field v1_hl string|table[]|nil hl group name, or list of {start_col, end_col, hl_group} relative to the v1 cell
----@field k2 string
----@field v2 string
----@field v2_hl string|table[]|nil hl group name, or list of {start_col, end_col, hl_group} relative to the v2 cell
+---@class IssuesDetailHeaderField
+---@field label string
+---@field value string
+---@field hl string|table[]|nil hl group name, or list of {start_col, end_col, hl_group} relative to the value
 
----@class IssuesPanelChip
+---@class IssuesDetailChip
 ---@field label string
 ---@field hl string|nil
 
----@class IssuesPanelTabModule
----@field render fun(issue: Issue, width: integer): string[], table[], table<integer, table>|nil
+---@class IssuesDetailTabModule
+---@field render fun(issue: Issue, details: IssueDetails|nil, width: integer): string[], table[], table<integer, table>|nil
 ---@field on_select (fun(issue: Issue, refresh: fun(), opts: { force_refresh: boolean|nil }|nil))|nil
----@field activate (fun(buf: integer|nil, refresh: fun()|nil))|nil
----@field deactivate (fun(buf: integer|nil))|nil
+---@field reset fun()|nil
+---@field activate (fun(buf: integer, refresh: fun()))|nil
+---@field deactivate (fun(buf: integer))|nil
+---@field is_loading (fun(): boolean)|nil
 ---@field is_selectable_line (fun(lnum: integer, entry: table): boolean)|nil
 ---@field on_enter (fun(issue: Issue, entry: table): boolean|nil)|nil
 
----@class IssuesPanelTab
+---@class IssuesDetailTabDefinition
 ---@field key string
 ---@field label string
----@field icon string|nil
----@field icon_hl string|nil
----@field mod IssuesPanelTabModule
+---@field icon AtlasIconStyle|nil
+---@field mod IssuesDetailTabModule

@@ -1,16 +1,60 @@
--- Minimal stub for the `vim` global so specs can run outside Neovim via busted.
--- Loaded once as a busted helper (--helper=spec/support/vim_stub.lua).
--- Individual spec files no longer need their own `if _G.vim == nil then` blocks.
+-- Neovim API stubs for Busted.
 
-if _G.vim ~= nil then
+if vim ~= nil then
 	return
+end
+
+local function json_encode(value)
+	local value_type = type(value)
+	if value_type == "string" then
+		return '"' .. value:gsub('[\\"]', "\\%0"):gsub("\n", "\\n") .. '"'
+	elseif value_type == "number" or value_type == "boolean" then
+		return tostring(value)
+	elseif value_type == "table" then
+		local keys = {}
+		for key in pairs(value) do
+			table.insert(keys, key)
+		end
+		table.sort(keys, function(a, b)
+			return tostring(a) < tostring(b)
+		end)
+		local parts = {}
+		for _, key in ipairs(keys) do
+			table.insert(parts, string.format('"%s":%s', tostring(key), json_encode(value[key])))
+		end
+		return "{" .. table.concat(parts, ",") .. "}"
+	end
+	return "null"
+end
+
+local function strchars(text)
+	local _, count = text:gsub("[^\128-\191]", "")
+	return count
+end
+
+local function deepcopy(value, seen)
+	if type(value) ~= "table" then
+		return value
+	end
+	seen = seen or {}
+	if seen[value] then
+		return seen[value]
+	end
+	local copy = {}
+	seen[value] = copy
+	for key, item in pairs(value) do
+		copy[deepcopy(key, seen)] = deepcopy(item, seen)
+	end
+	return setmetatable(copy, getmetatable(value))
 end
 
 _G.vim = {
 	-- Sentinel used by the Neovim C layer for JSON null / GraphQL null values.
 	NIL = {},
+	o = { background = "dark" },
+	deepcopy = deepcopy,
+	inspect = json_encode,
 
-	-- vim.split(s, sep, {plain=true|false})
 	split = function(s, sep, opts)
 		local plain = opts and opts.plain
 		local result = {}
@@ -24,26 +68,79 @@ _G.vim = {
 			table.insert(result, s:sub(from, start - 1))
 			from = finish + 1
 		end
+		if opts and opts.trimempty then
+			while result[#result] == "" do
+				table.remove(result)
+			end
+			while result[1] == "" do
+				table.remove(result, 1)
+			end
+		end
 		return result
 	end,
 
-	-- vim.inspect / vim.fn stubs used by various modules
-	inspect = function(v)
-		return tostring(v)
-	end,
-
-	-- vim.schedule(fn) -> run immediately; specs are single-threaded
+	-- Run scheduled callbacks immediately in tests.
 	schedule = function(fn)
 		fn()
 	end,
+
+	trim = function(value)
+		return value:match("^%s*(.-)%s*$")
+	end,
+
+	fs = {
+		basename = function(path)
+			return path:match("[^/]*$")
+		end,
+		dirname = function(path)
+			return path:match("^(.+)/[^/]*$") or (path:sub(1, 1) == "/" and "/" or ".")
+		end,
+	},
+
+	filetype = {
+		match = function()
+			return nil
+		end,
+	},
+
+	treesitter = {
+		language = {
+			get_lang = function(filetype)
+				return filetype
+			end,
+		},
+		get_string_parser = function()
+			error("No Tree-sitter parsers in the test environment")
+		end,
+	},
 
 	api = {
 		nvim_create_namespace = function()
 			return 1
 		end,
+
+		nvim_create_augroup = function()
+			return 1
+		end,
+
+		nvim_create_autocmd = function()
+			return 1
+		end,
+
+		nvim_set_hl = function() end,
+		nvim_get_hl = function()
+			return {}
+		end,
 	},
 
-	-- vim.tbl_extend(behavior, ...) -> shallow merge honoring "keep"/"force"/"error"
+	tbl_map = function(fn, values)
+		local out = {}
+		for key, value in pairs(values) do
+			out[key] = fn(value)
+		end
+		return out
+	end,
+
 	tbl_extend = function(behavior, ...)
 		assert(
 			behavior == "keep" or behavior == "force" or behavior == "error",
@@ -52,9 +149,7 @@ _G.vim = {
 		local out = {}
 		for index = 1, select("#", ...) do
 			for k, v in pairs(select(index, ...) or {}) do
-				if out[k] == nil then
-					out[k] = v
-				elseif behavior == "force" then
+				if out[k] == nil or behavior == "force" then
 					out[k] = v
 				elseif behavior == "error" then
 					error("vim.tbl_extend: key found in more than one map: " .. tostring(k))
@@ -64,7 +159,6 @@ _G.vim = {
 		return out
 	end,
 
-	-- vim.list_extend(dst, src) -> append src onto dst in place
 	list_extend = function(dst, src)
 		for _, v in ipairs(src or {}) do
 			table.insert(dst, v)
@@ -72,7 +166,6 @@ _G.vim = {
 		return dst
 	end,
 
-	-- vim.tbl_keys(t) -> list of the table's keys
 	tbl_keys = function(t)
 		local keys = {}
 		for k in pairs(t) do
@@ -83,50 +176,24 @@ _G.vim = {
 
 	env = { HOME = os.getenv("HOME") or "" },
 
-	-- vim.json.encode(value) -> minimal JSON encoder for plain Lua values
-	json = {
-		encode = function(value)
-			local t = type(value)
-			if t == "string" then
-				return '"' .. value:gsub('[\\"]', "\\%0"):gsub("\n", "\\n") .. '"'
-			elseif t == "number" or t == "boolean" then
-				return tostring(value)
-			elseif t == "table" then
-				local keys = {}
-				for k in pairs(value) do
-					table.insert(keys, k)
-				end
-				table.sort(keys, function(a, b)
-					return tostring(a) < tostring(b)
-				end)
-				local parts = {}
-				for _, k in ipairs(keys) do
-					table.insert(parts, string.format('"%s":%s', tostring(k), _G.vim.json.encode(value[k])))
-				end
-				return "{" .. table.concat(parts, ",") .. "}"
-			end
-			return "null"
-		end,
-	},
+	json = { encode = json_encode },
 
 	fn = {
-		expand = function(x)
-			if x == "~" then
-				return os.getenv("HOME") or ""
+		-- Layout fixtures use one-cell characters, including accented text and icons.
+		strdisplaywidth = strchars,
+		strchars = strchars,
+		strcharpart = function(text, start, length)
+			local chars = {}
+			for char in text:gmatch("[^\128-\191][\128-\191]*") do
+				chars[#chars + 1] = char
 			end
-			return x
+			return table.concat(chars, "", start + 1, math.min(#chars, start + length))
 		end,
 		fnamemodify = function(path, _)
 			return path
 		end,
-		isdirectory = function(_)
-			return 1
-		end,
 		stdpath = function(_)
 			return "/tmp"
-		end,
-		writefile = function(_, _, _)
-			return 0
 		end,
 	},
 }

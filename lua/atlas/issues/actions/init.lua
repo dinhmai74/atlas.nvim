@@ -1,123 +1,159 @@
 local M = {}
 
-local statusline = require("atlas.ui.statusline")
+local action_runner = require("atlas.core.actions")
+local icons = require("atlas.ui.shared.icons")
+local picker = require("atlas.ui.picker")
+local providers = require("atlas.providers")
+local repository = require("atlas.ui.repository")
+local templates = require("atlas.templates")
+local utils = require("atlas.issues.actions.utils")
 
----@return IssuesProvider|nil
-local function provider()
-	return require("atlas.issues.state").provider
+---@alias AtlasIssueActionId
+---| "transition"
+---| "assign"
+---| "create_issue"
+---| "edit_issue"
+---| "search"
+---| "edit_search"
+---| "browse_issue"
+---| "browse_repository"
+---| "browse_repositories"
+---| "copy_issue_key"
+---| "copy_issue_url"
+---| "manage_templates"
+---| "toggle_subscription"
+
+---@class AtlasIssueActionContext
+---@field provider IssuesProvider
+---@field issue Issue|nil
+---@field current_user AtlasUser|nil
+---@field repo_slug string|nil
+---@field project_path string|nil
+---@field notify fun(level: AtlasNotifyLevel, message: string, duration: integer|nil)|nil
+
+---@class AtlasIssueAction
+---@field id string
+---@field label string
+---@field icon string|nil
+---@field hidden boolean|nil
+---@field confirmation boolean|nil
+---@field is_available (fun(context: AtlasIssueActionContext): boolean, string|nil)|nil
+---@field run fun(context: AtlasIssueActionContext, on_done: fun(result: IssuesActionResult|nil, err: string|nil)): boolean|{ cancel: fun() }|nil
+
+---@param id string
+---@param context AtlasIssueActionContext
+---@return AtlasIssueAction|nil
+function M.find(id, context)
+	local action = utils.find_custom_action(id)
+	if action then
+		return action
+	end
+	local actions = context.provider.capabilities.actions
+	local provider_action = actions and actions.find(id) or nil
+	---@cast provider_action AtlasIssueAction|nil
+	return provider_action
 end
 
----@param action_id string
----@param issue Issue|nil
----@param source "main"|"panel"|nil
----@param on_done fun(result: table|nil)|nil
-function M.run_action(action_id, issue, source, on_done)
-	local p = provider()
-	local actions = p and p.capabilities.actions
-	if not actions then
+---@param id string
+---@param context AtlasIssueActionContext
+---@return boolean
+function M.is_available(id, context)
+	return action_runner.is_available(M.find(id, context), context)
+end
+
+---@param id string
+---@param context AtlasIssueActionContext
+---@param on_done fun(result: IssuesActionResult|nil, err: string|nil)|nil
+---@return boolean handled
+function M.run(id, context, on_done)
+	local action = M.find(id, context)
+	if action then
+		return action_runner.run(action, context, on_done)
+	end
+	if not context.provider.capabilities.actions then
+		return false
+	end
+	return action_runner.reject(context, on_done, string.format("Unknown action: %s", tostring(id)))
+end
+
+---@param context AtlasIssueActionContext
+---@param on_done fun(result: IssuesActionResult|nil, err: string|nil)|nil
+---@param extra_items { label: string, icon?: string, callback: fun() }[]|nil
+function M.open(context, on_done, extra_items)
+	local actions = context.provider.capabilities.actions
+	local items = {}
+	for _, action in ipairs(actions and actions.items or {}) do
+		if not action.hidden and not utils.find_custom_action(action.id) and M.is_available(action.id, context) then
+			table.insert(items, action)
+		end
+	end
+	for _, action in ipairs(utils.custom_actions()) do
+		if action_runner.is_available(action, context) then
+			table.insert(items, action)
+		end
+	end
+	vim.list_extend(items, extra_items or {})
+	if #items == 0 then
+		if on_done then
+			on_done(nil, "No actions available")
+		end
 		return
 	end
 
-	actions.run(action_id, { issue = issue, source = source }, function(result, err)
-		if err ~= nil then
-			statusline.notify("error", tostring(err))
-			if on_done then
-				on_done(nil)
+	local target = context.issue and string.format(" for %s", tostring(context.issue.key)) or ""
+	picker.select({
+		title = string.format("Choose %s action%s", context.provider.name, target),
+		items = items,
+		format_item = function(action)
+			return (action.icon or icons.get("custom", "actions")) .. "  " .. action.label
+		end,
+		on_select = function(action)
+			if not action then
+				if on_done then
+					on_done(nil, nil)
+				end
+				return
 			end
+			if action.callback then
+				action.callback()
+			else
+				M.run(action.id, context, on_done)
+			end
+		end,
+	})
+end
+
+M.browse_repository = {
+	id = "browse_repository",
+	label = "Browse Current Repository",
+	icon = icons.get("overview"),
+	is_available = function(context)
+		return context.issue ~= nil and context.issue.url ~= nil
+	end,
+	run = function(context, done)
+		local issue = assert(context.issue)
+		local target, err = providers.resolve(assert(issue.url))
+		if not target or not target.repo_full_name then
+			done(nil, err or "Missing repository info")
 			return
 		end
+		repository.open(target.repo_full_name, context.provider)
+		done(nil, nil)
+	end,
+}
 
-		if result ~= nil and result.message ~= nil and result.message ~= "" then
-			statusline.notify("info", tostring(result.message), 1200)
-		end
-
-		if result ~= nil and result.changed_issue_key ~= nil and result.changed_issue_key ~= "" then
-			require("atlas.issues.ui.main.controller").refresh_issue(result.changed_issue_key)
-		end
-
-		if on_done then
-			on_done(result)
-		end
-	end)
-end
-
----@param issue Issue
----@param source "main"|"panel"|nil
----@param on_done fun(result: table|nil)|nil
-function M.open_actions(issue, source, on_done)
-	local p = provider()
-	local actions = p and p.capabilities.actions
-	if not actions then
-		return
-	end
-
-	actions.open({ issue = issue, source = source }, function(result, err)
-		if err ~= nil then
-			statusline.notify("error", tostring(err))
-			if on_done then
-				on_done(nil)
-			end
-			return
-		end
-
-		if result ~= nil and result.changed_issue_key ~= nil and result.changed_issue_key ~= "" then
-			require("atlas.issues.ui.main.controller").refresh_issue(result.changed_issue_key)
-		end
-
-		if result ~= nil and result.message ~= nil and result.message ~= "" then
-			statusline.notify("info", tostring(result.message), 1200)
-		end
-
-		if on_done then
-			on_done(result)
-		end
-	end)
-end
-
----@param on_done fun(result: table|nil)|nil
-function M.search(on_done)
-	local p = provider()
-	local search = p and p.capabilities.search
-	if not search then
-		return
-	end
-
-	search(function(result, err)
-		if err ~= nil then
-			statusline.notify("error", tostring(err))
-			if on_done then
-				on_done(nil)
-			end
-			return
-		end
-
-		if result ~= nil and result.message ~= nil and result.message ~= "" then
-			statusline.notify("info", tostring(result.message), 1200)
-		end
-
-		if result ~= nil and result.changed_issue_key ~= nil and result.changed_issue_key ~= "" then
-			require("atlas.issues.ui.main.controller").refresh_issue(result.changed_issue_key)
-		end
-
-		if on_done then
-			on_done(result)
-		end
-	end)
-end
-
----@param issue Issue
-function M.open_in_browser(issue)
-	M.run_action("browse_issue", issue, "main")
-end
-
----@param issue Issue
-function M.copy_key(issue)
-	M.run_action("copy_issue_key", issue, "main")
-end
-
----@param issue Issue
-function M.copy_url(issue)
-	M.run_action("copy_issue_url", issue, "main")
-end
+M.browse_issue = utils.browse_issue
+M.copy_issue_key = utils.copy_issue_key
+M.copy_issue_url = utils.copy_issue_url
+M.manage_templates = {
+	id = "manage_templates",
+	label = "Manage Templates",
+	icon = icons.get("edit", "actions"),
+	run = function(_, done)
+		templates.manage(function(err)
+			done(nil, err)
+		end)
+	end,
+}
 
 return M

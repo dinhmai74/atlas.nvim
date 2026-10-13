@@ -1,8 +1,15 @@
 local M = {}
 
 local help = require("atlas.ui.popups.help")
+local navigation = require("atlas.ui.navigation")
 local resolver = require("atlas.core.keymaps")
 local utils = require("atlas.ui.shared.utils")
+local registrations = {}
+
+local function domain_dashboard()
+	local domain = require("atlas.ui.state").domain
+	return domain and require("atlas." .. domain .. ".ui.dashboard") or nil
+end
 
 ---@param action_id AtlasKeymapActionId|string
 ---@param map_item table
@@ -13,25 +20,8 @@ local function item(action_id, map_item)
 		return nil
 	end
 
-	local out = vim.tbl_deep_extend("force", {}, map_item)
-	out.key = #keys == 1 and keys[1] or keys
-	return out
-end
-
----@param action_id AtlasKeymapActionId|string
----@param mode string|string[]|nil
----@return table|nil
-local function remove_item(action_id, mode)
-	local keys = resolver.resolve(action_id)
-	if keys == nil then
-		return nil
-	end
-
-	local out = { key = (#keys == 1 and keys[1] or keys) }
-	if mode ~= nil then
-		out.mode = mode
-	end
-	return out
+	map_item.key = #keys == 1 and keys[1] or keys
+	return map_item
 end
 
 ---@param buf integer
@@ -44,7 +34,7 @@ function M.register(buf)
 			desc = "Next item",
 			hidden = true,
 			callback = function()
-				require("atlas.ui.navigation").move_cursor("down")
+				navigation.move_cursor("down")
 			end,
 		})
 	)
@@ -55,7 +45,7 @@ function M.register(buf)
 			desc = "Previous item",
 			hidden = true,
 			callback = function()
-				require("atlas.ui.navigation").move_cursor("up")
+				navigation.move_cursor("up")
 			end,
 		})
 	)
@@ -66,7 +56,7 @@ function M.register(buf)
 			desc = "Go to first item",
 			hidden = true,
 			callback = function()
-				require("atlas.ui.navigation").focus_first_item()
+				navigation.focus_first_item()
 			end,
 		})
 	)
@@ -77,7 +67,7 @@ function M.register(buf)
 			desc = "Go to last item",
 			hidden = true,
 			callback = function()
-				require("atlas.ui.navigation").focus_last_item()
+				navigation.focus_last_item()
 			end,
 		})
 	)
@@ -86,6 +76,7 @@ function M.register(buf)
 		items,
 		item("ui.help", {
 			desc = "Toggle this help popup",
+			index = 100,
 			opts = { nowait = true, silent = true },
 			callback = function()
 				help.toggle({ buffer = buf })
@@ -97,12 +88,13 @@ function M.register(buf)
 		items,
 		item("ui.close", {
 			desc = "Close Atlas window",
+			index = 101,
 			opts = { nowait = true, silent = true },
 			callback = function()
 				if help.is_open() then
 					return
 				end
-				require("atlas.ui.layout").close()
+				require("atlas.ui.dashboard").close()
 			end,
 		})
 	)
@@ -111,15 +103,11 @@ function M.register(buf)
 		items,
 		item("ui.toggle_panel", {
 			desc = "Toggle detail panel",
+			index = 12,
 			callback = function()
-				local layout_mod = require("atlas.ui.layout")
-				local ui_st = require("atlas.ui.state")
-				local was_open = layout_mod.win_id("detail") ~= nil
-				layout_mod.toggle_detail()
-				if not was_open then
-					if ui_st.on_panel_open then
-						ui_st.on_panel_open()
-					end
+				local dashboard = domain_dashboard()
+				if dashboard then
+					dashboard.toggle_detail()
 				end
 			end,
 		})
@@ -129,12 +117,12 @@ function M.register(buf)
 		items,
 		item("ui.next_panel_tab", {
 			desc = "Next panel tab",
+			index = 11,
 			opts = { nowait = true },
 			callback = function()
-				local layout_mod = require("atlas.ui.layout")
-				local ui_st = require("atlas.ui.state")
-				if layout_mod.win_id("detail") ~= nil and ui_st.on_panel_next_tab then
-					ui_st.on_panel_next_tab()
+				local dashboard = domain_dashboard()
+				if dashboard then
+					dashboard.next_detail_tab()
 				end
 			end,
 		})
@@ -144,12 +132,12 @@ function M.register(buf)
 		items,
 		item("ui.previous_panel_tab", {
 			desc = "Previous panel tab",
+			index = 10,
 			opts = { nowait = true },
 			callback = function()
-				local layout_mod = require("atlas.ui.layout")
-				local ui_st = require("atlas.ui.state")
-				if layout_mod.win_id("detail") ~= nil and ui_st.on_panel_prev_tab then
-					ui_st.on_panel_prev_tab()
+				local dashboard = domain_dashboard()
+				if dashboard then
+					dashboard.prev_detail_tab()
 				end
 			end,
 		})
@@ -157,8 +145,9 @@ function M.register(buf)
 
 	utils.insert_if(
 		items,
-		item("ui.open_notifications", {
+		item("ui.notifications.open", {
 			desc = "Open notifications",
+			index = 20,
 			callback = function()
 				require("atlas.ui.notifications").open()
 			end,
@@ -166,24 +155,19 @@ function M.register(buf)
 	)
 
 	M.remove(buf)
+	navigation.attach(buf)
 	help.register("General", items, { index = 210, buffer = buf })
+	registrations[buf] = items
 end
 
 ---@param buf integer
 function M.remove(buf)
-	local items = {}
-	utils.insert_if(items, remove_item("ui.next_item"))
-	utils.insert_if(items, remove_item("ui.previous_item"))
-	utils.insert_if(items, remove_item("ui.first_item"))
-	utils.insert_if(items, remove_item("ui.last_item"))
-	utils.insert_if(items, remove_item("ui.help"))
-	utils.insert_if(items, remove_item("ui.close"))
-	utils.insert_if(items, remove_item("ui.toggle_panel"))
-	utils.insert_if(items, remove_item("ui.next_panel_tab"))
-	utils.insert_if(items, remove_item("ui.previous_panel_tab"))
-	utils.insert_if(items, remove_item("ui.open_notifications"))
-
-	help.remove("General", items, { buffer = buf })
+	navigation.detach(buf)
+	local registered = registrations[buf]
+	if registered then
+		help.remove("General", registered, { buffer = buf })
+		registrations[buf] = nil
+	end
 end
 
 return M

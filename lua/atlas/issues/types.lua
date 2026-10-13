@@ -1,47 +1,52 @@
 --------------------------------------------------------------------------------
--- User
+-- Issue
 --------------------------------------------------------------------------------
 
----@class IssueUser
----@field id integer|nil
----@field account_id string|nil
----@field display_name string
-
---------------------------------------------------------------------------------
--- Project
---------------------------------------------------------------------------------
-
----@class IssueProject
----@field id string
+---@class IssueRef
 ---@field key string
----@field name string
----@field self string
----@field category table|nil
+---@field title string|nil
 
---------------------------------------------------------------------------------
---  Issue
---------------------------------------------------------------------------------
--- TODO: This has been mainly started with Jira so its pretty much jira specific, it currently works with github as well but i should probably refactor this at some point.
-
----@class Issue
----@field key string
----@field summary string
----@field project IssueProject|nil
+---@class Issue : IssueRef
+---@field title string
+---@field icon AtlasIconStyle|nil
 ---@field status string|nil
 ---@field status_id string|nil
----@field status_category string|nil
----@field status_color string|nil
 ---@field type IssueType|nil
----@field priority string|nil
----@field assignee IssueUser|nil
----@field reporter IssueUser|nil
+---@field assignee AtlasUser|nil
+---@field reporter AtlasUser|nil
 ---@field story_points number|nil
 ---@field duedate string|nil
----@field parent Issue|nil
+---@field parent IssueRef|nil
 ---@field url string|nil
----@field is_pinned boolean|nil
+---@field created_at string|nil
+---@field updated_at string|nil
+---@field closed_at string|nil
+---@field comment_count integer|nil
+---@field is_starred boolean|nil
 ---@field is_subscribed boolean|nil
----@field _raw table|nil
+
+---@class IssueDetails
+---@field title string|nil
+---@field description string
+---@field assignees AtlasUser[]
+---@field labels IssueLabel[]
+---@field milestone IssueMilestone|nil
+
+--------------------------------------------------------------------------------
+-- Label
+--------------------------------------------------------------------------------
+
+---@class IssueLabel
+---@field name string
+---@field color string|nil
+
+--------------------------------------------------------------------------------
+-- Milestone
+--------------------------------------------------------------------------------
+
+---@class IssueMilestone
+---@field id integer|nil
+---@field title string
 
 --------------------------------------------------------------------------------
 -- Group
@@ -58,6 +63,7 @@
 ---@class IssueType
 ---@field id string
 ---@field name string
+---@field icon AtlasIconStyle|nil
 ---@field description string|nil
 ---@field subtask boolean
 
@@ -68,6 +74,7 @@
 ---@class IssueTransition
 ---@field id string
 ---@field name string
+---@field icon AtlasIconStyle|nil
 ---@field to_status_id string|nil
 ---@field to_status_name string|nil
 ---@field to_status_category string|nil
@@ -81,7 +88,7 @@
 ---@field id string
 ---@field self string|nil
 ---@field url string|nil
----@field author IssueUser|nil
+---@field author AtlasUser|nil
 ---@field body string|nil
 ---@field created string|nil
 ---@field updated string|nil
@@ -90,10 +97,6 @@
 ---@field reactions table<string, number>|nil
 ---@field deleted boolean|nil
 ---@field _raw table|nil
-
---------------------------------------------------------------------------------
--- History
---------------------------------------------------------------------------------
 
 --------------------------------------------------------------------------------
 -- Activity / reactions
@@ -108,13 +111,21 @@
 
 ---@class IssueActivityEntry
 ---@field kind string
----@field actor IssueUser|nil
+---@field actor AtlasUser|nil
 ---@field date string|nil
 ---@field label string|nil
 ---@field body string|nil
 ---@field body_hl IssueActivityBodyHlFn|nil
 ---@field deleted boolean|nil
 ---@field always_render boolean|nil
+
+---@alias IssueConversationItemKind "comment"|"activity"
+
+---@class IssueConversationItem
+---@field id string
+---@field kind IssueConversationItemKind
+---@field created_at string
+---@field entity IssueComment|IssueActivityEntry
 
 ---@class IssueReactionOption
 ---@field key string

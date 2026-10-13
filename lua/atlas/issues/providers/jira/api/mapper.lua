@@ -1,9 +1,22 @@
 local M = {}
-local adf = require("atlas.issues.providers.jira.converted.adf")
+local adf = require("atlas.formats.adf.to_markdown")
+local config = require("atlas.config")
+local highlights = require("atlas.ui.highlights")
+local icons = require("atlas.ui.shared.icons")
 local json = require("atlas.core.json")
+local users = require("atlas.providers.jira.users")
+
+---@param raw any
+---@return AtlasUser|nil
+local function normalize_issue_user(raw)
+	local user = users.to_user(raw)
+	if user and user.id ~= "" and user.name ~= "" then
+		return user
+	end
+end
 
 ---@param raw_project any Decoded API value.
----@return IssueProject|nil
+---@return JiraIssueProject|nil
 function M.to_project(raw_project)
 	if type(raw_project) ~= "table" then
 		return nil
@@ -41,6 +54,21 @@ function M.to_project(raw_project)
 	}
 end
 
+---@param name string|nil
+---@return AtlasIconStyle
+local function issue_type_icon(name)
+	local key = tostring(name or ""):lower()
+	local style = config.options.issues.jira.project_config.issue_types[key]
+	if style then
+		return { icon = style.icon or icons.get("issue"), hl_group = style.hl_group or "AtlasTextMuted" }
+	end
+
+	return {
+		icon = icons.get("issue"),
+		hl_group = highlights.dynamic_for(key ~= "" and ("jira-issue-type:" .. key) or nil) or "AtlasTextMuted",
+	}
+end
+
 ---@param raw_type any Decoded API value.
 ---@return IssueType|nil
 function M.to_issue_type(raw_type)
@@ -57,6 +85,7 @@ function M.to_issue_type(raw_type)
 	return {
 		id = id,
 		name = name,
+		icon = issue_type_icon(name),
 		description = raw_type.description and tostring(raw_type.description) or nil,
 		subtask = raw_type.subtask == true,
 	}
@@ -81,81 +110,42 @@ local function safe_get(obj, key, subkey)
 	return val
 end
 
----@param value any
----@return string|nil
-local function to_string_or_nil(value)
-	return json.safe_str(value)
-end
-
 ---@param raw_status any Decoded API value.
----@return string|nil, string|nil, string|nil, string|nil
+---@return string|nil, string|nil
 local function extract_status(raw_status)
 	raw_status = json.nilify(raw_status)
 	if type(raw_status) ~= "table" then
-		return nil, nil, nil, nil
+		return nil, nil
 	end
 
 	local name = safe_get(raw_status, "name")
 	local id = raw_status.id and tostring(raw_status.id) or nil
-	local category = nil
-	local color = nil
-
-	local cat = safe_get(raw_status, "statusCategory")
-	if type(cat) == "table" then
-		category = cat.name
-		color = cat.colorName
-	end
-
-	return name, id, category, color
-end
-
----@param raw_user any Decoded API value.
----@return IssueUser|nil
-local function normalize_issue_user(raw_user)
-	raw_user = json.nilify(raw_user)
-	if type(raw_user) ~= "table" then
-		return nil
-	end
-
-	-- Replace accountId with name to support Jira server instances
-	local account_id = json.safe_str(raw_user.accountId) or json.safe_str(raw_user.name) or ""
-	local display_name = json.safe_str(raw_user.displayName) or ""
-	if account_id == "" or display_name == "" then
-		return nil
-	end
-	return {
-		account_id = account_id,
-		display_name = display_name,
-	}
+	return name, id
 end
 
 ---@param raw_parent any Decoded API value.
----@return Issue|nil
+---@return IssueRef|nil
 local function extract_parent(raw_parent)
 	raw_parent = json.nilify(raw_parent)
 	if type(raw_parent) ~= "table" or not raw_parent.key then
 		return nil
 	end
 
-	local pf = raw_parent.fields or {}
-	local status, status_id, status_category, status_color = extract_status(safe_get(pf, "status"))
-
+	local pf = json.safe_table(raw_parent.fields)
 	return {
 		key = tostring(raw_parent.key),
-		summary = tostring(pf.summary or ""),
-		project = M.to_project(safe_get(pf, "project")),
-		status = status,
-		status_id = status_id,
-		status_category = status_category,
-		status_color = status_color,
-		type = M.to_issue_type(safe_get(pf, "issuetype")),
-		priority = safe_get(pf, "priority", "name"),
-		assignee = normalize_issue_user(safe_get(pf, "assignee")),
-		reporter = normalize_issue_user(safe_get(pf, "reporter")),
-		story_points = nil,
-		duedate = nil,
-		parent = nil,
+		title = json.safe_str(pf.summary),
 	}
+end
+
+---@param value any
+---@return string
+local function extract_description(value)
+	value = json.nilify(value)
+	if type(value) == "table" then
+		return adf.to_markdown(value)
+	end
+	return json.safe_str(value) or ""
 end
 
 ---@param value any
@@ -182,29 +172,77 @@ end
 
 ---@param raw table
 ---@param sp_field string|nil
----@return Issue
+---@return JiraIssue
 function M.to_issue(raw, sp_field)
-	local fields = raw.fields or {}
-	local status, status_id, status_category, status_color = extract_status(safe_get(fields, "status"))
+	local fields = json.safe_table(raw.fields)
+	local status, status_id = extract_status(safe_get(fields, "status"))
+	local issue_type = M.to_issue_type(safe_get(fields, "issuetype"))
 
 	return {
+		id = raw.id,
 		key = tostring(raw.key or ""),
-		summary = tostring(fields.summary or ""),
+		title = tostring(fields.summary or ""),
 		project = M.to_project(safe_get(fields, "project")),
 		status = status,
 		status_id = status_id,
-		status_category = status_category,
-		status_color = status_color,
-		type = M.to_issue_type(safe_get(fields, "issuetype")),
+		type = issue_type,
+		icon = issue_type and issue_type.icon,
 		priority = safe_get(fields, "priority", "name"),
 		assignee = normalize_issue_user(safe_get(fields, "assignee")),
 		reporter = normalize_issue_user(safe_get(fields, "reporter")),
 		story_points = sp_field and extract_story_points(fields[sp_field]) or nil,
-		duedate = to_string_or_nil(fields.duedate),
+		duedate = json.safe_str(fields.duedate),
 		parent = extract_parent(safe_get(fields, "parent")),
+		created_at = json.safe_str(fields.created),
+		updated_at = json.safe_str(fields.updated),
+		closed_at = json.safe_str(fields.resolutiondate),
+		comment_count = tonumber(safe_get(fields, "comment", "total")),
 		is_subscribed = safe_get(fields, "watches", "isWatching") == true,
-		_raw = raw,
 	}
+end
+
+---@param raw table
+---@param project_config AtlasJiraProjectFieldsConfig|nil
+---@return JiraIssueDetails
+function M.to_issue_details(raw, project_config)
+	local fields = json.safe_table(raw.fields)
+	local status = extract_status(safe_get(fields, "status"))
+	local assignee = normalize_issue_user(safe_get(fields, "assignee"))
+	local labels = {}
+	for _, name in ipairs(json.safe_table(fields.labels)) do
+		if type(name) == "string" and name ~= "" then
+			table.insert(labels, { name = name })
+		end
+	end
+	---@type JiraIssueDetails
+	local details = {
+		title = json.safe_str(fields.summary),
+		description = extract_description(fields.description),
+		type = M.to_issue_type(safe_get(fields, "issuetype")),
+		status = status,
+		priority = safe_get(fields, "priority", "name"),
+		reporter = normalize_issue_user(safe_get(fields, "reporter")),
+		assignees = assignee and { assignee } or {},
+		labels = labels,
+		milestone = nil,
+		raw_description = json.nilify(fields.description),
+		custom_fields = {},
+	}
+	for field_id, field_config in pairs(project_config or {}) do
+		local value = json.nilify(fields[field_id])
+		if value ~= nil then
+			local ok, formatted = pcall(field_config.format, value)
+			if ok and formatted and formatted ~= "" then
+				table.insert(details.custom_fields, {
+					name = field_config.name or field_id,
+					formatted = formatted,
+					hl_group = field_config.hl_group,
+					display = field_config.display or "chip",
+				})
+			end
+		end
+	end
+	return details
 end
 
 ---@param raw_issues table[]
@@ -263,8 +301,9 @@ end
 ---@param context JiraCommentMappingContext
 ---@return IssueComment[]
 function M.to_comments_list(raw, context)
+	local payload = json.safe_table(raw)
 	local comments = {}
-	for _, raw_comment in ipairs((type(raw) == "table" and raw.comments) or {}) do
+	for _, raw_comment in ipairs(json.safe_table(payload.comments)) do
 		local comment = normalize_comment(raw_comment, context or {})
 		if comment ~= nil then
 			table.insert(comments, comment)
@@ -273,8 +312,7 @@ function M.to_comments_list(raw, context)
 	return comments
 end
 
-local icons = require("atlas.ui.shared.icons")
-local helper = require("atlas.issues.ui.main.helper")
+local helper = require("atlas.issues.ui.presentation")
 
 local FIELD_LABELS = {
 	Comment = "a comment",
@@ -325,13 +363,13 @@ local function arrow_hl(from_hl, to_hl)
 end
 
 ---@param raw_item table
----@param actor IssueUser|nil
+---@param actor AtlasUser|nil
 ---@param date string|nil
 ---@return IssueActivityEntry
 local function activity_from_history_item(raw_item, actor, date)
-	local field = to_string_or_nil(raw_item.field) or ""
-	local from = to_string_or_nil(raw_item.fromString) or to_string_or_nil(raw_item.from)
-	local to = to_string_or_nil(raw_item.toString) or to_string_or_nil(raw_item.to)
+	local field = json.safe_str(raw_item.field) or ""
+	local from = json.safe_str(raw_item.fromString) or json.safe_str(raw_item.from)
+	local to = json.safe_str(raw_item.toString) or json.safe_str(raw_item.to)
 	local has_from = from ~= nil and vim.trim(from) ~= ""
 	local has_to = to ~= nil and vim.trim(to) ~= ""
 	local action = (has_from and not has_to) and "deleted" or (not has_from and has_to) and "added" or "updated"
@@ -365,19 +403,18 @@ local function activity_from_history_item(raw_item, actor, date)
 		body = string.format("%s -> %s", from or "Unassigned", to or "Unassigned")
 		body_hl = arrow_hl(helper.person_hl(from), helper.person_hl(to))
 	elseif field == "priority" then
-		local from_icon, from_hl = icons.issues_priority(from or "")
-		local to_icon, to_hl = icons.issues_priority(to or "")
+		local from_icon, from_hl = icons.get(from or "", "priority")
+		local to_icon, to_hl = icons.get(to or "", "priority")
 		body = string.format("%s %s -> %s %s", from_icon, from or "", to_icon, to or "")
 		body_hl = arrow_hl(from_hl, to_hl)
 	elseif field == "issuetype" then
-		local from_icon, from_hl = icons.issues_type(from or "")
-		local to_icon, to_hl = icons.issues_type(to or "")
-		body = string.format("%s %s -> %s %s", from_icon, from or "", to_icon, to or "")
-		body_hl = arrow_hl(from_hl, to_hl)
+		local from_icon = issue_type_icon(from)
+		local to_icon = issue_type_icon(to)
+		body = string.format("%s %s -> %s %s", from_icon.icon, from or "", to_icon.icon, to or "")
+		body_hl = arrow_hl(from_icon.hl_group, to_icon.hl_group)
 	elseif field == "status" then
 		body = string.format("%s -> %s", from or "", to or "")
-		body_hl =
-			arrow_hl(helper.status_hl(to_string_or_nil(raw_item.from)), helper.status_hl(to_string_or_nil(raw_item.to)))
+		body_hl = arrow_hl(helper.status_hl(json.safe_str(raw_item.from)), helper.status_hl(json.safe_str(raw_item.to)))
 	elseif field == "timeoriginalestimate" or field == "timeestimate" or field == "timespent" then
 		body = string.format("%s -> %s", format_estimate(from), format_estimate(to))
 	elseif field == "IssueParentAssociation" then
@@ -400,31 +437,23 @@ local function activity_from_history_item(raw_item, actor, date)
 end
 
 ---@param raw any Decoded API value.
----@param fallback_start_at number|nil
----@param fallback_max_results number|nil
----@return { start_at: number, max_results: number, total: number, is_last: boolean, values: IssueActivityEntry[] }
-function M.to_history_page(raw, fallback_start_at, fallback_max_results)
-	local values = {}
-	local histories = type(raw) == "table" and (raw.values or raw.histories) or {}
-	for _, raw_entry in ipairs(type(histories) == "table" and histories or {}) do
-		if type(raw_entry) == "table" then
-			local actor = normalize_issue_user(raw_entry.author)
-			local date = raw_entry.created and tostring(raw_entry.created) or nil
-			for _, raw_item in ipairs(raw_entry.items or {}) do
-				if type(raw_item) == "table" then
-					table.insert(values, activity_from_history_item(raw_item, actor, date))
-				end
+---@return IssueActivityEntry[]
+function M.to_history(raw)
+	local payload = json.safe_table(raw)
+	local entries = {}
+	for _, raw_entry in ipairs(json.safe_table(payload.values or payload.histories)) do
+		local entry = json.safe_table(raw_entry)
+		local actor = normalize_issue_user(entry.author)
+		local date = entry.created and tostring(entry.created) or nil
+		for _, raw_item in ipairs(json.safe_table(entry.items)) do
+			local item = json.safe_table(raw_item)
+			if next(item) ~= nil then
+				table.insert(entries, activity_from_history_item(item, actor, date))
 			end
 		end
 	end
 
-	return {
-		start_at = tonumber(type(raw) == "table" and raw.startAt) or tonumber(fallback_start_at) or 0,
-		max_results = tonumber(type(raw) == "table" and raw.maxResults) or tonumber(fallback_max_results) or 100,
-		total = tonumber(type(raw) == "table" and raw.total) or #values,
-		is_last = type(raw) == "table" and raw.isLast == true or false,
-		values = values,
-	}
+	return entries
 end
 
 return M

@@ -1,610 +1,391 @@
+local checkout = require("atlas.core.git.checkout")
+local config = require("atlas.config")
+local diff_git = require("atlas.pulls.diff.git")
+local diff_worktree = require("atlas.pulls.diff.worktree")
+local git = require("atlas.core.git")
+local loading = require("atlas.ui.loading")
+local logger = require("atlas.core.logger")
+local notes = require("atlas.pulls.notes")
+local notify = require("atlas.core.notify")
+local providers = require("atlas.providers")
+local request_scope = require("atlas.core.requests")
+local viewer = require("atlas.pulls.diff.viewer")
+local worktree = require("atlas.core.git.worktree")
+
 local M = {}
 
-local git = require("atlas.core.git")
-local checkout = require("atlas.core.git.checkout")
-local logger = require("atlas.core.logger")
-local notify = require("atlas.core.notify")
+---@class AtlasDiffFile
+---@field path string
+---@field old_path string|nil
+---@field status "added"|"deleted"|"modified"|"renamed"|"copied"|"type_changed"
+---@field additions integer|nil
+---@field deletions integer|nil
+---@field binary boolean
 
----@param requested AtlasPullsDiffOpenCommand|string|nil
----@return AtlasPullsDiffOpenCommand|string|nil open_cmd
----@return string|nil err
-local function configured_command(requested)
-	local config = require("atlas.config")
-	local pulls_cfg = config.options.pulls or {}
-	local cmd = vim.trim(tostring(requested or (pulls_cfg.diff or {}).open_cmd or ""))
-	if cmd == "" then
-		return nil, "diff.open_cmd is not configured"
-	end
-	if vim.fn.exists(":" .. cmd) ~= 2 then
-		return nil, string.format("diff.open_cmd command not found: %s", cmd)
-	end
-
-	return cmd, nil
-end
-
----@class PullsDiffOpenOptions
----@field git_root string
+---@class AtlasDiffResult
+---@field kind "pr"|"commit"|"range"
+---@field root string
 ---@field base_revision string
 ---@field head_revision string
----@field open_cmd AtlasPullsDiffOpenCommand|string|nil
-
----@param opts PullsDiffLaunchOptions
----@param range string
----@param view AtlasLoadingView
----@return string|nil err
-local function open_diffview(opts, range, view)
-	local ok, result = pcall(vim.api.nvim_win_call, view.win, function()
-		vim.cmd("tcd " .. vim.fn.fnameescape(opts.git_root))
-		vim.api.nvim_cmd({ cmd = "DiffviewOpen", args = { range } }, {})
-		if not opts.review then
-			return nil
-		end
-		local diffview = require("diffview.lib").get_current_view()
-		if not diffview then
-			return "Diffview session is unavailable"
-		end
-		return require("atlas.pulls.diff.diffview").attach(opts.review, diffview, {
-			root = opts.git_root,
-			base_revision = opts.base_revision,
-			head_revision = opts.head_revision,
-			reload = opts.reload,
-		})
-	end)
-	if not ok then
-		return tostring(result)
-	end
-	return result and "Unable to attach review to Diffview: " .. result or nil
-end
-
----@param open_cmd string
----@param repo_path string
----@param range string
----@return string|nil err
-local function open_external_diff(open_cmd, repo_path, range)
-	local tabpage
-	local ok, err = pcall(function()
-		vim.cmd("tabnew")
-		tabpage = vim.api.nvim_get_current_tabpage()
-		vim.cmd("tcd " .. vim.fn.fnameescape(repo_path))
-		vim.api.nvim_cmd({ cmd = open_cmd, args = { range } }, {})
-	end)
-	if not ok and tabpage and vim.api.nvim_tabpage_is_valid(tabpage) then
-		pcall(vim.cmd, vim.api.nvim_tabpage_get_number(tabpage) .. "tabclose")
-	end
-	return not ok and tostring(err) or nil
-end
-
----@param opts PullsDiffLaunchOptions
----@param range string
----@param view AtlasLoadingView
----@param on_done fun(err: string|nil)
----@return { cancel: fun() }
-local function open_codediff(opts, range, view, on_done)
-	local finished = false
-	local cancelled = false
-	local opened_tabpage
-	local autocmd_id
-
-	local function finish(err)
-		if finished then
-			return
-		end
-		finished = true
-		if autocmd_id then
-			pcall(vim.api.nvim_del_autocmd, autocmd_id)
-			autocmd_id = nil
-		end
-		if cancelled then
-			return
-		end
-		view:finish()
-		on_done(err)
-	end
-
-	-- CodeDiff opens its own tab, so close the temporary one.
-	autocmd_id = vim.api.nvim_create_autocmd("User", {
-		pattern = "CodeDiffOpen",
-		callback = function(args)
-			local tabpage = args.data and args.data.tabpage
-			if not tabpage then
-				return
-			end
-			local lifecycle_ok, lifecycle = pcall(require, "codediff.ui.lifecycle")
-			local session = lifecycle_ok and lifecycle.get_session(tabpage) or nil
-			if not session then
-				return
-			end
-			opened_tabpage = tabpage
-			if cancelled then
-				pcall(lifecycle.close, tabpage)
-				finish(nil)
-				return
-			end
-			local attach_err
-			if opts.review then
-				local attached, result = pcall(require("atlas.pulls.diff.codediff").attach, opts.review, tabpage, {
-					root = opts.git_root,
-					base_revision = opts.base_revision,
-					head_revision = opts.head_revision,
-					reload = opts.reload,
-				})
-				if attached then
-					attach_err = result
-				else
-					attach_err = tostring(result)
-				end
-			end
-			vim.schedule(function()
-				finish(attach_err and "Unable to attach review to CodeDiff: " .. attach_err or nil)
-			end)
-		end,
-	})
-	local ok, err = pcall(vim.api.nvim_win_call, view.win, function()
-		vim.api.nvim_cmd({ cmd = "CodeDiff", args = { "--repo", opts.git_root, range } }, {})
-	end)
-	if not ok then
-		finish(tostring(err))
-	end
-	vim.defer_fn(function()
-		if not finished then
-			finish("CodeDiff did not open; check CodeDiff notifications for details")
-		end
-	end, 15000)
-	return {
-		cancel = function()
-			if finished or cancelled then
-				return
-			end
-			cancelled = true
-			if opened_tabpage then
-				local loaded, lifecycle = pcall(require, "codediff.ui.lifecycle")
-				if loaded then
-					pcall(lifecycle.close, opened_tabpage)
-				end
-				finish(nil)
-			end
-		end,
-	}
-end
-
--- Prefer an existing checkout; nil makes Atlas use its shared cache.
----@param pr PullRequest
----@return string|nil
-local function repository_path(pr)
-	local cwd = vim.fn.getcwd()
-	local resolver = require("atlas.providers.resolve")
-	local current = git.local_repository(cwd)
-	local target = resolver.resolve(pr.link.html)
-	if
-		current
-		and target
-		and current.provider == target.provider
-		and current.host:lower() == target.host:lower()
-		and current.slug:lower() == pr.repo_full_name:lower()
-	then
-		return git.repo_root(cwd)
-	end
-	local path = checkout.resolve_repo_path_for_pr(pr, { require_git = true, require_existing = true })
-	return path
-end
-
----@class PullsDiffLaunchOptions
----@field git_root string
----@field base_revision string
----@field head_revision string
----@field open_cmd AtlasPullsDiffOpenCommand|string
----@field review AtlasPreparedReviewContext|nil
+---@field base_ref string|nil
+---@field head_ref string|nil
+---@field files AtlasDiffFile[]
+---@field options AtlasPullsDiffConfig
+---@field pr PullRequest|nil
 ---@field commits PullsCommit[]
----@field reload fun(target: AtlasLoadingTarget|nil)
+---@field review { data?: PullsReviewData, context?: PullsReviewContext }|nil
+---@field current_user AtlasUser|nil
+---@field notes { target: AtlasNoteTarget, items: AtlasNote[] }|nil
+---@field worktree_root string|nil
+---@field release fun() Call when closing the review to clean up its worktree.
 
----@param opts PullsDiffLaunchOptions
----@param view AtlasLoadingView
----@param on_done fun(err: string|nil)
----@return { cancel: fun() }|nil
-local function launch_diff(opts, view, on_done)
-	local range = opts.base_revision .. "..." .. opts.head_revision
-	logger.loginfo("diff.open", { repo_path = opts.git_root, command = opts.open_cmd .. " " .. range })
+vim.api.nvim_create_autocmd("VimLeavePre", {
+	group = vim.api.nvim_create_augroup("AtlasDiffWorktrees", { clear = true }),
+	callback = function()
+		worktree.shutdown()
+	end,
+})
 
-	if opts.open_cmd == "AtlasDiff" then
-		local explorer = require("atlas.pulls.diff.atlas.explorer")
-		local explorer_options = explorer.options()
-		local cancelled = false
-		local request = require("atlas.pulls.diff.atlas.git").prepare({
-			git_root = opts.git_root,
-			base_revision = opts.base_revision,
-			head_revision = opts.head_revision,
-			filter = function(files)
-				return explorer.filter(files, explorer_options)
-			end,
-			on_progress = function(message)
-				view:update(message)
-			end,
-		}, function(prepared, err)
-			vim.schedule(function()
-				if cancelled then
-					return
-				end
-				if not prepared then
-					view:finish()
-					on_done(tostring(err or "Unable to prepare diff"))
-					return
-				end
-				local target = view:handoff()
-				if not target then
-					on_done("The diff loading view was closed")
-					return
-				end
-				local open_err = require("atlas.pulls.diff.atlas").open({
-					diff = prepared,
-					explorer = explorer_options,
-					review = opts.review,
-					commits = opts.commits,
-					reload = opts.reload,
-					target = target,
-				})
-				on_done(open_err)
-			end)
-		end)
-		return {
-			cancel = function()
-				cancelled = true
-				request.cancel()
-			end,
-		}
-	end
-
-	if opts.open_cmd == "CodeDiff" then
-		return open_codediff(opts, range, view, on_done)
-	end
-
-	local err
-	if opts.open_cmd == "DiffviewOpen" then
-		err = open_diffview(opts, range, view)
-	else
-		err = open_external_diff(opts.open_cmd, opts.git_root, range)
-	end
-	view:finish()
-	vim.schedule(function()
-		on_done(err)
-	end)
-	return nil
-end
-
----@param opts PullsDiffOpenOptions
----@param on_done fun(err: string|nil)|nil
----@param loading_target AtlasLoadingTarget|nil
----@return { cancel: fun() }|nil
-local function start_range(opts, on_done, loading_target)
-	local open_cmd, command_err = configured_command(opts.open_cmd)
-	local root = vim.trim(opts.git_root)
-	local base = vim.trim(opts.base_revision)
-	local head = vim.trim(opts.head_revision)
-	if not open_cmd or root == "" or base == "" or head == "" then
-		if on_done then
-			on_done(command_err or "Repository path, base revision, and head revision are required")
-		end
-		return nil
-	end
-
-	local current
-	local finished = false
-	local cancelled = false
-	local view
-	local function cancel()
-		if finished or cancelled then
+---@param root string
+---@param revision string
+---@param on_done fun(hash: string|nil, err: string|nil)
+local function resolve_commit(root, revision, on_done)
+	return git.run({ "rev-parse", "--verify", "--end-of-options", revision .. "^{commit}" }, {
+		cwd = root,
+		text = true,
+	}, function(result)
+		if result.code ~= 0 then
+			on_done(nil, vim.trim(result.stderr))
 			return
 		end
-		cancelled = true
-		if current then
-			current.cancel()
+
+		on_done(vim.trim(result.stdout), nil)
+	end)
+end
+
+---@param root string
+---@param base string|nil
+---@param head string
+---@param requests AtlasRequestScope
+---@param on_prepared fun(kind: string, source: table)
+---@param fail fun(title: string, description?: string)
+local function prepare_commits(root, base, head, requests, on_prepared, fail)
+	requests.run(function(done)
+		return resolve_commit(root, head, done)
+	end, function(head_hash, head_err)
+		if not head_hash then
+			fail("Unable to resolve commit: " .. head, head_err)
+			return
 		end
-		view:finish()
-	end
-	view = require("atlas.ui.components.loading").open("Preparing diff...", cancel, loading_target)
 
-	local function reload(target)
-		start_range(opts, function(err)
-			if err then
-				notify.error("Unable to reload diff: " .. err)
-			end
-		end, target)
-	end
-
-	current = launch_diff(
-		{
-			git_root = root,
-			base_revision = base,
-			head_revision = head,
-			open_cmd = open_cmd,
-			review = nil,
-			commits = {},
-			reload = reload,
-		},
-		view,
-		function(err)
-			if finished or cancelled then
+		requests.run(function(done)
+			return resolve_commit(root, base or head_hash .. "^", done)
+		end, function(base_hash, base_err)
+			if not base_hash then
+				fail("Unable to resolve base commit", base_err)
 				return
 			end
-			finished = true
-			current = nil
-			if on_done then
-				on_done(err)
-			end
-		end
-	)
-	return { cancel = cancel }
+
+			on_prepared(base and "range" or "commit", {
+				root = root,
+				base_revision = base_hash,
+				head_revision = head_hash,
+				base_ref = base,
+				head_ref = head,
+			})
+		end)
+	end)
 end
 
----@class AtlasDiffStartContext
----@field provider PullsProvider
----@field pr PullRequestRef
----@field current_user PullsUser|nil
+local function start_loading(message, context, on_done)
+	local requests = request_scope.new()
+	local options = vim.deepcopy(config.options.pulls.diff)
+	---@cast options AtlasPullsDiffConfig
+	options.open_cmd = config.diff_command()
+	context.command = options.open_cmd
 
----@param context AtlasDiffStartContext
----@param requested AtlasPullsDiffOpenCommand|string|nil
----@param refresh boolean
----@param on_done fun(err: string|nil)|nil
----@param loading_target AtlasLoadingTarget|nil
----@return { cancel: fun() }|nil
-local function start_pr(context, requested, refresh, on_done, loading_target)
-	local open_cmd, command_err = configured_command(requested)
-	if not open_cmd then
-		if on_done then
-			on_done(command_err)
+	---@type AtlasDiffResult|nil
+	local result
+	local pending_worktree
+
+	local function release_worktree()
+		if pending_worktree then
+			worktree.discard(pending_worktree.repo_root, pending_worktree.root)
+			pending_worktree = nil
 		end
-		return nil
+
+		if result and result.worktree_root then
+			diff_worktree.cleanup(result.worktree_root)
+			worktree.discard(result.root, result.worktree_root)
+		end
+
+		result = nil
 	end
 
-	local current
-	local finished = false
-	local cancelled = false
-	local view
 	local function cancel()
-		if finished or cancelled then
-			return
-		end
-		cancelled = true
-		if current then
-			current.cancel()
-		end
-		view:finish()
+		requests.cancel()
+		release_worktree()
 	end
-	view = require("atlas.ui.components.loading").open("Preparing diff...", cancel, loading_target)
 
-	local function complete(err)
-		if finished or cancelled then
-			return
+	local view = loading.open(message, cancel, "diff")
+
+	local function fail(title, description)
+		cancel()
+
+		local err = title
+		if description and description ~= "" then
+			err = title .. "\n\n" .. description
 		end
-		finished = true
-		current = nil
+
+		context.error = err
+		logger.logerror("diff.open failed", context)
+		view:error(err)
+
 		if on_done then
 			on_done(err)
 		end
 	end
 
-	local function fail(err)
-		view:finish()
-		complete(err)
-	end
+	local function on_prepared(kind, source, pr_data)
+		pr_data = pr_data or {}
+		context.root = source.root
+		context.base = source.base_revision
+		context.head = source.head_revision
 
-	-- Provider caches may invoke callbacks before returning their request handle.
-	local function later(callback, ...)
-		local args = { ... }
-		local count = select("#", ...)
-		vim.schedule(function()
-			if finished or cancelled then
+		view:update("Loading changed files...")
+		requests.run(function(done)
+			return diff_git.load(source, done)
+		end, function(diff, load_err)
+			if not diff then
+				fail("Unable to load changed files", load_err)
 				return
 			end
-			current = nil
-			callback(unpack(args, 1, count))
-		end)
-	end
 
-	---@param review AtlasPreparedReviewContext|nil
-	---@param commits PullsCommit[]
-	---@param root string
-	---@param base string
-	---@param head string
-	local function launch(review, commits, root, base, head)
-		local function reload(target)
-			start_pr(context, open_cmd, true, function(err)
-				if err then
-					notify.error("Unable to reload diff: " .. err)
+			local function complete(worktree_root)
+				result = {
+					kind = kind,
+					root = source.root,
+					base_revision = diff.base_revision,
+					head_revision = source.head_revision,
+					base_ref = source.base_ref,
+					head_ref = source.head_ref,
+					files = diff.files,
+					options = options,
+					pr = pr_data.pr,
+					commits = pr_data.commits or {},
+					review = pr_data.review,
+					current_user = pr_data.current_user,
+					notes = pr_data.notes,
+					worktree_root = worktree_root,
+					release = release_worktree,
+				}
+				pending_worktree = nil
+
+				local opened, open_err = pcall(viewer.open, result)
+				if not opened then
+					fail("Unable to open diff", open_err)
+					return
 				end
-			end, target)
-		end
-		current = launch_diff(
-			{
-				git_root = root,
-				base_revision = base,
-				head_revision = head,
-				open_cmd = open_cmd,
-				review = review,
-				commits = commits,
-				reload = reload,
-			},
-			view,
-			function(err)
-				later(complete, err)
+
+				view:finish()
+				if on_done then
+					on_done(nil)
+				end
 			end
-		)
-	end
 
-	---@param review AtlasPreparedReviewContext
-	---@param root string
-	---@param base string
-	---@param head string
-	local function load_commits(review, root, base, head)
-		context = review
-		local core = context.provider.capabilities.core
-		if open_cmd ~= "AtlasDiff" or not core.fetch_commits then
-			launch(review, {}, root, base, head)
-			return
-		end
-		view:update(refresh and "Refreshing commits..." or "Loading commits...")
-		current = core.fetch_commits(context.pr, refresh and { force_refresh = true } or {}, function(commits, err)
-			later(function()
-				if err then
-					table.insert(review.initial_review.warnings, "Unable to load commits: " .. tostring(err))
+			-- Diffview uses revision buffers, so it doesn't need an LSP worktree.
+			if not options.lsp.enabled or options.open_cmd == "DiffviewOpen" or #diff.files == 0 then
+				complete()
+				return
+			end
+
+			view:update("Preparing worktree...")
+			local pr = pr_data.pr
+			local dir, claim_err = worktree.claim({
+				repo_root = source.root,
+				head_sha = source.head_revision,
+				repo_full_name = pr and pr.repo_full_name,
+				pr_id = pr and pr.id,
+			}, options.lsp)
+			if not dir then
+				notify.warn("LSP worktree unavailable: " .. claim_err)
+				complete()
+				return
+			end
+
+			pending_worktree = { repo_root = source.root, root = dir }
+			worktree.prune(source.root)
+
+			requests.run(function(done)
+				return worktree.ensure({
+					repo_root = source.root,
+					head_sha = source.head_revision,
+					dir = dir,
+					link = options.lsp.link,
+				}, done)
+			end, function(path, prepare_err)
+				if not path then
+					release_worktree()
+					notify.warn("LSP worktree unavailable: " .. prepare_err)
 				end
-				launch(review, commits or {}, root, base, head)
+
+				complete(path)
 			end)
 		end)
 	end
 
-	---@param root string
-	---@param base string
-	---@param head string
-	local function load_review(root, base, head)
-		if open_cmd ~= "AtlasDiff" and open_cmd ~= "CodeDiff" and open_cmd ~= "DiffviewOpen" then
-			launch(nil, {}, root, base, head)
-			return
-		end
-		view:update(refresh and "Refreshing review..." or "Loading review...")
-		current = require("atlas.pulls.diff.shared.review").load(context, { force_refresh = refresh }, function(review)
-			later(load_commits, review, root, base, head)
-		end)
-	end
-
-	local function load_repository()
-		---@cast context AtlasReviewOpenContext
-		current = checkout.ensure_pr_repository(context.pr, repository_path(context.pr), function(message)
-			view:update(message)
-		end, function(root, err)
-			later(function()
-				if not root then
-					fail(tostring(err or "Unable to load pull request repository"))
-					return
-				end
-				local base, head, revision_err = checkout.pr_diff_revisions(context.pr)
-				if not base or not head then
-					fail(tostring(revision_err or "Unable to resolve pull request revisions"))
-					return
-				end
-				local head_hash = git.resolve_revision(root, head)
-				if not head_hash then
-					fail("Unable to resolve pull request head")
-					return
-				end
-				load_review(root, base, head_hash)
-			end)
-		end)
-	end
-
-	if refresh then
-		view:update("Refreshing pull request...")
-		current = context.provider.capabilities.core.fetch_pullrequest(
-			context.pr,
-			{ force_load = true },
-			function(pr, err)
-				later(function()
-					if not pr then
-						fail(tostring(err or "Unable to refresh pull request"))
-						return
-					end
-					context.pr = pr
-					load_repository()
-				end)
-			end
-		)
-	else
-		load_repository()
-	end
-	return { cancel = cancel }
+	return view, requests, fail, on_prepared
 end
 
----@param value string
----@return { cancel: fun() }|nil
-local function open_pull_request(value)
-	local providers = require("atlas.providers")
-	local resolver = require("atlas.providers.resolve")
-	local target, target_err = resolver.resolve(value)
-	if not target then
-		notify.error(target_err or "Invalid pull request URL")
-		return nil
-	end
-	if target.domain ~= "pulls" or target.entity ~= "pr" then
-		notify.error("Expected a pull request URL")
-		return nil
-	end
-	if not resolver.configured(target) then
-		notify.error("Pull request provider is not configured: " .. target.provider)
-		return nil
-	end
+-- Accepts a PR reference: provider ID, repository name and PR ID.
+---@param ref { provider: string, repo_full_name: string, id: string|number, root?: string }
+---@param on_done (fun(err: string|nil))|nil
+function M.open_pr(ref, on_done)
+	local cwd = ref.root or git.default_cwd()
+	local view, requests, fail, on_prepared = start_loading("Loading pull request...", {
+		kind = "pr",
+		provider = ref.provider,
+		repo = ref.repo_full_name,
+		pr_id = ref.id,
+	}, on_done)
 
-	---@type PullsProvider|nil
-	local provider = providers.load(target.provider, target.domain)
-	if not provider then
-		notify.error("Unable to load pull request provider: " .. target.provider)
-		return nil
-	end
-
-	local pr = resolver.pull_request_ref(target)
-	return start_pr(
-		{
-			provider = provider,
-			pr = pr,
-			current_user = nil,
-		},
-		"AtlasDiff",
-		true,
-		function(err)
-			if err then
-				notify.error(err)
-			end
-		end
-	)
-end
-
----@param opts PullsDiffOpenOptions
----@param on_done fun(err: string|nil)|nil
----@return { cancel: fun() }|nil
-function M.open_range(opts, on_done)
-	return start_range(opts, on_done)
-end
-
----@param range string
-local function open_range_argument(range)
-	local separator = range:find("...", 1, true)
-	local base = separator and vim.trim(range:sub(1, separator - 1)) or ""
-	local head = separator and vim.trim(range:sub(separator + 3)) or ""
-	if base == "" or head == "" then
-		notify.error("Expected an explicit base...head range")
+	if not config.provider_options(ref.provider) then
+		fail("Pull request provider is not configured: " .. ref.provider)
 		return
 	end
-	M.open_range({
-		git_root = vim.fn.getcwd(),
-		base_revision = base,
-		head_revision = head,
-		open_cmd = "AtlasDiff",
-	}, function(err)
-		if err then
-			notify.error(err)
+
+	local provider = providers.load(ref.provider, "pulls")
+	if not provider then
+		fail("Unable to load pull request provider: " .. ref.provider)
+		return
+	end
+	---@cast provider PullsProvider
+
+	requests.run(function(done)
+		return provider.capabilities.core.fetch_by_refs({ ref }, { force_refresh = true }, done)
+	end, function(pulls, err)
+		local pr = pulls and pulls[1]
+		if not pr then
+			fail("Unable to load pull request", err)
+			return
 		end
+
+		local capabilities = provider.capabilities
+		local starts = {
+			repository = function(done)
+				return checkout.prepare_diff(pr, cwd, function(message)
+					view:update(message)
+				end, function(source, prepare_err)
+					if not source then
+						fail("Unable to prepare repository", prepare_err)
+						return
+					end
+
+					done(source, nil)
+				end)
+			end,
+		}
+
+		if capabilities.core.fetch_commits then
+			starts.commits = function(done)
+				return capabilities.core.fetch_commits(pr, { force_refresh = true }, done)
+			end
+		end
+
+		if capabilities.reviews then
+			starts.review = function(done)
+				return capabilities.reviews.fetch(pr, { force_refresh = true }, done)
+			end
+
+			if capabilities.reviews.fetch_review_context then
+				starts.review_context = function(done)
+					return capabilities.reviews.fetch_review_context(pr, { force_refresh = true }, done)
+				end
+			end
+		end
+
+		if capabilities.users then
+			starts.current_user = capabilities.users.fetch_user
+		end
+
+		view:update("Preparing repository and review data...")
+		requests.all(starts, function(values, errors)
+			for _, item in ipairs({
+				{ "commits", "commits" },
+				{ "review", "review data" },
+				{ "review_context", "review context" },
+				{ "current_user", "current user" },
+			}) do
+				if errors[item[1]] then
+					notify.warn("Unable to load " .. item[2] .. ": " .. errors[item[1]])
+				end
+			end
+
+			local target, notes_err = notes.target_for_pull_request(pr)
+			local note_items
+			if target then
+				note_items, notes_err = notes.list(target)
+			end
+			if notes_err then
+				notify.warn("Unable to load notes: " .. notes_err)
+			end
+
+			on_prepared("pr", values.repository, {
+				pr = pr,
+				commits = values.commits,
+				review = (values.review or values.review_context)
+					and { data = values.review, context = values.review_context },
+				current_user = values.current_user,
+				notes = target and { target = target, items = note_items or {} },
+			})
+		end)
 	end)
 end
 
----@param value string
-function M.open_argument(value)
-	if value:find("...", 1, true) then
-		open_range_argument(value)
-		return
-	end
-	open_pull_request(value)
+-- Accepts a commit revision and an optional repository path.
+---@param opts { commit: string, root?: string }
+---@param on_done (fun(err: string|nil))|nil
+function M.open_commit(opts, on_done)
+	local cwd = opts.root or git.default_cwd()
+	local _, requests, fail, on_prepared = start_loading("Preparing commit diff...", {
+		kind = "commit",
+		root = cwd,
+		commit = opts.commit,
+	}, on_done)
+
+	requests.run(function(done)
+		return git.repo_root(cwd, done)
+	end, function(root, err)
+		if not root then
+			fail("Unable to open diff", err)
+			return
+		end
+
+		prepare_commits(root, nil, opts.commit, requests, on_prepared, fail)
+	end)
 end
 
----@param context AtlasReviewOpenContext
----@param on_done fun(err: string|nil, level: "error"|nil)|nil
----@return { cancel: fun() }|nil
-function M.open_pr(context, on_done)
-	local pr = context.pr
-	return start_pr(context, nil, false, function(err)
-		if err then
-			logger.logerror("diff.open failed", { pr_id = pr.id, error = tostring(err) })
+-- Accepts base/head revisions and an optional repository path.
+---@param opts { base: string, head: string, root?: string }
+---@param on_done (fun(err: string|nil))|nil
+function M.open_range(opts, on_done)
+	local cwd = opts.root or git.default_cwd()
+	local _, requests, fail, on_prepared = start_loading("Preparing diff...", {
+		kind = "range",
+		root = cwd,
+		base = opts.base,
+		head = opts.head,
+	}, on_done)
+
+	requests.run(function(done)
+		return git.repo_root(cwd, done)
+	end, function(root, err)
+		if not root then
+			fail("Unable to open diff", err)
+			return
 		end
-		if on_done then
-			on_done(err, err and "error" or nil)
-		end
+
+		prepare_commits(root, opts.base, opts.head, requests, on_prepared, fail)
 	end)
 end
 

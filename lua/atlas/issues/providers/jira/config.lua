@@ -1,43 +1,65 @@
 -- Example:
 --   require("atlas").setup({
+--     providers = {
+--       ---@type AtlasJiraConfig
+--       jira = {
+--         base_url = "https://your-domain.atlassian.net",
+--         email    = vim.env.JIRA_EMAIL,
+--         token    = vim.env.JIRA_TOKEN,
+--         api_type = "cloud", -- "cloud" | "server"
+--         auth_method = "basic", -- "basic" | "bearer"
+--         cache_ttl = 300, -- Seconds; 0 disables caching.
+--       },
+--     },
 --     issues = {
---       providers = {
---         jira = {
---           base_url = "https://your-domain.atlassian.net",
---           email    = vim.env.JIRA_EMAIL,
---           token    = vim.env.JIRA_TOKEN,
---           api_type = "cloud",
---           auth_method = "basic", -- "basic" | "bearer"
---           cache_ttl = 300,
---           views = {
---             { name = "Open",       key = "1", jql = "assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC" },
---             { name = "Reported",   key = "2", jql = "reporter = currentUser() AND resolution = Unresolved ORDER BY updated DESC" },
---             { name = "Watching",   key = "3", jql = "watcher = currentUser() AND resolution = Unresolved ORDER BY updated DESC" },
---             { name = "Sprint",     key = "4", jql = "sprint in openSprints() AND assignee = currentUser() ORDER BY rank" },
---           },
---           bookmarks = {
---             -- key   = "J",   -- default
---             -- label = "JQL", -- default
---             items = {
---               ["Backlog"]     = "project = KAN AND statusCategory != Done AND (sprint IS EMPTY OR sprint NOT IN openSprints()) ORDER BY Rank ASC",
---               ["Next sprint"] = "project = KAN AND sprint in futureSprints() ORDER BY Rank ASC",
---             },
---           },
+--       ---@type AtlasJiraIssuesConfig
+--       jira = {
 --
---           -- Global Jira display settings and per-project custom fields
---           project_config = {
---             story_points_field = "customfield_10016",
---             issue_types = {
---               ["Maintenance"] = { icon = "", hl_group = "AtlasTextWarning" },
---               ["Infrastructure"] = { icon = "󰒋", hl_group = "AtlasLogInfo" },
+--         -- Global Jira display settings and per-project custom fields
+--         project_config = {
+--           story_points_field = "customfield_10016",
+--           -- Override issue type styles by name (case-insensitive).
+--           issue_types = {
+--             bug = { icon = "" },
+--             maintenance = { icon = "", hl_group = "AtlasTextWarning" },
+--             infrastructure = { icon = "󰒋", hl_group = "AtlasLogInfo" },
+--           },
+--           -- Override icons by status name or category.
+--           status_icons = {
+--             new = "●",
+--             indeterminate = "",
+--             done = "",
+--             ["In Review"] = "",
+--           },
+--           -- Custom fields to display per project; replace KAN with your project key.
+--           KAN = {
+--             customfield_10038 = {
+--               name    = "Team",
+--               format  = function(v) return type(v) == "table" and v.value or nil end,
+--               hl_group = "AtlasChipActive",
+--               display  = "chip", -- "chip" | "table"
 --             },
---             KAN = {
---               customfield_10038 = {
---                 name    = "Team",
---                 format  = function(v) return type(v) == "table" and v.value or nil end,
---                 hl_group = "AtlasChipActive",
---                 display  = "chip", -- "chip" | "table"
---               },
+--           },
+--         },
+--         views = {
+--           {
+--             name = "Open",
+--             key = "1",
+--             layout = "plain", -- "compact" | "plain"
+--             jql = "assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC",
+--           },
+--           { name = "Reported",   key = "2", jql = "reporter = currentUser() AND resolution = Unresolved ORDER BY updated DESC" },
+--           { name = "Watching",   key = "3", jql = "watcher = currentUser() AND resolution = Unresolved ORDER BY updated DESC" },
+--           { name = "Sprint",     key = "4", jql = "sprint in openSprints() AND assignee = currentUser() ORDER BY rank" },
+--         },
+--         bookmarks = {
+--           -- key   = "J",   -- default
+--           -- label = "JQL", -- default
+--           items = {
+--             ["Backlog"]     = "project = KAN AND statusCategory != Done AND (sprint IS EMPTY OR sprint NOT IN openSprints()) ORDER BY Rank ASC",
+--             ["Next sprint"] = {
+--               layout = "compact",
+--               jql = "project = KAN AND sprint in futureSprints() ORDER BY Rank ASC",
 --             },
 --           },
 --         },
@@ -65,20 +87,18 @@
 ---@class AtlasJiraProjectConfig
 ---@field story_points_field string|nil
 ---@field issue_types AtlasJiraIssueTypesConfig|nil
+---@field status_icons table<string, string>|nil
 ---@field [string] AtlasJiraProjectFieldsConfig
+
+---@class AtlasJiraBookmarkConfig : AtlasIssuesBookmarkConfig
+---@field jql string
 
 ---@class AtlasJiraBookmarksConfig
 ---@field key string|nil    -- default "J"
 ---@field label string|nil  -- default "JQL"
----@field items table<string, string>|nil
+---@field items table<string, string|AtlasJiraBookmarkConfig>|nil
 
 ---@class AtlasJiraIssuesConfig
----@field base_url string
----@field email string
----@field token string
----@field api_type string|nil
----@field auth_method "basic"|"bearer"|nil
----@field cache_ttl number|nil
 ---@field views AtlasJiraViewConfig[]|nil
 ---@field bookmarks AtlasJiraBookmarksConfig|nil
 ---@field project_config AtlasJiraProjectConfig|nil

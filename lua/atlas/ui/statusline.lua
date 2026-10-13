@@ -1,13 +1,19 @@
-local M = {}
-
+local config = require("atlas.config")
 local keymaps = require("atlas.core.keymaps")
 local icons = require("atlas.ui.shared.icons")
 local spinner = require("atlas.ui.components.spinner")
 local utils = require("atlas.ui.shared.utils")
 
+local M = {}
+
 local BACKGROUND_HL = "AtlasFooterBackground"
-local EXPRESSION = "%!v:lua.require'atlas.ui.statusline'.current()"
-local DIFF_EXPRESSION = "%!v:lua.require'atlas.pulls.diff.atlas.statusline'.current()"
+
+---@type table<integer, AtlasStatusline>
+local instances = {}
+---@type table<integer, AtlasStatusline>
+local windows = {}
+local next_id = 0
+local cached_version = nil
 
 ---@class AtlasStatuslineSegment
 ---@field text string
@@ -23,21 +29,49 @@ local DIFF_EXPRESSION = "%!v:lua.require'atlas.pulls.diff.atlas.statusline'.curr
 ---@class AtlasStatuslineNoticeState: AtlasStatuslineNotice
 ---@field token integer
 
----@type AtlasStatuslineSegment[]
-local items = {}
+---@class AtlasStatuslineOptions
+---@field context? "atlas"|"diff" Defaults to "atlas"
+---@field help_key? string|fun(): string|nil
+---@field show_version boolean|nil
+---@field left_padding integer|nil
 
----@type AtlasStatuslineNoticeState
-local notice = {
-	text = "",
-	hl_group = "AtlasFooterText",
-	token = 0,
-}
+---@class AtlasStatusline
+---@field id integer
+---@field expression string
+---@field items AtlasStatuslineSegment[]
+---@field notice AtlasStatuslineNoticeState
+---@field loading_spinner SpinnerInstance|nil
+---@field options AtlasStatuslineOptions
+---@field disposed boolean
+local Statusline = {}
+Statusline.__index = Statusline
 
----@type SpinnerInstance|nil
-local loading_spinner
+---@param context "atlas"|"diff"|nil
+local function redraw(context)
+	if M.enabled(context) then
+		vim.cmd("redrawstatus")
+	end
+end
 
-local function redraw()
-	vim.cmd("redrawstatus")
+local function get_version()
+	if cached_version then
+		return cached_version
+	end
+
+	cached_version = "dev"
+	local cwd = vim.fn.fnamemodify(debug.getinfo(1).source:sub(2), ":h")
+	pcall(
+		require("atlas.core.git").run,
+		{ "describe", "--tags", "--abbrev=0" },
+		{ cwd = cwd, text = true },
+		function(result)
+			if result.code == 0 and vim.trim(result.stdout or "") ~= "" then
+				cached_version = vim.trim(result.stdout)
+				vim.cmd("redrawstatus")
+			end
+		end
+	)
+	return cached_version
 end
 
 ---@param text any
@@ -166,7 +200,7 @@ function M.format(segments, current_notice, available, options)
 	end
 	if options.show_version then
 		fitted[#fitted + 1] = {
-			text = string.format("atlas (%s)", utils.get_version()),
+			text = string.format("atlas (%s)", get_version()),
 			hl_group = "AtlasFooterText",
 			align = "right",
 			priority = 0,
@@ -174,13 +208,19 @@ function M.format(segments, current_notice, available, options)
 	end
 	if options.help_key then
 		fitted[#fitted + 1] = {
-			text = string.format("%s help", options.help_key),
-			hl_group = "AtlasFooterWarning",
+			text = options.help_key,
+			hl_group = BACKGROUND_HL,
+			align = "right",
+		}
+		fitted[#fitted + 1] = {
+			text = "help",
+			hl_group = "AtlasFooterText",
 			align = "right",
 			priority = 10,
 		}
 	end
-	fit(fitted, available or current_width())
+	local left_padding = options.left_padding or 0
+	fit(fitted, math.max((available or current_width()) - left_padding - 1, 0))
 
 	local left, right = {}, {}
 	for _, segment in ipairs(fitted) do
@@ -188,7 +228,7 @@ function M.format(segments, current_notice, available, options)
 	end
 
 	return table.concat({
-		"%#" .. BACKGROUND_HL .. "#%<" .. string.rep(" ", options.left_padding or 0),
+		"%#" .. BACKGROUND_HL .. "#" .. string.rep(" ", left_padding),
 		table.concat(left),
 		"%=",
 		table.concat(right),
@@ -196,35 +236,35 @@ function M.format(segments, current_notice, available, options)
 	})
 end
 
-local function stop_loading()
-	if loading_spinner then
-		loading_spinner:stop()
-		loading_spinner = nil
+function Statusline:stop_loading()
+	if self.loading_spinner then
+		self.loading_spinner:stop()
+		self.loading_spinner = nil
 	end
 end
 
 ---@param token integer
 ---@param message string
-local function start_loading(token, message)
-	loading_spinner = spinner.create({
+function Statusline:start_loading(token, message)
+	self.loading_spinner = spinner.create({
 		interval_ms = 120,
 		on_tick = function(frame)
-			if notice.token ~= token then
+			if self.disposed or self.notice.token ~= token then
 				return
 			end
 
-			notice.text = string.format("%s %s", frame, message)
-			redraw()
+			self.notice.text = string.format("%s %s", frame, message)
+			redraw(self.options.context)
 		end,
 	})
-	loading_spinner:start()
+	self.loading_spinner:start()
 end
 
 ---@param text any
 ---@return string
 local function sanitize_notice(text)
 	local message = tostring(text or ""):gsub("[\r\n]+", " | ")
-	return #message > 60 and message:sub(1, 57) .. "..." or message
+	return utils.truncate(message, 60)
 end
 
 ---@param level "success"|"warn"|"error"|"info"|"loading"
@@ -242,91 +282,250 @@ local function notice_style(level)
 		error = "AtlasFooterError",
 		info = "AtlasFooterInfo",
 	}
-	return icons.general(icon_name), highlights[level] or "AtlasFooterText"
+	return icons.get(icon_name), highlights[level] or "AtlasFooterText"
 end
 
----@param win integer
+---@param context "atlas"|"diff"|nil
+---@return boolean
+function M.enabled(context)
+	return config.statusline_enabled(context or "atlas")
+end
+
+---@param options AtlasStatuslineOptions|nil
+---@return AtlasStatusline
+function M.new(options)
+	next_id = next_id + 1
+	local instance = setmetatable({
+		id = next_id,
+		expression = string.format("%%!v:lua.require'atlas.ui.statusline'.current(%d)", next_id),
+		items = {},
+		notice = { text = "", hl_group = "AtlasFooterText", token = 0 },
+		loading_spinner = nil,
+		options = options or {},
+		disposed = false,
+	}, Statusline)
+	return instance
+end
+
+---@param win integer|nil
+function Statusline:attach(win)
+	if not M.enabled(self.options.context) or self.disposed or not win or not vim.api.nvim_win_is_valid(win) then
+		return
+	end
+	instances[self.id] = self
+	windows[win] = self
+	vim.api.nvim_set_option_value("statusline", self.expression, { win = win, scope = "local" })
+end
+
+---@param win integer|nil
+---@return boolean
+function Statusline:is_attached(win)
+	win = win or vim.api.nvim_get_current_win()
+	return M.enabled(self.options.context)
+		and not self.disposed
+		and vim.api.nvim_win_is_valid(win)
+		and vim.api.nvim_get_option_value("statusline", { win = win }) == self.expression
+end
+
+function Statusline:clear_items()
+	self.items = {}
+	redraw(self.options.context)
+end
+
+---@param items AtlasStatuslineSegment[]
+function Statusline:set_items(items)
+	if not self.disposed then
+		self.items = items or {}
+		redraw(self.options.context)
+	end
+end
+
+---@param level "success"|"warn"|"error"|"info"|"loading"
+---@param text string
+---@param duration_ms number|nil
+function Statusline:notify(level, text, duration_ms)
+	if self.disposed then
+		return
+	end
+
+	local message = sanitize_notice(text)
+	self.notice.token = self.notice.token + 1
+	local token = self.notice.token
+	self:stop_loading()
+
+	local icon, hl_group = notice_style(level)
+	self.notice.hl_group = hl_group
+	if level == "loading" then
+		self:start_loading(token, message)
+		self.notice.text = self.loading_spinner:text(message)
+		redraw(self.options.context)
+		return
+	end
+
+	self.notice.text = icon ~= "" and string.format("%s %s", icon, message) or message
+	redraw(self.options.context)
+	vim.defer_fn(function()
+		if self.disposed or self.notice.token ~= token then
+			return
+		end
+		self.notice.text = ""
+		self.notice.hl_group = "AtlasFooterText"
+		redraw(self.options.context)
+	end, duration_ms or 2500)
+end
+
+function Statusline:clear_notice()
+	self.notice.token = self.notice.token + 1
+	self:stop_loading()
+	self.notice.text = ""
+	self.notice.hl_group = "AtlasFooterText"
+	redraw(self.options.context)
+end
+
+function Statusline:reset()
+	self.items = {}
+	self:clear_notice()
+end
+
+---@return string
+function Statusline:render()
+	if self.disposed then
+		return ""
+	end
+	local help_key = self.options.help_key
+	if type(help_key) == "function" then
+		help_key = help_key()
+	end
+	return M.format(self.items, self.notice, nil, {
+		help_key = help_key,
+		show_version = self.options.show_version,
+		left_padding = self.options.left_padding,
+	})
+end
+
+function Statusline:dispose()
+	if self.disposed then
+		return
+	end
+	self.notice.token = self.notice.token + 1
+	self:stop_loading()
+	self.disposed = true
+	instances[self.id] = nil
+	for win, instance in pairs(windows) do
+		if instance == self then
+			windows[win] = nil
+		end
+	end
+	redraw(self.options.context)
+end
+
+M.default = M.new({
+	help_key = function()
+		local keys = keymaps.resolve("ui.help")
+		return keys and keys[1]
+	end,
+	show_version = true,
+})
+
+---@param id integer|nil
+---@return string
+function M.current(id)
+	local instance = id == nil and M.default or instances[id]
+	return instance and instance:render() or ""
+end
+
+---@param win integer|nil
 function M.attach(win)
-	vim.api.nvim_set_option_value("statusline", EXPRESSION, { win = win, scope = "local" })
+	M.default:attach(win)
+end
+
+---@param win integer|nil
+function M.detach(win)
+	if win then
+		windows[win] = nil
+	end
+end
+
+---@param win integer|nil
+---@return boolean
+function M.is_attached(win)
+	for _, instance in pairs(instances) do
+		if instance:is_attached(win) then
+			return true
+		end
+	end
+	return false
 end
 
 ---@param target_win integer
 ---@param source_win integer
 function M.inherit(target_win, source_win)
-	if
-		vim.o.laststatus ~= 3
-		or not vim.api.nvim_win_is_valid(source_win)
-		or not vim.api.nvim_win_is_valid(target_win)
-	then
-		return
-	end
-	local source_statusline = vim.wo[source_win].statusline
-	if source_statusline == EXPRESSION or source_statusline == DIFF_EXPRESSION then
-		vim.api.nvim_set_option_value("statusline", source_statusline, { win = target_win, scope = "local" })
+	local instance = windows[source_win]
+	if instance then
+		instance:attach(target_win)
 	end
 end
 
 function M.clear_items()
-	items = {}
-	redraw()
+	M.default:clear_items()
 end
 
----@param new_items AtlasStatuslineSegment[]
-function M.set_items(new_items)
-	items = new_items or {}
-	redraw()
+---@param items AtlasStatuslineSegment[]
+function M.set_items(items)
+	M.default:set_items(items)
 end
 
 ---@param level "success"|"warn"|"error"|"info"|"loading"
 ---@param text string
 ---@param duration_ms number|nil
 function M.notify(level, text, duration_ms)
-	local message = sanitize_notice(text)
-	notice.token = notice.token + 1
-	local token = notice.token
-	stop_loading()
-
-	local icon, hl_group = notice_style(level)
-	notice.hl_group = hl_group
-	if level == "loading" then
-		start_loading(token, message)
-		notice.text = loading_spinner and loading_spinner:text(message) or message
-		redraw()
-		return
-	end
-
-	notice.text = icon ~= "" and string.format("%s %s", icon, message) or message
-	redraw()
-	vim.defer_fn(function()
-		if notice.token ~= token then
+	for _, instance in pairs(instances) do
+		if instance:is_attached() then
+			instance:notify(level, text, duration_ms)
 			return
 		end
-		notice.text = ""
-		notice.hl_group = "AtlasFooterText"
-		redraw()
-	end, duration_ms or 2500)
-end
-
----@return string
-function M.current()
-	local help_keys = keymaps.resolve("ui.help")
-	return M.format(items, notice, nil, {
-		help_key = help_keys and help_keys[1],
-		show_version = true,
-	})
+	end
 end
 
 function M.clear_notice()
-	notice.token = notice.token + 1
-	stop_loading()
-	notice.text = ""
-	notice.hl_group = "AtlasFooterText"
-	redraw()
+	for _, instance in pairs(instances) do
+		if instance:is_attached() then
+			instance:clear_notice()
+			return
+		end
+	end
 end
 
 function M.reset()
-	items = {}
-	M.clear_notice()
+	M.default:reset()
 end
+
+local group = vim.api.nvim_create_augroup("AtlasStatusline", { clear = true })
+
+vim.api.nvim_create_autocmd("OptionSet", {
+	group = group,
+	pattern = "statusline",
+	callback = function()
+		local win = vim.api.nvim_get_current_win()
+		local instance = windows[win]
+		if not instance or not M.enabled(instance.options.context) or instance:is_attached(win) then
+			return
+		end
+
+		-- Other statusline plugins can overwrite ours during a refresh.
+		vim.schedule(function()
+			if windows[win] == instance and not instance:is_attached(win) then
+				instance:attach(win)
+			end
+		end)
+	end,
+})
+
+vim.api.nvim_create_autocmd("WinClosed", {
+	group = group,
+	callback = function(event)
+		M.detach(tonumber(event.match))
+	end,
+})
 
 return M

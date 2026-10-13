@@ -1,36 +1,28 @@
 local M = {}
 
+local completion = require("atlas.completion")
 local keymaps = require("atlas.core.keymaps")
-local statusline = require("atlas.ui.statusline")
+local notify = require("atlas.core.notify")
 local utils = require("atlas.ui.shared.utils")
+local statusline = require("atlas.ui.statusline")
+local virtual_lines = require("atlas.ui.components.virtual_lines")
 
-local completion_provider_by_buf = {}
-local preview_namespace = vim.api.nvim_create_namespace("atlas.markdown_editor.preview")
-local MAX_PREVIEW_LINES = 6
+local preview_namespace = vim.api.nvim_create_namespace("atlas.editor.preview")
+local MAX_PREVIEW_LINES = 11
 
 ---@param buf integer
----@param preview AtlasMarkdownEditorPreview
+---@param preview AtlasEditorPreview|nil
 ---@param width integer
 local function render_preview(buf, preview, width)
 	vim.api.nvim_buf_clear_namespace(buf, preview_namespace, 0, -1)
-	local spans, line_highlights = {}, {}
-	for _, highlight in ipairs(preview.highlights or {}) do
-		if highlight.line_hl_group then
-			line_highlights[highlight.line] = highlight.line_hl_group
-		else
-			table.insert(spans, highlight)
-		end
+	if not preview then
+		return
 	end
-	local lines = utils.virtual_lines(preview.lines, spans)
-	for index, line in ipairs(lines) do
-		local background = line_highlights[index - 1] or "AtlasFooterBackground"
-		local line_width = 0
-		for _, chunk in ipairs(line) do
-			line_width = line_width + vim.api.nvim_strwidth(chunk[1])
-			chunk[2] = { chunk[2], background }
-		end
-		table.insert(line, { string.rep(" ", math.max(0, width - line_width)), background })
-	end
+
+	local lines = virtual_lines.render(preview.lines, preview.highlights, {
+		width = width,
+		background_hl_group = "Pmenu",
+	})
 	table.insert(lines, { { string.rep("─", width), "AtlasBorder" } })
 	vim.api.nvim_buf_set_extmark(buf, preview_namespace, 0, 0, {
 		virt_lines = lines,
@@ -39,54 +31,25 @@ local function render_preview(buf, preview, width)
 	})
 end
 
----@class AtlasMarkdownCompletionProvider
----@field trigger string|nil
----@field find_start fun(before: string, line: string, col: integer): integer|nil
----@field complete fun(base: string, line: string, col: integer): table[]|nil
----@field format_mention (fun(author: IssueUser|PullsAuthor|nil): string)|nil
----@field resolve_items (fun(): nil)|nil
-
----@param findstart integer
----@param base string
----@return integer|table[]
-function _G.__atlas_markdown_complete(findstart, base)
-	local buf = vim.api.nvim_get_current_buf()
-	local provider = completion_provider_by_buf[buf]
-	if type(provider) ~= "table" then
-		return findstart == 1 and -2 or {}
-	end
-
-	if findstart == 1 then
-		local line = vim.api.nvim_get_current_line()
-		local col = vim.api.nvim_win_get_cursor(0)[2]
-		local before = line:sub(1, col)
-		local start = provider.find_start(before, line, col)
-		if type(start) ~= "number" then
-			return -2
-		end
-		return start
-	end
-
-	local line = vim.api.nvim_get_current_line()
-	local col = vim.api.nvim_win_get_cursor(0)[2]
-	local items = provider.complete(tostring(base or ""), line, col)
-	if type(items) ~= "table" then
-		return {}
-	end
-	return items
-end
-
----@class AtlasMarkdownEditorAction
+---@class AtlasEditorAction
 ---@field key string
 ---@field description string|nil
----@field callback fun(ctx: { buf: integer, win: integer, close: fun(), get_text: fun(): string })
+---@field callback fun(ctx: AtlasEditorActionContext)
 ---@field mode string|string[]|nil
 
----@class AtlasMarkdownEditorPreview
+---@class AtlasEditorActionContext
+---@field buf integer
+---@field win integer
+---@field close fun()
+---@field get_text fun(): string
+---@field set_text fun(text: string)
+
+---@class AtlasEditorPreview
 ---@field lines string[]
 ---@field highlights AtlasUIHighlight[]|nil
+---@field selection { first: integer, last: integer }|nil Selected rows in the preview, starting at 1.
 
----@class AtlasMarkdownEditorOptions
+---@class AtlasEditorOptions
 ---@field key string
 ---@field title string|nil
 ---@field title_pos "left"|"center"|"right"|nil
@@ -95,33 +58,62 @@ end
 ---@field height_ratio number|nil
 ---@field on_save fun(text: string)|nil
 ---@field on_cancel fun()|nil
----@field actions AtlasMarkdownEditorAction[]|nil
----@field completion AtlasMarkdownCompletionProvider|nil
----@field preview AtlasMarkdownEditorPreview|nil
+---@field actions AtlasEditorAction[]|nil
+---@field preview AtlasEditorPreview|nil
+---@field completion { context: AtlasCompletionContext, sources?: string[] }|nil
 
----@param preview AtlasMarkdownEditorPreview
----@return AtlasMarkdownEditorPreview
-local function limit_preview(preview)
-	if #preview.lines <= MAX_PREVIEW_LINES then
+---@param preview AtlasEditorPreview
+---@param max_lines integer
+---@return AtlasEditorPreview|nil
+local function limit_preview(preview, max_lines)
+	if #preview.lines == 0 or max_lines < 3 then
+		return
+	end
+
+	local first, last = 1, #preview.lines
+	if preview.selection then
+		local selected = preview.selection
+		local count = selected.last - selected.first + 1
+		local context = math.max(0, math.min(2, math.floor((max_lines - count) / 2)))
+		first = math.max(1, selected.first - context)
+		last = math.min(#preview.lines, selected.last + context)
+	end
+
+	local count = last - first + 1
+	if first == 1 and last == #preview.lines and count <= max_lines then
 		return preview
 	end
 
-	local lines = {}
-	for index = 1, MAX_PREVIEW_LINES - 1 do
-		table.insert(lines, preview.lines[index])
+	local lines, rows = {}, {}
+	local function append(from, to)
+		for row = from, to do
+			rows[row - 1] = #lines
+			lines[#lines + 1] = preview.lines[row]
+		end
 	end
-	table.insert(lines, "..")
+
+	if count > max_lines then
+		local head = math.ceil((max_lines - 1) / 2)
+		local tail = max_lines - head - 1
+		append(first, first + head - 1)
+		lines[#lines + 1] = string.format("… %d lines omitted …", count - head - tail)
+		append(last - tail + 1, last)
+	else
+		append(first, last)
+	end
 
 	local highlights = {}
 	for _, highlight in ipairs(preview.highlights or {}) do
-		if highlight.line < MAX_PREVIEW_LINES - 1 then
-			table.insert(highlights, highlight)
+		local row = rows[highlight.line]
+		if row then
+			highlights[#highlights + 1] = vim.tbl_extend("force", highlight, { line = row })
 		end
 	end
+
 	return { lines = lines, highlights = highlights }
 end
 
----@param opts AtlasMarkdownEditorOptions
+---@param opts AtlasEditorOptions
 ---@return integer|nil, integer|nil
 function M.open(opts)
 	if type(opts) ~= "table" then
@@ -130,26 +122,23 @@ function M.open(opts)
 
 	local key = tostring(opts.key or "")
 	if key == "" then
-		statusline.notify("warn", "Missing editor key")
+		notify.warn("Missing editor key")
 		return nil, nil
 	end
 	local source_win = vim.api.nvim_get_current_win()
 	local submit_keys = keymaps.resolve("ui.submit") or {}
+	local close_keys = keymaps.resolve("ui.close") or {}
 
 	local buf = vim.api.nvim_create_buf(false, true)
 	vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
 	vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
 	vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
-	vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
 	vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
 
-	local name = string.format("atlas://editor/%s.md", key)
+	local name = string.format("atlas://editor/%s", key)
 	pcall(vim.api.nvim_buf_set_name, buf, name)
 
-	local lines = vim.split(tostring(opts.initial_text or ""), "\n", { plain = true })
-	if #lines == 0 then
-		lines = { "" }
-	end
+	local lines = vim.split(utils.normalize_newlines(opts.initial_text), "\n", { plain = true })
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 	vim.api.nvim_set_option_value("modified", false, { buf = buf })
 
@@ -157,20 +146,19 @@ function M.open(opts)
 	local height_ratio = tonumber(opts.height_ratio) or 0.8
 	local min_width = 80
 	local min_height = 12
-	local preview = opts.preview
-	if preview and #preview.lines == 0 then
-		preview = nil
-	elseif preview then
-		preview = limit_preview(preview)
-	end
-	local preview_height = preview and #preview.lines + 1 or 0
+	local preview, preview_height
 
 	local function geometry()
 		local available_width = math.max(1, vim.o.columns - 2)
 		local available_height = math.max(1, vim.o.lines - 4)
 		local width = math.min(math.max(math.floor(vim.o.columns * width_ratio), min_width), available_width)
-		local height =
-			math.min(math.max(math.floor(vim.o.lines * height_ratio), min_height) + preview_height, available_height)
+		local height = math.min(math.max(math.floor(vim.o.lines * height_ratio), min_height), available_height)
+
+		local max_preview_lines = math.min(MAX_PREVIEW_LINES, available_height - height - 1)
+		preview = opts.preview and limit_preview(opts.preview, max_preview_lines)
+		preview_height = preview and #preview.lines + 1 or 0
+		height = height + preview_height
+
 		local row = math.max(0, math.floor((vim.o.lines - height) / 2))
 		local col = math.max(0, math.floor((vim.o.columns - width) / 2))
 		return width, height, row, col
@@ -180,24 +168,21 @@ function M.open(opts)
 	if preview then
 		render_preview(buf, preview, width)
 	end
-	local footer_items = { "q quit" }
+	local footer_items = {}
+	if #close_keys > 0 then
+		table.insert(footer_items, string.format("%s quit", table.concat(close_keys, " / ")))
+	end
 	if #submit_keys > 0 then
 		table.insert(footer_items, string.format("%s save+close", table.concat(submit_keys, " / ")))
 	end
 	for _, action in ipairs(opts.actions or {}) do
-		local action_key = action.key
 		local description = action.description
-		if
-			type(action_key) == "string"
-			and action_key ~= ""
-			and type(description) == "string"
-			and description ~= ""
-		then
-			table.insert(footer_items, string.format("%s %s", action_key, description))
+		if description and description ~= "" then
+			table.insert(footer_items, string.format("%s %s", action.key, description))
 		end
 	end
 
-	local footer_text = " " .. table.concat(footer_items, " | ") .. " "
+	local footer_text = #footer_items > 0 and " " .. table.concat(footer_items, " | ") .. " " or nil
 	local win = vim.api.nvim_open_win(buf, true, {
 		relative = "editor",
 		style = "minimal",
@@ -209,7 +194,7 @@ function M.open(opts)
 		title = opts.title,
 		title_pos = opts.title_pos or "center",
 		footer = footer_text,
-		footer_pos = "center",
+		footer_pos = footer_text and "center" or nil,
 	})
 	vim.api.nvim_set_option_value(
 		"winhighlight",
@@ -221,8 +206,11 @@ function M.open(opts)
 	vim.api.nvim_set_option_value("diff", false, { win = win })
 	vim.api.nvim_set_option_value("scrollbind", false, { win = win })
 	vim.api.nvim_set_option_value("cursorbind", false, { win = win })
-	vim.api.nvim_set_option_value("wrap", true, { win = win })
 	vim.api.nvim_set_option_value("cursorline", false, { win = win })
+	vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
+	if opts.completion then
+		completion.attach(buf, opts.completion)
+	end
 	statusline.inherit(win, source_win)
 	local function reveal_preview()
 		vim.api.nvim_win_call(win, function()
@@ -234,76 +222,13 @@ function M.open(opts)
 		reveal_preview()
 	end
 
-	local completion = opts.completion
-	if completion ~= nil then
-		completion_provider_by_buf[buf] = completion
-		vim.api.nvim_set_option_value("completeopt", "menu,menuone,noselect,noinsert", { buf = buf })
-		vim.api.nvim_set_option_value("completefunc", "v:lua.__atlas_markdown_complete", { buf = buf })
-
-		local function open_completion_popup()
-			local provider = completion_provider_by_buf[buf]
-			if provider == nil then
-				return
-			end
-
-			if not vim.api.nvim_buf_is_valid(buf) or vim.api.nvim_get_current_buf() ~= buf then
-				return
-			end
-			if vim.fn.mode() ~= "i" or vim.fn.pumvisible() == 1 then
-				return
-			end
-
-			local cursor = vim.api.nvim_win_get_cursor(0)
-			local cursor_row = tonumber(cursor[1]) or 1
-			local cursor_col = tonumber(cursor[2]) or 0
-			local line = vim.api.nvim_buf_get_lines(buf, cursor_row - 1, cursor_row, false)[1] or ""
-			if type(line) ~= "string" then
-				return
-			end
-
-			local before = line:sub(1, cursor_col)
-			local start = provider.find_start(before, line, cursor_col)
-			if type(start) ~= "number" then
-				return
-			end
-
-			local base = before:sub(start + 1)
-			local items = provider.complete(tostring(base or ""), line, cursor_col)
-			if type(items) ~= "table" or #items == 0 then
-				return
-			end
-
-			vim.fn.complete(start + 1, items)
-		end
-
-		local trigger = completion.trigger
-		if type(trigger) == "string" and trigger ~= "" then
-			vim.keymap.set("i", trigger, function()
-				local provider = completion_provider_by_buf[buf]
-				if provider == nil then
-					return trigger
-				end
-				vim.schedule(open_completion_popup)
-				return trigger
-			end, { buffer = buf, silent = true, nowait = true, expr = true })
-		end
-
-		vim.api.nvim_create_autocmd("BufWipeout", {
-			buffer = buf,
-			once = true,
-			callback = function()
-				completion_provider_by_buf[buf] = nil
-			end,
-		})
-	end
-
-	local group = vim.api.nvim_create_augroup("AtlasMarkdownEditor" .. buf, { clear = true })
-	if preview then
+	local group = vim.api.nvim_create_augroup("AtlasEditor" .. buf, { clear = true })
+	if opts.preview then
 		vim.api.nvim_create_autocmd("CursorMoved", {
 			group = group,
 			buffer = buf,
 			callback = function()
-				if vim.api.nvim_win_get_cursor(win)[1] == 1 then
+				if preview and vim.api.nvim_win_get_cursor(win)[1] == 1 then
 					reveal_preview()
 				end
 			end,
@@ -313,9 +238,7 @@ function M.open(opts)
 		group = group,
 		callback = function()
 			local resized_width, resized_height, resized_row, resized_col = geometry()
-			if preview then
-				render_preview(buf, preview, resized_width)
-			end
+			render_preview(buf, preview, resized_width)
 			vim.api.nvim_win_set_config(win, {
 				relative = "editor",
 				width = resized_width,
@@ -323,6 +246,9 @@ function M.open(opts)
 				row = resized_row,
 				col = resized_col,
 			})
+			if vim.api.nvim_win_get_cursor(win)[1] == 1 then
+				reveal_preview()
+			end
 		end,
 	})
 
@@ -348,21 +274,31 @@ function M.open(opts)
 		return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
 	end
 
-	vim.keymap.set("n", "q", function()
-		if opts.on_cancel then
-			opts.on_cancel()
+	local function set_text(text)
+		local new_lines = vim.split(utils.normalize_newlines(text), "\n", { plain = true })
+		vim.api.nvim_buf_set_lines(buf, 0, -1, false, new_lines)
+		vim.api.nvim_win_set_cursor(win, { #new_lines, #new_lines[#new_lines] })
+		if preview then
+			reveal_preview()
 		end
-		close_editor()
-	end, { buffer = buf, silent = true, nowait = true })
+	end
+
+	for _, close_key in ipairs(close_keys) do
+		vim.keymap.set("n", close_key, function()
+			if opts.on_cancel then
+				opts.on_cancel()
+			end
+			close_editor()
+		end, { buffer = buf, silent = true, nowait = true })
+	end
 
 	local function save_and_close()
 		local body = get_text()
+		close_editor()
 
 		if opts.on_save then
 			opts.on_save(body)
 		end
-
-		close_editor()
 	end
 
 	for _, submit_key in ipairs(submit_keys) do
@@ -380,9 +316,10 @@ function M.open(opts)
 				win = win,
 				close = close_editor,
 				get_text = get_text,
+				set_text = set_text,
 			})
 			if not ok then
-				statusline.notify("error", tostring(err or "Markdown action failed"))
+				notify.error(tostring(err or "Markdown action failed"))
 			end
 		end, { buffer = buf, silent = true, nowait = true, desc = action.description })
 	end

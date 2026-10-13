@@ -1,178 +1,71 @@
----@class JiraIssuesOverviewTab : IssuesPanelTabModule
 local M = {}
 
 local utils = require("atlas.ui.shared.utils")
-local spinner = require("atlas.ui.components.spinner")
-local statusline = require("atlas.ui.statusline")
-local state = require("atlas.issues.providers.jira.ui.overview.state")
-local adf = require("atlas.issues.providers.jira.converted.adf")
-local issues_api = require("atlas.issues.providers.jira.api.issues")
+local markdown = require("atlas.formats.markdown")
+local help = require("atlas.ui.popups.help")
+local keymaps = require("atlas.core.keymaps")
 
-local PADDING_X = 1
-local PADDING = string.rep(" ", PADDING_X)
+local view_mode = "markdown"
 
----@type { cancel: fun() }[]
-local in_flight = {}
-
-local function cancel_all()
-	for _, handle in ipairs(in_flight) do
-		handle.cancel()
-	end
-	in_flight = {}
-end
-
----@param handle { cancel: fun() }|nil
-local function track(handle)
-	if handle then
-		table.insert(in_flight, handle)
-	end
-end
-
----@param raw any
----@return string
-local function to_markdown(raw)
-	if raw == nil then
-		return ""
-	end
-	if type(raw) == "table" then
-		return adf.to_markdown(raw) or ""
-	end
-	return tostring(raw)
-end
-
----@param issue Issue
----@param refresh fun()
----@param opts { force_refresh: boolean|nil }|nil
-function M.on_select(issue, refresh, opts)
-	opts = opts or {}
-
-	local force_refresh = opts.force_refresh == true
-	if not force_refresh and not state.description_loading and state.raw_description ~= nil then
-		return
-	end
-
-	cancel_all()
-	state.description_loading = true
-	state.raw_description = nil
-	state.md_description = nil
-
-	local issue_key = tostring(issue.key or "")
-	statusline.notify("loading", string.format("Loading description for %s...", issue_key))
-
-	track(issues_api.get_issue_description(issue_key, function(raw, err)
-		state.description_loading = false
-
-		if err then
-			state.raw_description = nil
-			state.md_description = nil
-			statusline.notify("error", string.format("Failed to load description for %s", issue_key))
-			refresh()
-			return
-		end
-
-		state.raw_description = raw
-		state.md_description = to_markdown(raw)
-
-		statusline.notify("success", string.format("Description loaded for %s", issue_key), 1200)
-		refresh()
-	end, { force_load = force_refresh }))
-end
-
--- Render
-
----@param issue Issue
+---@param _issue Issue
+---@param details IssueDetails|nil
 ---@param width integer
 ---@return string[], table[], table<integer, table>|nil
-function M.render(issue, width)
+function M.render(_issue, details, width)
+	if details == nil then
+		return {}, {}, {}
+	end
+	---@cast details JiraIssueDetails
 	local lines = {}
 	local spans = {}
-	local line_map = {}
+	local content_width = math.max(1, width - 2)
+	local raw_description = details.raw_description
 
-	-- Description header + mode chip on same line
-	local label = state.description_loading and "Loading description..." or "Description"
-	local mode_text = state.view_mode == "raw" and "Raw (m)" or "Markdown (m)"
-	local chip = " " .. mode_text .. " "
-	local gap = math.max(1, width - PADDING_X - #label - #chip)
-	local header_line = PADDING .. label .. string.rep(" ", gap) .. chip
-
-	table.insert(lines, header_line)
-	local hline = #lines - 1
-	table.insert(
-		spans,
-		{ line = hline, start_col = PADDING_X, end_col = PADDING_X + #label, hl_group = "AtlasTextMuted" }
-	)
-	table.insert(
-		spans,
-		{ line = hline, start_col = #header_line - #chip, end_col = #header_line, hl_group = "AtlasChipActive" }
-	)
-
-	-- Description content
-	if state.description_loading then
-		utils.push(lines, spans, spinner.with_text("Loading..."), "AtlasTextMuted", PADDING_X)
-	elseif state.raw_description == nil and not state.description_loading then
-	elseif state.view_mode == "raw" then
-		local raw_text
-		if type(state.raw_description) == "table" then
-			raw_text = vim.inspect(state.raw_description)
-		else
-			raw_text = tostring(state.raw_description or "")
-		end
+	if view_mode == "raw" then
+		local raw_text = type(raw_description) == "table" and vim.inspect(raw_description)
+			or tostring(raw_description or "")
 		for _, line in ipairs(vim.split(raw_text, "\n", { plain = true })) do
-			table.insert(lines, PADDING .. line)
+			table.insert(lines, line)
 		end
 	else
-		local md = tostring(state.md_description or "")
-		if md == "" then
-			utils.push(lines, spans, "No description", "AtlasTextMuted", PADDING_X)
+		local description = details.description or ""
+		if description == "" then
+			utils.push(lines, spans, "No description", "AtlasTextMuted")
 		else
-			for _, line in ipairs(utils.sanitize_lines(md)) do
-				table.insert(lines, PADDING .. line)
-			end
+			local content = markdown.render(description, { width = width, padding = 1 })
+			return content.lines, content.highlights, {}
 		end
 	end
 
-	return lines, spans, line_map
+	local content = utils.wrap_content({ lines = lines, highlights = spans }, content_width, " ")
+	return content.lines, content.highlights, {}
 end
 
 ---@param buf integer
-local function apply_filetype(buf)
-	if not (buf and vim.api.nvim_buf_is_valid(buf)) then
-		return
-	end
-	if state.view_mode == "markdown" then
-		vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
-		vim.api.nvim_set_option_value("syntax", "markdown", { buf = buf })
-	else
-		pcall(vim.treesitter.stop, buf)
-		vim.api.nvim_set_option_value("syntax", "OFF", { buf = buf })
-		vim.api.nvim_set_option_value("filetype", "", { buf = buf })
-	end
-end
-
+---@param refresh fun()
 function M.activate(buf, refresh)
-	apply_filetype(buf)
-	if buf and vim.api.nvim_buf_is_valid(buf) then
-		vim.keymap.set("n", "m", function()
-			state.view_mode = state.view_mode == "raw" and "markdown" or "raw"
-			apply_filetype(buf)
-			if refresh then
-				refresh()
-			end
-		end, { buffer = buf, silent = true, nowait = true })
+	local keys = keymaps.resolve("ui.toggle_description_mode")
+	if keys then
+		help.register("Detail", {
+			{
+				key = #keys == 1 and keys[1] or keys,
+				desc = "Toggle description mode",
+				index = 10,
+				opts = { silent = true, nowait = true },
+				callback = function()
+					view_mode = view_mode == "raw" and "markdown" or "raw"
+					refresh()
+				end,
+			},
+		}, { index = 2, buffer = buf })
 	end
 end
 
+---@param buf integer
 function M.deactivate(buf)
-	if buf and vim.api.nvim_buf_is_valid(buf) then
-		pcall(vim.keymap.del, "n", "m", { buffer = buf })
-		pcall(vim.treesitter.stop, buf)
-		vim.api.nvim_set_option_value("syntax", "OFF", { buf = buf })
-		vim.api.nvim_set_option_value("filetype", "", { buf = buf })
-	end
-	cancel_all()
-	if state.description_loading then
-		state.description_loading = false
-		statusline.clear_notice()
+	local keys = keymaps.resolve("ui.toggle_description_mode")
+	if keys then
+		help.remove("Detail", { { key = #keys == 1 and keys[1] or keys } }, { buffer = buf })
 	end
 end
 

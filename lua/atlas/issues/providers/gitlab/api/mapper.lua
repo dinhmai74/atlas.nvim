@@ -2,34 +2,51 @@ local M = {}
 
 local json = require("atlas.core.json")
 
----@param raw_user any Decoded API value.
----@return IssueUser|nil
-function M.to_user(raw_user)
-	raw_user = json.nilify(raw_user)
-	if type(raw_user) ~= "table" then
-		return nil
-	end
-	local username = json.safe_str(raw_user.username) or ""
-	if username == "" then
-		return nil
-	end
-	local name = json.safe_str(raw_user.name) or ""
-	return {
-		account_id = username,
-		display_name = name ~= "" and name or username,
-	}
-end
+M.to_user = require("atlas.providers.gitlab.users").to_user
 
 ---@param raw_assignees table[]|nil
----@return IssueUser|nil
-local function first_assignee(raw_assignees)
+---@return AtlasUser[]
+local function assignees(raw_assignees)
+	local users = {}
 	for _, raw in ipairs(json.safe_table(raw_assignees)) do
 		local user = M.to_user(raw)
 		if user then
-			return user
+			table.insert(users, user)
 		end
 	end
-	return nil
+	return users
+end
+
+---@param raw_labels table[]|nil
+---@return IssueLabel[]
+local function labels(raw_labels)
+	local result = {}
+	for _, raw in ipairs(json.safe_table(raw_labels)) do
+		raw = json.safe_table(raw)
+		local name = json.safe_str(raw.title)
+		if name and name ~= "" then
+			table.insert(result, {
+				name = name,
+				color = json.safe_str(raw.color),
+			})
+		end
+	end
+	return result
+end
+
+---@param raw any
+---@return IssueMilestone|nil
+local function milestone(raw)
+	raw = json.nilify(raw)
+	if type(raw) ~= "table" then
+		return nil
+	end
+	local title = json.safe_str(raw.title)
+	if title == nil then
+		return nil
+	end
+	local id = json.safe_str(raw.id) or ""
+	return { id = tonumber(id:match("([^/]+)$")), title = title }
 end
 
 ---@param state string|nil
@@ -42,8 +59,21 @@ local function normalize_state(state)
 	return "Open", "open"
 end
 
+---@param raw_type any
+---@return IssueType|nil
+local function to_issue_type(raw_type)
+	local id = json.safe_str(raw_type)
+	if id == nil or id == "" then
+		return nil
+	end
+	id = id:lower()
+	local name = id:gsub("_", " ")
+	name = name:sub(1, 1):upper() .. name:sub(2)
+	return { id = id, name = name, subtask = false }
+end
+
 ---@param raw any Decoded API value.
----@return Issue|nil
+---@return GitLabIssue|nil
 function M.to_issue(raw)
 	raw = json.nilify(raw)
 	if type(raw) ~= "table" then
@@ -57,73 +87,68 @@ function M.to_issue(raw)
 
 	local web_url = json.safe_str(raw.web_url) or ""
 	local refs = json.nilify(raw.references)
-	local key = type(refs) == "table" and json.safe_str(refs.full) or nil
+	local key = json.safe_str(raw.reference) or (type(refs) == "table" and json.safe_str(refs.full) or nil)
+	local project_path = key and key:match("^(.-)#%d+$") or nil
 	if not key or key == "" then
-		local extracted = web_url:match("^https?://[^/]+/(.+)/%-/issues/")
-		key = extracted and (extracted .. "#" .. tostring(iid)) or string.format("#%d", iid)
+		project_path = web_url:match("^https?://[^/]+/(.+)/%-/issues/")
+		key = project_path and (project_path .. "#" .. tostring(iid)) or string.format("#%d", iid)
 	end
 
 	local status_name, status_id = normalize_state(raw.state)
 	local title = json.safe_str(raw.title) or ""
-	local description = json.safe_str(raw.description) or ""
 
-	local labels_raw = json.safe_table(raw.labels) -- list of label-name strings
-	local labels = {}
-	for _, name in ipairs(labels_raw) do
-		if type(name) == "string" and name ~= "" then
-			table.insert(labels, { name = name })
-		end
-	end
+	local issue_assignees = assignees(json.safe_table(raw.assignees).nodes or raw.assignees)
+	local created_at = json.safe_str(raw.created_at)
+	local updated_at = json.safe_str(raw.updated_at)
+	local closed_at = json.safe_str(raw.closed_at)
 
-	local assignees = json.safe_table(raw.assignees)
-	local milestone = json.nilify(raw.milestone)
-
-	local project_path = key:match("^(.-)#") or ""
-
-	---@type Issue
+	---@type GitLabIssue
 	local issue = {
 		key = key,
-		summary = title,
-		project = nil,
+		project_path = project_path or "",
+		iid = iid,
+		title = title,
 		status = status_name,
 		status_id = status_id,
-		status_category = nil,
-		status_color = nil,
-		type = nil,
-		priority = nil,
-		assignee = first_assignee(assignees),
+		confidential = json.nilify(raw.confidential),
+		type = to_issue_type(raw.issue_type),
+		assignee = issue_assignees[1],
 		reporter = M.to_user(raw.author),
-		story_points = tonumber(json.nilify(raw.weight)),
 		duedate = json.safe_str(raw.due_date),
 		parent = nil,
 		url = web_url ~= "" and web_url or nil,
-		is_subscribed = type(raw.subscribed) == "boolean" and raw.subscribed or nil,
-		_raw = {
-			iid = iid,
-			project_id = tonumber(raw.project_id),
-			project_path = project_path,
-			description = description,
-			created_at = json.safe_str(raw.created_at) or "",
-			updated_at = json.safe_str(raw.updated_at) or "",
-			closed_at = json.safe_str(raw.closed_at),
-			labels = labels,
-			label_names = labels_raw,
-			assignees = assignees,
-			milestone = milestone,
-			comment_count = tonumber(raw.user_notes_count) or 0,
-			web_url = web_url,
-			confidential = raw.confidential == true,
-			issue_type = json.safe_str(raw.issue_type),
-		},
+		created_at = created_at,
+		updated_at = updated_at,
+		closed_at = closed_at,
+		comment_count = tonumber(raw.user_notes_count) or 0,
+		is_subscribed = json.nilify(raw.subscribed),
 	}
 	return issue
+end
+
+---@param raw any Decoded API value.
+---@return IssueDetails|nil
+function M.to_issue_details(raw)
+	raw = json.nilify(raw)
+	if type(raw) ~= "table" then
+		return nil
+	end
+
+	---@type IssueDetails
+	return {
+		title = json.safe_str(raw.title),
+		description = json.safe_str(raw.description) or "",
+		assignees = assignees(json.safe_table(raw.assignees).nodes),
+		labels = labels(json.safe_table(raw.labels).nodes),
+		milestone = milestone(raw.milestone),
+	}
 end
 
 ---@param raw_list table[]|nil
 ---@return Issue[]
 function M.to_issues_list(raw_list)
 	local out = {}
-	for _, raw in ipairs(raw_list or {}) do
+	for _, raw in ipairs(json.safe_table(raw_list)) do
 		local issue = M.to_issue(raw)
 		if issue ~= nil then
 			table.insert(out, issue)

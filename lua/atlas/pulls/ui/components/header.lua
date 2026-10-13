@@ -1,0 +1,217 @@
+local M = {}
+
+local icons = require("atlas.ui.shared.icons")
+local highlights = require("atlas.ui.highlights")
+local spinner = require("atlas.ui.components.spinner")
+local table_tree = require("atlas.ui.components.table_tree")
+local utils = require("atlas.ui.shared.utils")
+local presentation = require("atlas.pulls.ui.presentation")
+
+---@param label string
+---@return PullsDetailHeaderField
+function M.loading_field(label)
+	return { label = label, value = spinner.with_text("Loading..."), hl = "AtlasTextMuted" }
+end
+
+---@param logins string[]
+---@return PullsDetailHeaderField
+function M.assignee_field(logins)
+	if #logins == 0 then
+		return {
+			label = "Assignees",
+			value = "Unassigned",
+			hl = "AtlasTextMuted",
+		}
+	end
+
+	local parts = {}
+	local spans = {}
+	local cursor = 0
+	for i, login in ipairs(logins) do
+		local token = "@" .. login
+		table.insert(parts, token)
+		table.insert(spans, {
+			start_col = cursor,
+			end_col = cursor + #token,
+			hl_group = presentation.author_hl(login),
+		})
+		cursor = cursor + #token
+		if i < #logins then
+			table.insert(spans, {
+				start_col = cursor,
+				end_col = cursor + 2,
+				hl_group = "AtlasTextMuted",
+			})
+			cursor = cursor + 2
+		end
+	end
+
+	return {
+		label = "Assignees",
+		value = table.concat(parts, ", "),
+		hl = spans,
+	}
+end
+
+---@param text string
+---@param hl string|table[]|nil
+---@return table[]|nil
+local function value_hl_spans(text, hl)
+	if type(hl) == "table" then
+		return #hl > 0 and hl or nil
+	end
+	if type(hl) == "string" and hl ~= "" then
+		return { { start_col = 0, end_col = #text, hl_group = hl } }
+	end
+end
+
+---@param spans table[]
+---@param lines string[]
+---@param line integer
+---@param start_col integer
+---@param end_col integer
+---@param hl_group string
+local function add_span(spans, lines, line, start_col, end_col, hl_group)
+	local text = lines[line + 1] or ""
+	local max_col = #text
+	local s = math.max(0, math.min(start_col, max_col))
+	local e = math.max(s, math.min(end_col, max_col))
+	if e <= s then
+		return
+	end
+	table.insert(spans, {
+		line = line,
+		start_col = s,
+		end_col = e,
+		hl_group = hl_group,
+	})
+end
+
+---@param pr PullRequest
+---@param width integer
+---@param extra_fields PullsDetailHeaderField[]|nil
+---@return string[], table[]
+function M.render(pr, width, extra_fields)
+	local author_name = presentation.user_handle(pr.author)
+	local created_text = utils.relative_time_text(pr.created_on)
+	local repo_name = pr.repo_full_name
+	local src = pr.source.branch
+	local dst = pr.destination.branch
+
+	local id_text = string.format("%s%s", pr.provider == "gitlab" and "!" or "#", pr.id)
+	local title_text = pr.title
+	local title_lines = utils.wrap_line(string.format("%s %s", id_text, title_text), math.max(1, width - 1))
+	for index, line in ipairs(title_lines) do
+		title_lines[index] = " " .. line
+	end
+
+	local author_icon, author_icon_hl = icons.get("user")
+	local by_prefix = string.format(" %s by @", author_icon)
+	local by_sep = " - "
+	local byline = by_prefix .. author_name .. by_sep .. created_text
+
+	local lines = vim.list_extend({}, title_lines)
+	vim.list_extend(lines, { byline, "" })
+
+	local updated_text = utils.relative_time_text(pr.updated_on)
+
+	local fields = {
+		{
+			label = "Repo",
+			value = string.format("%s %s", icons.get("repo"), repo_name),
+			hl = highlights.dynamic_for(repo_name) or "AtlasTextMuted",
+		},
+		{
+			label = "Updated",
+			value = updated_text,
+			hl = "AtlasTextMuted",
+		},
+	}
+
+	for _, field in ipairs(extra_fields or {}) do
+		table.insert(fields, field)
+	end
+	table.insert(fields, {
+		label = "Branch",
+		value = string.format("%s %s → %s", icons.get("branch"), src, dst),
+		hl = "AtlasTextMuted",
+	})
+
+	local rows = {}
+	for index = 1, #fields, 2 do
+		local left = fields[index]
+		local right = fields[index + 1]
+		table.insert(rows, {
+			k1 = left.label .. ":",
+			v1 = left.value,
+			v1_hl = left.hl,
+			k2 = right and (right.label .. ":") or "",
+			v2 = right and right.value or "",
+			v2_hl = right and right.hl or nil,
+		})
+	end
+
+	local tbl_lines, _, tbl_spans = table_tree.render({
+		width = width,
+		margin = 1,
+		show_header = false,
+		column_gap = 1,
+		fill = true,
+		columns = {
+			{ key = "k1", name = "", can_grow = false },
+			{ key = "v1", name = "", can_grow = true },
+			{ key = "k2", name = "", can_grow = false },
+			{ key = "v2", name = "", can_grow = true, grow_last = true },
+		},
+		rows = rows,
+		cell_hl = function(row, col, _ctx)
+			if col.key == "k1" or col.key == "k2" then
+				local label = col.key == "k1" and row.k1 or row.k2
+				return { { start_col = 0, end_col = #label, hl_group = "AtlasTextMuted" } }
+			end
+			if col.key == "v1" then
+				return value_hl_spans(row.v1, row.v1_hl)
+			end
+			if col.key == "v2" and row.v2 ~= "" then
+				return value_hl_spans(row.v2, row.v2_hl)
+			end
+			return nil
+		end,
+	})
+
+	for _, l in ipairs(tbl_lines) do
+		table.insert(lines, l)
+	end
+	table.insert(lines, "")
+
+	-- Spans
+	local spans = {}
+	for line = 0, #title_lines do
+		table.insert(spans, { line = line, line_hl_group = "AtlasTabInactive" })
+	end
+
+	add_span(spans, lines, 0, 1, 1 + #id_text, "AtlasTextMuted")
+	local author_line = #title_lines
+	add_span(spans, lines, author_line, 1, 1 + #author_icon, author_icon_hl)
+
+	local author_start = #by_prefix - 1
+	local author_end = author_start + #("@" .. author_name)
+	add_span(spans, lines, author_line, author_start, author_end, presentation.author_hl(author_name))
+
+	local ts_start = author_end + #by_sep
+	local ts_end = ts_start + #created_text
+	add_span(spans, lines, author_line, ts_start, ts_end, "AtlasTextMuted")
+
+	for _, span in ipairs(tbl_spans) do
+		table.insert(spans, {
+			line = span.line + #title_lines + 2,
+			start_col = span.start_col,
+			end_col = span.end_col,
+			hl_group = span.hl_group,
+		})
+	end
+
+	return lines, spans
+end
+
+return M

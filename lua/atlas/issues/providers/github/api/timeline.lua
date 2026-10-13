@@ -1,12 +1,12 @@
 local M = {}
 
-local cli = require("atlas.providers.github.client").issues
+local cli = require("atlas.providers.github.client")
 local normalizer = require("atlas.issues.providers.github.api.mapper")
 local json = require("atlas.core.json")
 
 ---@param key string
 ---@param on_done fun(result: { comments: IssueComment[], events: IssueActivityEntry[] }|nil, err: string|nil)
----@param opts { force_load?: boolean }|nil
+---@param opts { force_refresh?: boolean }|nil
 ---@return { cancel: fun() }|nil
 function M.list_conversation(key, on_done, opts)
 	opts = opts or {}
@@ -17,7 +17,7 @@ function M.list_conversation(key, on_done, opts)
 	end
 
 	local cache_key = string.format("github_issues:conversation:%s#%d", slug, number)
-	if not opts.force_load then
+	if not opts.force_refresh then
 		local cached, ok = cli.get_mem(cache_key)
 		if ok then
 			on_done(cached, nil)
@@ -26,25 +26,27 @@ function M.list_conversation(key, on_done, opts)
 	end
 
 	return cli.gh(
-		{ "api", "--paginate", string.format("repos/%s/issues/%d/timeline", slug, number) },
+		{ "api", "--paginate", "--slurp", string.format("repos/%s/issues/%d/timeline?per_page=100", slug, number) },
 		function(result, err)
-			if err then
-				on_done(nil, err)
+			if err or type(result) ~= "table" then
+				on_done(nil, err or "Failed to fetch issue conversation")
 				return
 			end
 
 			local conversation = { comments = {}, events = {} }
-			for _, raw in ipairs(type(result) == "table" and result or {}) do
-				local raw_event = type(raw) == "table" and json.safe_str(raw.event) or ""
-				if raw_event == "commented" then
-					local comment = normalizer.to_timeline_comment(raw)
-					if comment then
-						table.insert(conversation.comments, comment)
-					end
-				else
-					local entry = normalizer.to_timeline_entry(raw)
-					if entry then
-						table.insert(conversation.events, entry)
+			for _, page in ipairs(result) do
+				for _, raw in ipairs(page) do
+					local raw_event = json.safe_str(raw.event) or ""
+					if raw_event == "commented" then
+						local comment = normalizer.to_timeline_comment(raw)
+						if comment then
+							table.insert(conversation.comments, comment)
+						end
+					else
+						local entry = normalizer.to_timeline_entry(raw)
+						if entry then
+							table.insert(conversation.events, entry)
+						end
 					end
 				end
 			end

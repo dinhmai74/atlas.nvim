@@ -1,7 +1,48 @@
+local requests = require("atlas.core.requests")
+local json = require("atlas.core.json")
+local pipeline_utils = require("atlas.pulls.pipelines.utils")
+local service = require("atlas.providers.bitbucket.client")
+local encode_path_segment = require("atlas.core.utils").url_encode
+
 local M = {}
 
-local providers = require("atlas.pulls.providers")
-local service = require("atlas.pulls.providers.bitbucket.api.service")
+---@param url string
+---@return string|nil
+local function pipeline_id(url)
+	return url:match("/pipelines/results/(%d+)")
+end
+
+---@param state table|string|nil
+---@return PullsPipelineState
+local function pipeline_state(state)
+	local value = state
+	if type(state) == "table" then
+		value = (state.result and state.result.name) or (state.stage and state.stage.name) or state.name
+	end
+	value = tostring(value or ""):upper()
+	if value == "SUCCESSFUL" then
+		return "SUCCESSFUL"
+	elseif value == "FAILED" or value == "ERROR" then
+		return "FAILED"
+	elseif value == "NOT_RUN" then
+		return "SKIPPED"
+	elseif value == "STOPPED" then
+		return type(state) == "table" and "CANCELED" or "STOPPED"
+	elseif value == "EXPIRED" or value == "SUPERSEDED" then
+		return "STOPPED"
+	elseif value == "HALTED" then
+		return "PAUSED"
+	elseif value == "PAUSED" then
+		return "MANUAL"
+	elseif value == "PENDING" then
+		return "PENDING"
+	elseif value == "READY" then
+		return "QUEUED"
+	elseif value == "RUNNING" or value == "IN_PROGRESS" or value == "INPROGRESS" then
+		return "INPROGRESS"
+	end
+	return "UNKNOWN"
+end
 
 ---@param values table[]
 ---@return string status
@@ -11,193 +52,438 @@ local function aggregate_statuses(values)
 		return "unknown", nil
 	end
 
-	local first_url = nil
+	local statuses = {}
+	local first_url
 	for _, item in ipairs(values) do
-		if not first_url and item.url and item.url ~= "" then
+		table.insert(statuses, { state = pipeline_state(item.state) })
+		if first_url == nil and item.url and item.url ~= "" then
 			first_url = tostring(item.url)
 		end
 	end
 
-	return providers.aggregate_pipeline_state(values):lower(), first_url
+	return pipeline_utils.aggregate_state(statuses):lower(), first_url
 end
 
----@param url string
----@return string|nil
-local function pipeline_id(url)
-	return url:match("/pipelines/results/(%d+)")
+---@param job table
+---@return PullsPipelineJob
+local function parse_job(job)
+	return {
+		id = tostring(job.uuid),
+		name = tostring(job.name or "Job"),
+		state = pipeline_state(job.state),
+		started_at = job.started_on,
+		duration = tonumber(job.duration_in_seconds),
+	}
 end
 
----@param state any
----@return string
-local function provider_state(state)
-	if type(state) ~= "table" then
-		return tostring(state or "")
-	end
-	local result = type(state.result) == "table" and state.result.name or nil
-	return tostring(result or state.name or "")
-end
-
----@param state any
----@return "SUCCESSFUL"|"FAILED"|"INPROGRESS"|"STOPPED"|"UNKNOWN"
-local function pipeline_state(state)
-	local value = provider_state(state):upper()
-	if value == "SUCCESSFUL" then
-		return "SUCCESSFUL"
-	elseif value == "FAILED" or value == "ERROR" then
-		return "FAILED"
-	elseif value == "STOPPED" or value == "EXPIRED" or value == "SUPERSEDED" then
-		return "STOPPED"
-	end
-
-	local name = type(state) == "table" and tostring(state.name or ""):upper() or value
-	if name == "PENDING" or name == "IN_PROGRESS" then
-		return "INPROGRESS"
-	end
-	return "UNKNOWN"
-end
-
----@param value string
----@return string
-local function encode_path_segment(value)
-	return (value:gsub("[^%w%-._~]", function(char)
-		return string.format("%%%02X", string.byte(char))
-	end))
+---@param result table
+---@param name string|nil
+---@return PullsPipeline
+local function parse_pipeline(result, name)
+	local target = json.safe_table(result.target)
+	local commit = json.safe_table(target.commit)
+	local number = tonumber(result.build_number)
+	local links = json.safe_table(result.links)
+	return {
+		id = tostring(number),
+		name = name or ("Pipeline #" .. tostring(number)),
+		state = pipeline_state(result.state),
+		url = json.safe_str(json.safe_table(links.html).href),
+		number = number,
+		commit = json.safe_str(commit.hash),
+		branch = json.safe_str(target.ref_name) or json.safe_str(target.source),
+		started_at = json.safe_str(result.created_on),
+		title = json.safe_str(commit.message),
+		stages = {},
+	}
 end
 
 ---@param result table|nil
----@return PullsPipelineJob[]
-local function parse_jobs(result)
-	local jobs = {}
-	for index, item in ipairs((result or {}).values or {}) do
-		local job = type(item) == "table" and item or {}
-		table.insert(jobs, {
-			id = tostring(job.uuid or index),
-			name = tostring(job.name or "Job"),
-			state = pipeline_state(job.state),
-			provider_state = provider_state(job.state),
-			started_at = job.started_on,
-			completed_at = job.completed_on,
-			duration = tonumber(job.duration_in_seconds),
-			steps = {},
+---@return PullsPipeline[]
+local function parse_pipelines(result)
+	local pipelines = {}
+	for index, status in ipairs((result or {}).values or {}) do
+		local pipeline_url = tostring(status.url or "")
+		local status_id = tostring(status.key or "")
+		if status_id == "" then
+			status_id = tostring(status.name or index)
+		end
+		table.insert(pipelines, {
+			id = pipeline_id(pipeline_url) or ("status:" .. status_id),
+			number = tonumber(pipeline_id(pipeline_url)),
+			name = tostring(status.name or status.key or ""),
+			state = pipeline_state(status.state),
+			url = pipeline_url ~= "" and pipeline_url or nil,
+			stages = {},
 		})
 	end
-	return jobs
+	return pipelines
 end
 
----@param pr PullRequest
----@param _opts { force_refresh: boolean|nil }|nil
----@param on_done fun(pipelines: PullsPipeline[]|nil, err: string|nil)
+---@param context PullsPipelineContext
+---@param pipeline PullsPipeline
+---@param on_done fun(pipeline: PullsPipeline|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
-function M.fetch_pipelines(pr, _opts, on_done)
-	local raw = pr._raw
-	local statuses_url = tostring((raw.links or {}).statuses or "")
-	local commit_hash = tostring((pr.source or {}).commit_hash or "")
-	if statuses_url == "" then
-		on_done({}, nil)
+local function fetch_jobs(context, pipeline, on_done)
+	local repo = tostring(context.repo_full_name or "")
+	local id = tostring(pipeline.id)
+	if not id:match("^%d+$") then
+		on_done(pipeline, nil)
+		return nil
+	end
+	if repo == "" then
+		on_done(nil, "Missing repo")
 		return nil
 	end
 
-	local cancelled = false
-	local handles = {}
-	local function track(handle)
-		if handle then
-			table.insert(handles, handle)
-		end
-	end
-
-	track(service.request("GET", statuses_url, nil, nil, function(result, err)
-		if cancelled then
-			return
-		end
+	local fields = "values.uuid,values.name,values.state,values.started_on,values.duration_in_seconds,next"
+	local endpoint = string.format("/repositories/%s/pipelines/%s/steps?pagelen=100&fields=%s", repo, id, fields)
+	return service.fetch_all_values(endpoint, function(result, err)
 		if err then
 			on_done(nil, err)
 			return
 		end
 
-		---@type PullsPipeline[]
-		local pipelines = {}
-		local pipeline_jobs = {}
-		for _, item in ipairs((result or {}).values or {}) do
-			local status = type(item) == "table" and item or {}
-			local url = tostring(status.url or "")
-			local id = pipeline_id(url)
-			local pipeline = {
-				name = tostring(status.name or status.key or ""),
-				state = tostring(status.state or ""):upper(),
-				provider_state = tostring(status.state or ""),
-				url = url ~= "" and url or nil,
-				key = tostring(status.key or ""),
-				provider_id = id,
-				commit_hash = commit_hash,
-				jobs = {},
-			}
-			table.insert(pipelines, pipeline)
-			if id then
-				table.insert(pipeline_jobs, pipeline)
-			end
+		local jobs = {}
+		for _, job in ipairs((result or {}).values or {}) do
+			table.insert(jobs, parse_job(job))
 		end
-
-		if #pipeline_jobs == 0 then
-			on_done(pipelines, nil)
-			return
-		end
-
-		local repo = tostring(pr.repo_full_name or "")
-		if repo == "" then
-			on_done(nil, "Missing repo")
-			return
-		end
-
-		local pending = #pipeline_jobs
-		local first_err
-		for _, pipeline in ipairs(pipeline_jobs) do
-			local endpoint =
-				string.format("/repositories/%s/pipelines/%s/steps?pagelen=100", repo, pipeline.provider_id)
-			track(service.request("GET", endpoint, nil, nil, function(jobs, jobs_err)
-				if cancelled then
-					return
-				end
-				if jobs_err then
-					first_err = first_err or tostring(jobs_err)
-				else
-					pipeline.jobs = parse_jobs(jobs)
-				end
-				pending = pending - 1
-				if pending == 0 then
-					on_done(first_err and nil or pipelines, first_err)
-				end
-			end))
-		end
-	end))
-
-	return {
-		cancel = function()
-			cancelled = true
-			for _, handle in ipairs(handles) do
-				if type(handle.cancel) == "function" then
-					handle.cancel()
-				end
-			end
-		end,
-	}
+		pipeline.job_count = #jobs
+		pipeline.stages = {
+			{
+				name = nil,
+				state = pipeline_utils.aggregate_state(jobs),
+				jobs = jobs,
+			},
+		}
+		on_done(pipeline, nil)
+	end, { action = "Fetch pipeline jobs", repo = repo, pipeline_id = id })
 end
 
----@param pr PullRequest
+---@param context PullsPipelineContext
+---@param pipeline PullsPipeline
+---@param on_done fun(pipeline: PullsPipeline|nil, err: string|nil)
+---@return { cancel: fun() }|nil
+local function fetch_pipeline(context, pipeline, on_done)
+	local repo = tostring(context.repo_full_name or "")
+	local id = tostring(pipeline.id)
+	if repo == "" or not id:match("^%d+$") then
+		on_done(nil, "Missing Bitbucket pipeline identifier")
+		return nil
+	end
+
+	local scope = requests.new()
+	local endpoint = string.format("/repositories/%s/pipelines/%s", repo, id)
+	scope.run(function(done)
+		return service.request("GET", endpoint, nil, nil, done, {
+			action = "Fetch pipeline details",
+			repo = repo,
+			pipeline_id = id,
+		})
+	end, function(result, err)
+		if err then
+			on_done(nil, err)
+			return
+		end
+		local selected = parse_pipeline(result, pipeline.name)
+		selected.id = id
+		selected.number = selected.number or tonumber(id)
+		selected.url = selected.url or string.format("https://bitbucket.org/%s/pipelines/results/%s", repo, selected.id)
+		scope.run(function(done)
+			return fetch_jobs(context, selected, done)
+		end, on_done)
+	end)
+	return scope
+end
+
+---@param context PullsPipelineContext
+---@param on_done fun(pipelines: PullsPipeline[]|nil, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.fetch_history(context, on_done)
+	local target = context.target
+	local is_branch = type(target) == "string"
+	local pr = not is_branch and target.source and target or nil
+	local repo = context.repo_full_name
+	local scope = requests.new()
+	local request_context = { action = "Fetch pipeline history", repo = repo }
+
+	local function fetch_runs(pipeline_target)
+		local selector = json.safe_table(pipeline_target.selector)
+		local pullrequest = json.safe_str(json.safe_table(pipeline_target.pullrequest).id)
+		local fields = "values.build_number,values.state,values.target,values.created_on,values.links.html"
+		local endpoint =
+			string.format("/repositories/%s/pipelines/?pagelen=30&sort=-created_on&fields=%s", repo, fields)
+		local filters = {
+			["target.ref_name"] = pipeline_target.ref_name,
+			["target.branch"] = pipeline_target.source,
+			["target.ref_type"] = pipeline_target.ref_type,
+			["target.selector.type"] = selector.type,
+			["target.selector.pattern"] = selector.pattern,
+		}
+		for key, value in pairs(filters) do
+			local text = json.safe_str(value)
+			if text then
+				endpoint = endpoint .. "&" .. key .. "=" .. encode_path_segment(text)
+			end
+		end
+		scope.run(function(done)
+			return service.request("GET", endpoint, nil, nil, done, request_context)
+		end, function(page, err)
+			if err then
+				on_done(nil, err)
+				return
+			end
+			local history = {}
+			for _, item in ipairs(page.values) do
+				local candidate = item.target
+				local candidate_pr = json.safe_str(json.safe_table(candidate.pullrequest).id)
+				if not pullrequest or candidate_pr == pullrequest or (pr and not candidate_pr) then
+					local run = parse_pipeline(item)
+					run.url = run.url or string.format("https://bitbucket.org/%s/pipelines/results/%s", repo, run.id)
+					table.insert(history, run)
+				end
+			end
+			on_done(history, nil)
+		end)
+	end
+
+	if is_branch then
+		fetch_runs({ source = target })
+	elseif pr then
+		fetch_runs({ source = pr.source.branch, pullrequest = { id = pr.id } })
+	else
+		scope.run(function(done)
+			local endpoint = string.format("/repositories/%s/pipelines/%s", repo, target.id)
+			return service.request("GET", endpoint, nil, nil, done, request_context)
+		end, function(result, err)
+			if err then
+				on_done(nil, err)
+				return
+			end
+			fetch_runs(result.target)
+		end)
+	end
+	return scope
+end
+
+---@param context PullsPipelineContext
+---@param opts { force_refresh?: boolean|nil, pipeline?: PullsPipeline }|nil
+---@param on_done fun(pipelines: PullsPipeline[]|nil, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.fetch(context, opts, on_done)
+	local target = context.target
+	local selected = (opts or {}).pipeline or (type(target) == "table" and target.stages and target or nil)
+	if selected then
+		---@cast selected PullsPipeline
+		return fetch_pipeline(context, selected, function(pipeline, err)
+			on_done(pipeline and { pipeline } or nil, err)
+		end)
+	end
+
+	local pr = type(target) == "table" and target.source and target or nil
+	if not pr then
+		local repo = context.repo_full_name
+		local branch = type(target) == "string" and target or nil
+		if repo == "" or not branch or branch == "" then
+			on_done(nil, "Missing pipeline repository or branch")
+			return nil
+		end
+		local endpoint = string.format(
+			"/repositories/%s/pipelines/?pagelen=1&sort=-created_on&target.branch=%s",
+			repo,
+			encode_path_segment(branch)
+		)
+		local key = "bitbucket:branch:pipelines:" .. endpoint
+		if not (opts or {}).force_refresh then
+			local cached, ok = service.get_cache(key)
+			if ok then
+				on_done(cached, nil)
+				return nil
+			end
+		end
+
+		local scope = requests.new()
+		scope.run(function(done)
+			return service.request("GET", endpoint, nil, nil, done, {
+				action = "Fetch branch pipeline",
+				repo = repo,
+				branch = branch,
+			})
+		end, function(result, err)
+			if err then
+				on_done(nil, err)
+				return
+			end
+			local latest = json.safe_table(json.safe_table(result).values)[1]
+			if not latest then
+				service.set_cache(key, {})
+				on_done({}, nil)
+				return
+			end
+			local pipeline = parse_pipeline(latest)
+			pipeline.url = pipeline.url
+				or string.format("https://bitbucket.org/%s/pipelines/results/%s", repo, pipeline.id)
+			scope.run(function(done)
+				return fetch_jobs(context, pipeline, done)
+			end, function(result_pipeline, jobs_err)
+				if jobs_err then
+					on_done(nil, jobs_err)
+					return
+				end
+				local pipelines = { result_pipeline }
+				service.set_cache(key, pipelines)
+				on_done(pipelines, nil)
+			end)
+		end)
+		return scope
+	end
+
+	---@cast pr BitbucketPullRequest
+	local statuses_url = tostring(pr.links.statuses or "")
+	if statuses_url == "" then
+		on_done({}, nil)
+		return nil
+	end
+
+	local fields = "values.name,values.key,values.state,values.url,next"
+	local sep = statuses_url:find("?") and "&" or "?"
+	local url = string.format("%s%spagelen=%d&fields=%s", statuses_url, sep, 100, fields)
+	local key = "bitbucket:pr:pipelines:" .. url
+	if not (opts or {}).force_refresh then
+		local cached, ok = service.get_cache(key)
+		if ok then
+			on_done(cached, nil)
+			return nil
+		end
+	end
+
+	local scope = requests.new()
+	scope.run(function(done)
+		return service.fetch_all_values(
+			url,
+			done,
+			{ action = "Fetch PR pipelines", repo = pr.repo_full_name, id = pr.id }
+		)
+	end, function(result, err)
+		if err then
+			on_done(nil, err)
+			return
+		end
+
+		local pipelines = parse_pipelines(result)
+		local starts = {}
+		for index, pipeline in ipairs(pipelines) do
+			starts[tostring(index)] = function(done)
+				return fetch_jobs(context, pipeline, done)
+			end
+		end
+		scope.all(starts, function(_, errors)
+			local _, first_err = next(errors)
+			if first_err ~= nil then
+				on_done(nil, first_err)
+				return
+			end
+			service.set_cache(key, pipelines)
+			on_done(pipelines, nil)
+		end)
+	end)
+	return scope
+end
+
+---@param context PullsPipelineContext
+---@param pipeline PullsPipeline
+---@param on_done fun(file: { path: string, content: string }|nil, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.fetch_config(context, pipeline, on_done)
+	local repo = tostring(context.repo_full_name or "")
+	local id = tostring(pipeline.id)
+	if repo == "" or not id:match("^%d+$") then
+		on_done(nil, "No configuration file available for this pipeline")
+		return nil
+	end
+
+	local scope = requests.new()
+	local endpoint = string.format("/repositories/%s/pipelines/%s", repo, id)
+	scope.run(function(done)
+		return service.request("GET", endpoint, nil, nil, done, {
+			action = "Fetch pipeline configuration",
+			repo = repo,
+			pipeline_id = id,
+		})
+	end, function(result, err)
+		if err then
+			on_done(nil, err)
+			return
+		end
+
+		local commit = json.safe_str(json.safe_table(json.safe_table(result.target).commit).hash)
+		if not commit then
+			on_done(nil, "Missing pipeline commit")
+			return
+		end
+		local path = json.safe_str(json.safe_table(result.configuration_file).path) or "bitbucket-pipelines.yml"
+		local source =
+			string.format("/repositories/%s/src/%s/%s", repo, commit, path:gsub("[^/]+", encode_path_segment))
+		scope.run(function(done)
+			return service.request_text("GET", source, { Accept = "*/*" }, nil, done, {
+				action = "Fetch pipeline configuration file",
+				repo = repo,
+				pipeline_id = id,
+			})
+		end, function(content, source_err)
+			if source_err then
+				on_done(nil, source_err)
+				return
+			end
+			on_done({ path = path, content = content or "" }, nil)
+		end)
+	end)
+	return scope
+end
+
+---@param context PullsPipelineContext
 ---@param pipeline PullsPipeline
 ---@param job PullsPipelineJob
----@param on_done fun(log: string|nil, err: string|nil)
+---@param on_done fun(job: PullsPipelineJob|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
-function M.fetch_pipeline_job_log(pr, pipeline, job, on_done)
-	local repo = tostring(pr.repo_full_name or "")
-	local id = tostring(pipeline.provider_id or pipeline_id(tostring(pipeline.url or "")) or "")
-	local job_id = tostring(job.id or "")
-	if repo == "" or id == "" or job_id == "" then
+function M.fetch_job(context, pipeline, job, on_done)
+	local repo = tostring(context.repo_full_name or "")
+	local id = tostring(pipeline.id)
+	local job_id = job.id
+	if repo == "" or not id:match("^%d+$") or job_id == "" then
+		on_done(nil, "Missing Bitbucket pipeline job identifier")
+		return nil
+	end
+
+	local endpoint = string.format("/repositories/%s/pipelines/%s/steps/%s", repo, id, encode_path_segment(job_id))
+	return service.request("GET", endpoint, nil, nil, function(result, err)
+		if err then
+			on_done(nil, err)
+			return
+		end
+		---@cast result table
+		on_done(parse_job(result), nil)
+	end, { action = "Fetch pipeline job", repo = repo, pipeline_id = id, job_id = job_id })
+end
+
+---@param context PullsPipelineContext
+---@param pipeline PullsPipeline
+---@param job PullsPipelineJob
+---@param on_done fun(log: PullsLog|nil, err: string|nil, status?: integer)
+---@return { cancel: fun() }|nil
+function M.fetch_job_log(context, pipeline, job, on_done)
+	local repo = tostring(context.repo_full_name or "")
+	local id = tostring(pipeline.id)
+	local job_id = job.id
+	if repo == "" or not id:match("^%d+$") or job_id == "" then
 		on_done(nil, "Missing Bitbucket pipeline job identifier")
 		return nil
 	end
 
 	local endpoint = string.format("/repositories/%s/pipelines/%s/steps/%s/log", repo, id, encode_path_segment(job_id))
-	return service.request_text("GET", endpoint, { Accept = "*/*" }, nil, on_done, {
+	return service.request_text("GET", endpoint, { Accept = "*/*" }, nil, function(raw, err, status)
+		on_done(raw and { raw = raw } or nil, err, status)
+	end, {
 		action = "Fetch pipeline job log",
 		repo = repo,
 		pipeline_id = id,
@@ -205,13 +491,12 @@ function M.fetch_pipeline_job_log(pr, pipeline, job, on_done)
 	})
 end
 
----@param pr PullRequest
+---@param repo string
+---@param branch string|nil
 ---@param on_done fun(ok: boolean, err: string|nil)
 ---@return { cancel: fun() }|nil
-function M.run_pipeline(pr, on_done)
-	local repo = tostring(pr.repo_full_name or "")
-	local branch = tostring((pr.source or {}).branch or "")
-	if repo == "" or branch == "" then
+function M.run_pipeline(repo, branch, on_done)
+	if repo == "" or not branch or branch == "" then
 		on_done(false, repo == "" and "Missing repo" or "Missing source branch")
 		return nil
 	end
@@ -228,14 +513,14 @@ function M.run_pipeline(pr, on_done)
 	end, { action = "Run pipeline", repo = repo, branch = branch })
 end
 
----@param pr PullRequest
+---@param context PullsPipelineContext
 ---@param pipeline PullsPipeline
 ---@param on_done fun(ok: boolean, err: string|nil)
 ---@return { cancel: fun() }|nil
-function M.stop_pipeline(pr, pipeline, on_done)
-	local repo = tostring(pr.repo_full_name or "")
-	local id = tostring(pipeline.provider_id or pipeline_id(tostring(pipeline.url or "")) or "")
-	if repo == "" or id == "" then
+function M.stop_pipeline(context, pipeline, on_done)
+	local repo = tostring(context.repo_full_name or "")
+	local id = tostring(pipeline.id)
+	if repo == "" or not id:match("^%d+$") then
 		on_done(false, "Missing Bitbucket pipeline identifier")
 		return nil
 	end
@@ -246,12 +531,13 @@ function M.stop_pipeline(pr, pipeline, on_done)
 	end, { action = "Stop pipeline", repo = repo, pipeline_id = id })
 end
 
----@param statuses_url string
+---@param commit PullsCommit
 ---@param opts { force_refresh: boolean|nil }|nil
 ---@param on_done fun(status: string|nil, url: string|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
-function M.fetch_commit_status(statuses_url, opts, on_done)
-	if type(statuses_url) ~= "string" or statuses_url == "" then
+function M.fetch_commit_status(commit, opts, on_done)
+	local statuses_url = tostring(commit.statuses_url or "")
+	if statuses_url == "" then
 		on_done("unknown", nil, nil)
 		return nil
 	end
@@ -263,24 +549,22 @@ function M.fetch_commit_status(statuses_url, opts, on_done)
 	if not force then
 		local cached, ok = service.get_cache(key)
 		if ok then
-			local entries = (cached or {}).values or cached or {}
-			local status, first_url = aggregate_statuses(entries)
-			on_done(status, first_url, nil)
+			on_done(cached.status, cached.url, nil)
 			return nil
 		end
 	end
 
-	return service.request("GET", url, nil, nil, function(result, err)
+	return service.fetch_all_values(url, function(result, err)
 		if err then
 			on_done(nil, nil, err)
 			return
 		end
 
-		service.set_cache(key, result, service.cache_ttl())
 		local values = (result or {}).values or {}
 		local status, first_url = aggregate_statuses(values)
+		service.set_cache(key, { status = status, url = first_url })
 		on_done(status, first_url, nil)
-	end)
+	end, { action = "Fetch commit status", commit_hash = commit.hash })
 end
 
 return M

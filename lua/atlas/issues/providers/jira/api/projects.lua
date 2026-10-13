@@ -1,12 +1,12 @@
 local M = {}
 
-local service = require("atlas.issues.providers.jira.api.service")
+local service = require("atlas.providers.jira.client")
 local normalizer = require("atlas.issues.providers.jira.api.mapper")
-local config = require("atlas.issues.providers.jira.api.config")
+local url_encode = require("atlas.core.utils").url_encode
 
 ---@class JiraProjectGroup
 ---@field category table|nil
----@field projects IssueProject[]
+---@field projects JiraIssueProject[]
 
 ---@param opts { maxResults?: integer, total?: integer, status?: string, query?: string }|nil
 ---@param callback fun(groups: JiraProjectGroup[]|nil, err: string|nil)
@@ -16,7 +16,7 @@ function M.get_projects(opts, callback)
 	local max_results = math.max(1, tonumber(opts.maxResults) or 20)
 	local total_pages = math.max(1, tonumber(opts.total) or 1)
 	local status = tostring(opts.status or "live")
-	local query = type(opts.query) == "string" and opts.query or ""
+	local query = opts.query or ""
 
 	local projects = {}
 	local pages_loaded = 0
@@ -59,21 +59,16 @@ function M.get_projects(opts, callback)
 		if cancelled then
 			return
 		end
-		local is_server = config.jira_config().api_type == "server"
+		local is_server = service.is_server()
 		local path = is_server and "/project" or "/project/search"
 		local endpoint
 		if is_server then
 			endpoint = path
 		else
-			endpoint = string.format(
-				"%s?maxResults=%d&startAt=%d&status=%s",
-				path,
-				max_results,
-				start_at,
-				vim.fn.escape(status, "&=?")
-			)
+			endpoint =
+				string.format("%s?maxResults=%d&startAt=%d&status=%s", path, max_results, start_at, url_encode(status))
 			if query ~= "" then
-				endpoint = endpoint .. "&query=" .. vim.fn.escape(query, "&=?")
+				endpoint = endpoint .. "&query=" .. url_encode(query)
 			end
 		end
 
@@ -90,7 +85,7 @@ function M.get_projects(opts, callback)
 			-- Handle differences in response structure between API versions
 			local normalized = result
 			if path == "/project" then
-				local items = type(result) == "table" and result or {}
+				local items = result
 				normalized = {
 					values = items,
 					isLast = true,

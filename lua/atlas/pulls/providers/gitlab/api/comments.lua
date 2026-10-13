@@ -1,29 +1,85 @@
 local M = {}
 
-local service = require("atlas.providers.gitlab.client").pulls
-local diff_parser = require("atlas.core.git.diff_parser")
-local files_api = require("atlas.pulls.providers.gitlab.api.files")
+local json = require("atlas.core.json")
+local service = require("atlas.providers.gitlab.client")
 local mapper = require("atlas.pulls.providers.gitlab.api.mapper")
+local request_scope = require("atlas.core.requests")
+
+local REVIEW_COMMENTS_QUERY = [[
+query($path:ID!,$iid:String!,$after:String){
+  project(fullPath:$path){
+    mergeRequest(iid:$iid){
+      notes(filter:ONLY_COMMENTS,first:100,after:$after){
+        pageInfo{hasNextPage endCursor}
+        nodes{
+          id
+          body
+          created_at:createdAt
+          web_url:url
+          author{id name username}
+          award_emoji:awardEmoji(first:100){nodes{name}}
+          position{
+            position_type:positionType
+            old_path:oldPath
+            new_path:newPath
+            old_line:oldLine
+            new_line:newLine
+            diff_refs:diffRefs{base_sha:baseSha start_sha:startSha head_sha:headSha}
+          }
+          discussion{
+            id
+            resolved
+            resolved_at:resolvedAt
+            resolved_by:resolvedBy{id name username}
+            notes(first:1){nodes{id}}
+            truncatedDiffLines{type oldLine newLine text}
+          }
+        }
+      }
+    }
+  }
+}
+]]
+
+local GENERAL_COMMENTS_QUERY = [[
+query($path:ID!,$iid:String!,$after:String){
+  project(fullPath:$path){
+    mergeRequest(iid:$iid){
+      notes(filter:ONLY_COMMENTS,first:100,after:$after){
+        pageInfo{hasNextPage endCursor}
+        nodes{
+          id
+          body
+          system
+          created_at:createdAt
+          position{__typename}
+          author{id name username}
+          award_emoji:awardEmoji(first:100){nodes{name}}
+          discussion{
+            id
+            resolved
+            resolved_at:resolvedAt
+            resolved_by:resolvedBy{id name username}
+            notes(first:1){nodes{id}}
+          }
+        }
+      }
+    }
+  }
+}
+]]
+
+---@param id any
+---@return string
+local function id_tail(id)
+	local value = tostring(id or "")
+	return value:match("([^/]+)$") or value
+end
 
 ---@param pr PullRequest
 ---@return string project_path, integer|nil iid
 local function project_iid(pr)
 	return pr.repo_full_name, tonumber(pr.id)
-end
-
----@param files DiffFile[]
----@return table<string, DiffFile>
-local function index_files(files)
-	local by_path = {}
-	for _, f in ipairs(files or {}) do
-		if f.path ~= "" then
-			by_path[f.path] = f
-		end
-		if f.old_path and f.old_path ~= "" and by_path[f.old_path] == nil then
-			by_path[f.old_path] = f
-		end
-	end
-	return by_path
 end
 
 ---@param comment PullsComment
@@ -34,8 +90,9 @@ local function inherit_thread_context(comment, parent)
 		return comment
 	end
 	comment.parent_id = parent.parent_id or parent.id
+	comment.thread_id = comment.thread_id or parent.thread_id
+	comment.file = comment.file or parent.file
 	comment.inline = comment.inline or parent.inline
-	comment.inline_hunk = comment.inline_hunk or parent.inline_hunk
 	comment.outdated = comment.outdated or parent.outdated
 	if comment.state == nil and (parent.state == "RESOLVED" or parent.state == "OUTDATED") then
 		comment.state = parent.state
@@ -48,7 +105,7 @@ end
 ---@return PullsComment
 local function add_permalink(pr, comment)
 	local note_id = tonumber(comment.id)
-	local base = tostring((pr.link or {}).html or "")
+	local base = pr.link.html
 	if note_id and base ~= "" then
 		comment.html_url = string.format("%s#note_%d", base, note_id)
 	end
@@ -59,7 +116,7 @@ end
 ---@param opts { force_refresh: boolean|nil }|nil
 ---@param on_done fun(result: PullsComment[]|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
-local function load_comments(pr, opts, on_done)
+function M.fetch_review_comments(pr, opts, on_done)
 	opts = opts or {}
 	local path, iid = project_iid(pr)
 	if path == "" or iid == nil then
@@ -69,7 +126,7 @@ local function load_comments(pr, opts, on_done)
 		return nil
 	end
 
-	local cache_key = string.format("gitlab_pulls:comments:%s!%d", path, iid)
+	local cache_key = string.format("gitlab_pulls:review-comments:%s!%d", path, iid)
 	if not opts.force_refresh then
 		local cached, ok = service.get_memory_cache(cache_key)
 		if ok then
@@ -79,37 +136,42 @@ local function load_comments(pr, opts, on_done)
 	end
 
 	local encoded = service.url_encode(path)
-	local discussions_ep = string.format("/projects/%s/merge_requests/%d/discussions?per_page=100", encoded, iid)
-	local drafts_ep = string.format("/projects/%s/merge_requests/%d/draft_notes?per_page=100", encoded, iid)
+	local discussions_ep = string.format("/projects/%s/merge_requests/%d/discussions", encoded, iid)
+	local drafts_ep = string.format("/projects/%s/merge_requests/%d/draft_notes", encoded, iid)
 
-	local pending = 2
-	local discussions_result, drafts_result
-	local first_err
-	local drafts_failed = false
-	local handles = {}
-	local cancelled = false
-
-	local function finalize()
-		if cancelled then
-			return
-		end
-		if first_err or discussions_result == nil or drafts_result == nil then
-			on_done(nil, first_err or "Failed to fetch comments")
+	local requests = request_scope.new()
+	requests.all({
+		discussions = function(done)
+			return service.fetch_all_pages(discussions_ep, done, {
+				action = "Fetch MR review discussions",
+				project_path = path,
+				iid = iid,
+			})
+		end,
+		drafts = function(done)
+			return service.fetch_all_pages(drafts_ep, done, {
+				action = "Fetch MR draft comments",
+				project_path = path,
+				iid = iid,
+			})
+		end,
+	}, function(values, errors)
+		if errors.discussions or errors.drafts then
+			on_done(nil, errors.discussions or errors.drafts)
 			return
 		end
 
 		local result = {}
 		local discussion_roots = {}
-		for _, discussion in ipairs(discussions_result) do
-			local notes = type(discussion.notes) == "table" and discussion.notes or {}
+		for _, discussion in ipairs(values.discussions) do
+			local notes = discussion.notes
 			if #notes > 0 then
 				local first = notes[1]
 				if first.system ~= true then
 					local discussion_id = tostring(discussion.id or "")
-					local root =
-						add_permalink(pr, mapper.to_comment(first, first.id, discussion_id, first.resolved == true))
-					discussion_roots[discussion_id] = root
 					local resolved = first.resolved == true
+					local root = add_permalink(pr, mapper.to_comment(first, first.id, discussion_id, resolved))
+					discussion_roots[discussion_id] = root
 					table.insert(result, root)
 					for i = 2, #notes do
 						local note = notes[i]
@@ -122,167 +184,239 @@ local function load_comments(pr, opts, on_done)
 				end
 			end
 		end
-		for _, draft in ipairs(drafts_result or {}) do
+		for _, draft in ipairs(values.drafts) do
 			local discussion_id = type(draft.discussion_id) == "string" and draft.discussion_id or ""
 			local root = discussion_roots[discussion_id]
 			local comment = inherit_thread_context(mapper.to_draft_comment(draft, root and root.id or nil), root)
 			table.insert(result, comment)
 		end
-		if not drafts_failed then
-			service.set_memory_cache(cache_key, result)
-		end
+		service.set_memory_cache(cache_key, result)
 		on_done(result, nil)
-	end
+	end)
+	return requests
+end
 
-	local function track(h)
-		if h then
-			table.insert(handles, h)
-		end
+---@param note table
+---@return PullsComment
+local function to_graphql_comment(note)
+	local discussion = note.discussion
+	local position = json.nilify(note.position)
+	if position then
+		position.base_sha = position.diff_refs.base_sha
+		position.start_sha = position.diff_refs.start_sha
+		position.head_sha = position.diff_refs.head_sha
 	end
-
-	local function step()
-		if cancelled then
-			return
-		end
-		pending = pending - 1
-		if pending <= 0 then
-			finalize()
-		end
+	note.id = id_tail(note.id)
+	local author = json.nilify(note.author)
+	if author then
+		author.id = id_tail(author.id)
 	end
-
-	track(service.fetch_all_pages(discussions_ep, function(result, err)
-		if err then
-			first_err = first_err or err
-		else
-			discussions_result = result
-		end
-		step()
-	end))
-	track(service.fetch_all_pages(drafts_ep, function(result, err)
-		if err then
-			drafts_failed = true
-			drafts_result = {}
-		else
-			drafts_result = result
-		end
-		step()
-	end))
-	return {
-		cancel = function()
-			cancelled = true
-			for _, h in ipairs(handles) do
-				h.cancel()
-			end
-		end,
-	}
+	local resolved_by = json.nilify(discussion.resolved_by)
+	if resolved_by then
+		resolved_by.id = id_tail(resolved_by.id)
+	end
+	note.award_emoji = json.safe_table(json.safe_table(note.award_emoji).nodes)
+	note.resolved_at = discussion.resolved_at
+	note.resolved_by = resolved_by
+	return mapper.to_comment(note, id_tail(discussion.notes.nodes[1].id), id_tail(discussion.id), discussion.resolved)
 end
 
 ---@param pr PullRequest
----@param opts { force_refresh: boolean|nil }|nil
----@param on_done fun(comments: PullsComment[]|nil, err: string|nil)
+---@param opts { force_refresh?: boolean }|nil
+---@param on_done fun(result: PullsComment[]|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
-function M.fetch_comments(pr, opts, on_done)
-	local load_handle, diff_handle
-	local cancelled = false
-	load_handle = load_comments(pr, opts, function(result, err)
-		if not result then
-			on_done(nil, err)
-			return
+function M.fetch_review_threads(pr, opts, on_done)
+	local path, iid = project_iid(pr)
+	local cache_key = string.format("gitlab_pulls:review-threads:%s!%d", path, iid)
+	if not (opts and opts.force_refresh) then
+		local cached, ok = service.get_memory_cache(cache_key)
+		if ok then
+			on_done(cached, nil)
+			return nil
 		end
-		diff_handle = files_api.fetch_diff(pr, opts, function(files)
-			if cancelled then
-				return
-			end
-			local files_by_path = index_files(files or {})
-			local comments = {}
-			for _, comment in ipairs(result) do
-				if comment.inline then
-					local side = comment.inline.to ~= nil and "new" or "old"
-					local line = comment.inline.to or comment.inline.from
-					if line then
-						comment.inline_hunk = diff_parser.find_hunk(files_by_path[comment.inline.path], side, line)
+	end
+
+	local requests = request_scope.new()
+	requests.all({
+		notes = function(done)
+			local records = {}
+			local pages = request_scope.new()
+			local function fetch_page(after)
+				pages.run(function(callback)
+					return service.graphql(
+						REVIEW_COMMENTS_QUERY,
+						{
+							path = path,
+							iid = tostring(iid),
+							after = after,
+						},
+						callback,
+						{
+							action = "Fetch MR review threads",
+							project_path = path,
+							iid = iid,
+						}
+					)
+				end, function(result, err)
+					local project = json.nilify(result and result.project)
+					local merge_request = project and json.nilify(project.mergeRequest)
+					if err or not merge_request then
+						done(nil, err or "GitLab did not return the merge request")
+						return
 					end
-					table.insert(comments, comment)
-				end
+					local notes = merge_request.notes
+					vim.list_extend(records, notes.nodes)
+					if notes.pageInfo.hasNextPage then
+						fetch_page(notes.pageInfo.endCursor)
+					else
+						done(records, nil)
+					end
+				end)
 			end
-			on_done(comments, nil)
-		end)
-	end)
-	return {
-		cancel = function()
-			cancelled = true
-			if load_handle then
-				load_handle.cancel()
-			end
-			if diff_handle then
-				diff_handle.cancel()
-			end
+			fetch_page(nil)
+			return pages
 		end,
-	}
-end
-
----@param pr PullRequest
----@param opts { force_refresh: boolean|nil }|nil
----@param on_done fun(comments: PullsComment[]|nil, err: string|nil)
----@return { cancel: fun() }|nil
-function M.fetch_general_comments(pr, opts, on_done)
-	return load_comments(pr, opts, function(result, err)
-		if not result then
-			on_done(nil, err)
+		drafts = function(done)
+			local endpoint = string.format("/projects/%s/merge_requests/%d/draft_notes", service.url_encode(path), iid)
+			return service.fetch_all_pages(endpoint, done, {
+				action = "Fetch MR draft comments",
+				project_path = path,
+				iid = iid,
+			})
+		end,
+	}, function(values, errors)
+		if errors.notes or errors.drafts then
+			on_done(nil, errors.notes or errors.drafts)
 			return
 		end
-		local general = {}
-		for _, comment in ipairs(result) do
-			if not comment.inline then
-				table.insert(general, comment)
+		local comments, roots = {}, {}
+		for _, note in ipairs(values.notes) do
+			local comment = to_graphql_comment(note)
+			table.insert(comments, comment)
+			if comment.parent_id == nil then
+				roots[comment.thread_id] = comment
+				comment.hunk = mapper.to_diff_hunk(note.discussion.truncatedDiffLines)
 			end
 		end
-		on_done(general, nil)
+		for _, comment in ipairs(comments) do
+			if comment.parent_id then
+				inherit_thread_context(comment, roots[comment.thread_id])
+			end
+		end
+		for _, draft in ipairs(values.drafts) do
+			local root = roots[draft.discussion_id]
+			local comment = inherit_thread_context(mapper.to_draft_comment(draft, root and root.id or nil), root)
+			table.insert(comments, comment)
+		end
+		service.set_memory_cache(cache_key, comments)
+		on_done(comments, nil)
 	end)
+	return requests
 end
 
-local function bust_caches(path, iid)
-	service.delete_memory_cache(string.format("gitlab_pulls:comments:%s!%d", path, iid))
+---@param path string
+---@param iid integer
+function M.invalidate_caches(path, iid)
+	service.delete_memory_cache(string.format("gitlab_pulls:review-comments:%s!%d", path, iid))
+	service.delete_memory_cache(string.format("gitlab_pulls:review-threads:%s!%d", path, iid))
+	service.delete_memory_cache(string.format("gitlab_pulls:conversation-comments:%s!%d", path, iid))
 	service.delete_memory_cache(string.format("gitlab_pulls:activity:%s!%d", path, iid))
 end
 
 ---@param pr PullRequest
----@param reviewer_state "reviewed"|"requested_changes"|nil
----@param body string|nil
----@param on_done fun(ok: boolean, err: string|nil)
+---@param opts { force_refresh: boolean|nil }|nil
+---@param on_done fun(comments: PullsComment[]|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
-function M.publish_review(pr, reviewer_state, body, on_done)
+function M.fetch_conversation_comments(pr, opts, on_done)
+	opts = opts or {}
 	local path, iid = project_iid(pr)
 	if path == "" or iid == nil then
-		on_done(false, "Invalid MR identifier")
+		on_done(nil, "Invalid MR identifier")
 		return nil
 	end
 
-	local payload
-	if body and vim.trim(body) ~= "" then
-		payload = { note = body }
-	end
-	if reviewer_state then
-		payload = payload or {}
-		payload.reviewer_state = reviewer_state
+	local cache_key = string.format("gitlab_pulls:conversation-comments:%s!%d", path, iid)
+	if not opts.force_refresh then
+		local cached, ok = service.get_memory_cache(cache_key)
+		if ok then
+			on_done(cached, nil)
+			return nil
+		end
 	end
 
-	local endpoint =
-		string.format("/projects/%s/merge_requests/%d/draft_notes/bulk_publish", service.url_encode(path), iid)
-	return service.request("POST", endpoint, payload, function(_, err)
-		if err then
-			on_done(false, err)
-			return
-		end
-		bust_caches(path, iid)
-		on_done(true, nil)
-	end)
+	local comments = {}
+	local after
+	local requests = request_scope.new()
+
+	local function fetch_page()
+		requests.run(function(done)
+			return service.graphql(
+				GENERAL_COMMENTS_QUERY,
+				{
+					path = path,
+					iid = tostring(iid),
+					after = after,
+				},
+				done,
+				{
+					action = "Fetch MR comments",
+					project_path = path,
+					iid = iid,
+				}
+			)
+		end, function(result, err)
+			local project = json.safe_table(result and result.project)
+			local merge_request = json.nilify(project.mergeRequest)
+			if err or not merge_request then
+				on_done(nil, err or "GitLab did not return the merge request")
+				return
+			end
+
+			local notes = json.safe_table(merge_request.notes)
+			for _, note in ipairs(json.safe_table(notes.nodes)) do
+				local discussion = json.safe_table(note.discussion)
+				local root = json.safe_table(json.safe_table(discussion.notes).nodes)[1]
+				if note.system ~= true and json.nilify(note.position) == nil and root then
+					discussion.resolved = discussion.resolved == true
+					table.insert(comments, add_permalink(pr, to_graphql_comment(note)))
+				end
+			end
+
+			local page_info = json.safe_table(notes.pageInfo)
+			local end_cursor = json.safe_str(page_info.endCursor) or ""
+			if page_info.hasNextPage == true and end_cursor ~= "" then
+				after = end_cursor
+				fetch_page()
+				return
+			end
+
+			table.sort(comments, function(a, b)
+				return a.created_on == b.created_on and a.id < b.id or a.created_on < b.created_on
+			end)
+			local roots = {}
+			for _, comment in ipairs(comments) do
+				if comment.parent_id == nil then
+					roots[comment.thread_id] = comment
+				end
+			end
+			for _, comment in ipairs(comments) do
+				if comment.parent_id then
+					inherit_thread_context(comment, roots[comment.thread_id])
+				end
+			end
+			service.set_memory_cache(cache_key, comments)
+			on_done(comments, nil)
+		end)
+	end
+
+	fetch_page()
+	return requests
 end
 
 ---@param value any Decoded API value.
----@return { base_sha: string, head_sha: string, start_sha: string }|nil
+---@return GitLabPullRequestDiffRefs|nil
 local function normalize_diff_refs(value)
-	value = type(value) == "table" and value or {}
+	value = json.safe_table(value)
 	local refs = {
 		base_sha = tostring(value.base_sha or value.base_commit_sha or ""),
 		head_sha = tostring(value.head_sha or value.head_commit_sha or ""),
@@ -298,61 +432,75 @@ end
 ---@param path string
 ---@param iid integer
 ---@param content string
----@param inline PullsInlineCommentPosition
+---@param target PullsInlineCommentPosition|PullsFileCommentPosition
+---@param file_level boolean
 ---@param pending boolean
 ---@param on_done fun(comment: PullsComment|nil, err: string|nil)
 ---@return { cancel: fun() }
-local function add_inline_comment(pr, path, iid, content, inline, pending, on_done)
-	local cancelled = false
-	local request
-	local function track(handle)
-		request = handle
-		if cancelled and request then
-			request.cancel()
-		end
-	end
-	local function finish(comment, err)
-		if not cancelled then
-			on_done(comment, err)
-		end
-	end
+local function add_positioned_comment(pr, path, iid, content, target, file_level, pending, on_done)
+	---@cast pr GitLabPullRequest
+	local requests = request_scope.new()
 	local function create(refs)
 		local position = {
-			position_type = "text",
+			position_type = file_level and "file" or "text",
 			base_sha = refs.base_sha,
 			head_sha = refs.head_sha,
 			start_sha = refs.start_sha,
-			old_path = inline.old_path or inline.path,
-			new_path = inline.path,
-			old_line = inline.from,
-			new_line = inline.to,
+			old_path = target.old_path or target.path,
+			new_path = target.path,
+			old_line = not file_level and target.from or nil,
+			new_line = not file_level and target.to or nil,
 		}
+		local start_from, start_to = target.start_from, target.start_to
+		if not file_level and (start_from or start_to) then
+			local line_code = require("atlas.pulls.providers.gitlab.api.line_code")
+			local side = target.to and "new" or "old"
+			position.line_range = {
+				start = {
+					line_code = line_code.encode(target.path, start_from, start_to),
+					type = side,
+					old_line = start_from,
+					new_line = start_to,
+				},
+				["end"] = {
+					line_code = line_code.encode(target.path, target.from, target.to),
+					type = side,
+					old_line = target.from,
+					new_line = target.to,
+				},
+			}
+		end
 		local resource = pending and "draft_notes" or "discussions"
 		local endpoint = string.format("/projects/%s/merge_requests/%d/%s", service.url_encode(path), iid, resource)
 		local payload = pending and { note = content, position = position } or { body = content, position = position }
-		track(service.request("POST", endpoint, payload, function(result, err)
-			if err or type(result) ~= "table" then
-				finish(nil, err or "Empty response")
+		requests.run(function(done)
+			return service.request("POST", endpoint, payload, done, {
+				action = pending and "Add MR draft comment" or "Add MR discussion",
+				project_path = path,
+				iid = iid,
+			})
+		end, function(result, err)
+			if err then
+				on_done(nil, err)
 				return
 			end
 			if pending then
-				bust_caches(path, iid)
-				finish(mapper.to_draft_comment(result, nil), nil)
+				M.invalidate_caches(path, iid)
+				on_done(mapper.to_draft_comment(result, nil), nil)
 				return
 			end
-			local first = type(result.notes) == "table" and result.notes[1] or nil
-			if type(first) ~= "table" then
-				finish(nil, "Created discussion has no comment")
+			local first = result.notes[1]
+			if not first then
+				on_done(nil, "Created discussion has no comment")
 				return
 			end
-			bust_caches(path, iid)
-			finish(add_permalink(pr, mapper.to_comment(first, first.id, tostring(result.id or ""), false)), nil)
-		end))
+			M.invalidate_caches(path, iid)
+			on_done(add_permalink(pr, mapper.to_comment(first, first.id, tostring(result.id or ""), false)), nil)
+		end)
 	end
 
-	local raw = pr._raw
-	local refs = normalize_diff_refs(raw.diff_refs)
-	if refs and inline.commit_hash and refs.head_sha ~= inline.commit_hash then
+	local refs = normalize_diff_refs(pr.diff_refs)
+	if refs and target.commit_hash and refs.head_sha ~= target.commit_hash then
 		refs = nil
 	end
 	if refs then
@@ -360,30 +508,32 @@ local function add_inline_comment(pr, path, iid, content, inline, pending, on_do
 	else
 		local endpoint =
 			string.format("/projects/%s/merge_requests/%d/versions?per_page=1", service.url_encode(path), iid)
-		track(service.request("GET", endpoint, nil, function(result, err)
-			local latest = type(result) == "table" and result[1] or nil
-			local latest_refs = normalize_diff_refs(latest)
-			if err or not latest_refs then
-				finish(nil, err or "Unable to load merge request diff refs")
+		requests.run(function(done)
+			return service.request("GET", endpoint, nil, done, {
+				action = "Fetch MR diff refs",
+				project_path = path,
+				iid = iid,
+			})
+		end, function(result, err)
+			if err then
+				on_done(nil, err)
 				return
 			end
-			if inline.commit_hash and latest_refs.head_sha ~= inline.commit_hash then
-				finish(nil, "Merge request head changed")
+			local latest_refs = normalize_diff_refs(result[1])
+			if not latest_refs then
+				on_done(nil, "Unable to load merge request diff refs")
 				return
 			end
-			raw.diff_refs = latest_refs
+			if target.commit_hash and latest_refs.head_sha ~= target.commit_hash then
+				on_done(nil, "Merge request head changed")
+				return
+			end
+			pr.diff_refs = latest_refs
 			create(latest_refs)
-		end))
+		end)
 	end
 
-	return {
-		cancel = function()
-			cancelled = true
-			if request then
-				request.cancel()
-			end
-		end,
-	}
+	return requests
 end
 
 ---@param pr PullRequest
@@ -403,36 +553,41 @@ function M.add_comment(pr, content, opts, on_done)
 		return nil
 	end
 	local parent = opts.parent
-	if parent and parent.state == "PENDING" and tostring((parent._raw or {}).discussion_id or "") == "" then
+	if parent and parent.pending and (parent.thread_id or "") == "" then
 		on_done(nil, "GitLab cannot reply to this draft until it is published")
 		return nil
 	end
-	if opts.inline then
-		return add_inline_comment(pr, path, iid, content, opts.inline, opts.pending == true, on_done)
+	local target = opts.inline or opts.file
+	if target then
+		return add_positioned_comment(pr, path, iid, content, target, opts.file ~= nil, opts.pending == true, on_done)
 	end
 
 	if opts.pending then
 		local endpoint = string.format("/projects/%s/merge_requests/%d/draft_notes", service.url_encode(path), iid)
 		local payload = { note = content }
-		if parent and parent._raw then
-			local discussion_id = tostring(parent._raw.discussion_id or "")
+		if parent then
+			local discussion_id = parent.thread_id or ""
 			if discussion_id ~= "" then
 				payload.in_reply_to_discussion_id = discussion_id
 			end
 		end
 		return service.request("POST", endpoint, payload, function(result, err)
-			if err or type(result) ~= "table" then
-				on_done(nil, err or "Empty response")
+			if err then
+				on_done(nil, err)
 				return
 			end
-			bust_caches(path, iid)
+			M.invalidate_caches(path, iid)
 			local root_id = parent and (parent.parent_id or parent.id) or nil
 			local created = mapper.to_draft_comment(result, root_id)
 			on_done(inherit_thread_context(created, parent), nil)
-		end)
+		end, {
+			action = "Add MR draft comment",
+			project_path = path,
+			iid = iid,
+		})
 	end
 
-	local discussion_id = parent and tostring((parent._raw or {}).discussion_id or "") or ""
+	local discussion_id = parent and parent.thread_id or ""
 	if parent and discussion_id == "" then
 		on_done(nil, "Missing discussion id")
 		return nil
@@ -447,16 +602,16 @@ function M.add_comment(pr, content, opts, on_done)
 		or string.format("/projects/%s/merge_requests/%d/discussions", service.url_encode(path), iid)
 
 	return service.request("POST", endpoint, { body = content }, function(result, err)
-		if err or type(result) ~= "table" then
-			on_done(nil, err or "Empty response")
+		if err then
+			on_done(nil, err)
 			return
 		end
-		local note = parent and result or (result.notes or {})[1]
-		if type(note) ~= "table" then
+		local note = parent and result or result.notes[1]
+		if not note then
 			on_done(nil, "Empty response")
 			return
 		end
-		bust_caches(path, iid)
+		M.invalidate_caches(path, iid)
 		local first_id = parent and (parent.parent_id or parent.id) or note.id
 		local created_discussion_id = parent and discussion_id or tostring(result.id or "")
 		on_done(
@@ -466,7 +621,11 @@ function M.add_comment(pr, content, opts, on_done)
 			),
 			nil
 		)
-	end)
+	end, {
+		action = parent and "Reply to MR discussion" or "Add MR discussion",
+		project_path = path,
+		iid = iid,
+	})
 end
 
 ---@param path string
@@ -486,7 +645,7 @@ local function comment_endpoint(path, iid, comment)
 	if draft_note_id then
 		return string.format("%s/draft_notes/%d", prefix, note_id), true
 	end
-	local discussion_id = tostring(raw.discussion_id or "")
+	local discussion_id = comment.thread_id or ""
 	if discussion_id ~= "" then
 		return string.format("%s/discussions/%s/notes/%d", prefix, service.url_encode(discussion_id), note_id), false
 	end
@@ -498,13 +657,12 @@ end
 ---@param on_done fun(comment: PullsComment|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
 function M.edit_comment(pr, comment, on_done)
-	local body = tostring(comment.content_raw or "")
+	local body = comment.content_raw
 	local path, iid = project_iid(pr)
 	if path == "" or iid == nil then
 		on_done(nil, "Invalid MR identifier")
 		return nil
 	end
-	local raw = comment._raw or {}
 	local endpoint, draft = comment_endpoint(path, iid, comment)
 	if not endpoint then
 		on_done(nil, "Invalid note id")
@@ -513,26 +671,32 @@ function M.edit_comment(pr, comment, on_done)
 
 	local payload = draft and { note = body } or { body = body }
 	return service.request("PUT", endpoint, payload, function(result, err)
-		if err or type(result) ~= "table" then
-			on_done(nil, err or "Empty response")
+		if err then
+			on_done(nil, err)
 			return
 		end
-		bust_caches(path, iid)
+		M.invalidate_caches(path, iid)
 		local updated
 		if draft then
 			updated = mapper.to_draft_comment(result, comment.parent_id)
 		else
 			local first_id = comment.parent_id or comment.id
-			local discussion_id = tostring(raw.discussion_id or "")
+			local discussion_id = comment.thread_id or ""
 			updated = add_permalink(pr, mapper.to_comment(result, first_id, discussion_id, comment.state == "RESOLVED"))
 		end
 		updated.parent_id = comment.parent_id
+		updated.thread_id = updated.thread_id or comment.thread_id
+		updated.file = updated.file or comment.file
 		updated.inline = updated.inline or comment.inline
-		updated.inline_hunk = updated.inline_hunk or comment.inline_hunk
 		updated.state = updated.state or comment.state
 		updated.outdated = updated.outdated or comment.outdated
 		on_done(updated, nil)
-	end)
+	end, {
+		action = "Edit MR comment",
+		project_path = path,
+		iid = iid,
+		note_id = tostring(comment.id),
+	})
 end
 
 ---@param pr PullRequest
@@ -556,9 +720,14 @@ function M.delete_comment(pr, comment, on_done)
 			on_done(false, err)
 			return
 		end
-		bust_caches(path, iid)
+		M.invalidate_caches(path, iid)
 		on_done(true, nil)
-	end)
+	end, {
+		action = "Delete MR comment",
+		project_path = path,
+		iid = iid,
+		note_id = tostring(comment.id),
+	})
 end
 
 ---@param pr PullRequest
@@ -568,8 +737,7 @@ end
 ---@return { cancel: fun() }|nil
 function M.set_thread_resolved(pr, root, resolved, on_done)
 	local path, iid = project_iid(pr)
-	local raw = root._raw or {}
-	local discussion_id = tostring(raw.discussion_id or "")
+	local discussion_id = root.thread_id or ""
 	if path == "" or iid == nil then
 		on_done(false, "Invalid MR identifier")
 		return nil
@@ -590,17 +758,28 @@ function M.set_thread_resolved(pr, root, resolved, on_done)
 			on_done(false, err)
 			return
 		end
-		bust_caches(path, iid)
+		M.invalidate_caches(path, iid)
 		on_done(true, nil)
-	end)
+	end, {
+		action = resolved and "Resolve MR discussion" or "Reopen MR discussion",
+		project_path = path,
+		iid = iid,
+		discussion_id = discussion_id,
+	})
 end
 
 ---@param pr PullRequest
----@param comment PullsComment
+---@param item PullsConversationItem
 ---@param key string
 ---@param on_done fun(ok: boolean, err: string|nil)
 ---@return { cancel: fun() }|nil
-function M.add_reaction(pr, comment, key, on_done)
+function M.add_reaction(pr, item, key, on_done)
+	if item.kind ~= "comment" then
+		on_done(false, "This item does not support reactions")
+		return nil
+	end
+	---@type PullsComment
+	local comment = item.entity
 	local path, iid = project_iid(pr)
 	if path == "" or iid == nil then
 		on_done(false, "Invalid MR identifier")
@@ -623,9 +802,14 @@ function M.add_reaction(pr, comment, key, on_done)
 			on_done(false, err)
 			return
 		end
-		bust_caches(path, iid)
+		M.invalidate_caches(path, iid)
 		on_done(true, nil)
-	end)
+	end, {
+		action = "Add MR comment reaction",
+		project_path = path,
+		iid = iid,
+		note_id = note_id,
+	})
 end
 
 return M

@@ -40,7 +40,6 @@ end
 ---@param value any
 ---@param ttl number|nil
 function M.set(key, value, ttl)
-	prune_expired()
 	local now = os.time()
 
 	local expires_at = nil
@@ -61,19 +60,22 @@ end
 ---@return MemoryCacheEntry|nil
 function M.get(key)
 	prune_expired()
-
-	local entry = store[key]
-	if entry == nil then
-		return nil
-	end
-
-	return entry
+	return store[key]
 end
 
 ---@param key string
 function M.delete(key)
 	store[key] = nil
 	remove_from_order(key)
+end
+
+---@param prefix string
+function M.clear_prefix(prefix)
+	for key in pairs(store) do
+		if key:sub(1, #prefix) == prefix then
+			M.delete(key)
+		end
+	end
 end
 
 function M.clear_all()

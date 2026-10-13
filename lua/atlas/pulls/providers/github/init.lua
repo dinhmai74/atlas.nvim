@@ -1,345 +1,169 @@
-local actions = require("atlas.pulls.providers.github.actions")
+---@class GitHubPullRequest : PullRequest
+---@field node_id string|nil
+---@field review_decision string|nil
+---@field check_status string|nil
+---@field lines_added number
+---@field lines_removed number
+
+---@class GitHubPullRequestDetails : PullRequestDetails
+---@field assignees PullsAuthor[]
+---@field labels PullsLabel[]
+
 local activity_api = require("atlas.pulls.providers.github.api.activity")
+local changes_api = require("atlas.pulls.providers.github.api.changes")
 local checks_api = require("atlas.pulls.providers.github.api.checks")
-local cli = require("atlas.providers.github.client").pulls
+local config = require("atlas.config")
 local comments_api = require("atlas.pulls.providers.github.api.comments")
-local commits_api = require("atlas.pulls.providers.github.api.commits")
-local notifications_api = require("atlas.pulls.providers.github.api.notifications")
+local emojis = require("atlas.ui.shared.emojis")
+local git = require("atlas.core.git")
+local links_api = require("atlas.providers.github.links")
 local pullrequests_api = require("atlas.pulls.providers.github.api.pullrequests")
-local repositories_api = require("atlas.pulls.providers.github.api.repositories")
-local users_api = require("atlas.pulls.providers.github.api.users")
-local resolver = require("atlas.providers.resolve")
+local reviews_api = require("atlas.pulls.providers.github.api.reviews")
+local request_scope = require("atlas.core.requests")
+local search_query = require("atlas.providers.github.query")
+local ui_detail = require("atlas.pulls.providers.github.ui.detail")
+local ui_repository = require("atlas.providers.github.ui.repository")
+local users_api = require("atlas.providers.github.users")
 
----@param on_done fun(user: PullsUser|nil, err: string|nil)
----@return { cancel: fun() }|nil
-local function fetch_user(on_done)
-	return users_api.fetch_user(function(user, err)
-		if user then
-			require("atlas.pulls.providers.github.state").current_user = user
-		end
-		on_done(user, err)
-	end)
-end
-
----@param view AtlasPullsViewConfig
+---@param ref PullRequestRef
 ---@param opts PullsFetchOpts
----@param on_done fun(groups: PullsGroup[], err: string[]|nil)
+---@param on_done fun(details: PullRequestDetails|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
-local function fetch_pullrequests(view, opts, on_done)
-	---@cast view AtlasGitHubViewConfig
-	local search = view.search or ""
-	if search == "" then
-		vim.schedule(function()
-			on_done({}, { "No search query configured for view" })
-		end)
-		return nil
-	end
-
-	local query = search:find("is:pr") and search or "is:pr " .. search
-	local filters = require("atlas.pulls.state").status_filters or {}
-	local open, merged, declined = filters.OPEN, filters.MERGED, filters.DECLINED
-	if open and not merged and not declined then
-		query = query .. " is:open"
-	elseif merged and not open and not declined then
-		query = query .. " is:merged"
-	elseif declined and not open and not merged then
-		query = query .. " is:closed -is:merged"
-	elseif merged and declined and not open then
-		query = query .. " is:closed"
-	end
-
-	require("atlas.pulls.state").last_search_query = query
-	return pullrequests_api.search_prs(query, on_done, {
-		force_load = opts.force_load == true,
-		limit = opts.pagelen,
-	})
-end
-
----@param pr PullRequestRef
----@param opts PullsFetchOpts
----@param on_done fun(pr: PullRequest|nil, err: string|nil)
----@return { cancel: fun() }|nil
-local function fetch_pullrequest(pr, opts, on_done)
-	local owner, repo = pr.repo_full_name:match("^([^/]+)/(.+)$")
+local function fetch_pullrequest(ref, opts, on_done)
+	local owner, repo = ref.repo_full_name:match("^([^/]+)/(.+)$")
 	if owner == nil or repo == nil then
 		vim.schedule(function()
 			on_done(nil, "Missing repository info")
 		end)
 		return nil
 	end
-	return pullrequests_api.get_pr(owner, repo, pr.id, on_done, { force_load = opts.force_load == true })
-end
-
----@param pr PullRequest
----@param opts { force_refresh: boolean|nil }|nil
----@param on_done fun(result: { comments: PullsComment[], events: PullsActivityEntry[] }|nil, err: string|nil)
----@return { cancel: fun() }|nil
-local function fetch_conversation(pr, opts, on_done)
-	---@param result { comments: PullsComment[], events: PullsActivityEntry[] }
-	---@param description string
-	local function finish(result, description)
-		local comments = type(result.comments) == "table" and result.comments or {}
-		if description ~= "" then
-			table.insert(comments, 1, {
-				id = "__body__",
-				parent_id = nil,
-				author = pr.author,
-				content_raw = description,
-				created_on = pr.created_on or "",
-				reactions = pr.reactions,
-				can_resolve = false,
-			})
-		end
-		on_done({ comments = comments, events = type(result.events) == "table" and result.events or {} }, nil)
-	end
-
-	return activity_api.fetch_conversation(pr, opts, function(result, err)
-		if err or type(result) ~= "table" then
-			on_done(nil, err or "Failed to fetch conversation")
-			return
-		end
-
-		local description = tostring(pr.description or "")
-		if description ~= "" then
-			finish(result, description)
-			return
-		end
-		pullrequests_api.get_description(pr, opts, function(value)
-			finish(result, tostring(value or ""))
-		end)
-	end)
-end
-
----@param pr PullRequest
----@param comment PullsComment
----@param key string
----@param on_done fun(ok: boolean, err: string|nil)
----@return { cancel: fun() }|nil
-local function add_reaction(pr, comment, key, on_done)
-	local repo_slug = pr.repo_full_name or ""
-	if repo_slug == "" then
-		on_done(false, "Missing repo")
-		return nil
-	end
-
-	local endpoint
-	if tostring(comment.id) == "__body__" then
-		endpoint = string.format("repos/%s/issues/%s/reactions", repo_slug, tostring(pr.id))
-	else
-		endpoint = string.format("repos/%s/issues/comments/%s/reactions", repo_slug, tostring(comment.id))
-	end
-	return cli.gh({ "api", "-X", "POST", endpoint, "-f", "content=" .. key }, function(_, err)
-		on_done(err == nil, err)
-	end)
+	return pullrequests_api.get_pr(owner, repo, ref.id, on_done, { force_refresh = opts.force_refresh == true })
 end
 
 ---@return AtlasGitHubViewConfig[]
 local function views()
-	local config = ((require("atlas.config").options.pulls or {}).providers or {}).github or {}
-	---@cast config AtlasGitHubConfig
-	local configured = type(config.views) == "table" and #config.views > 0 and config.views
-		or { { name = "Me", key = "1", search = "involves:@me", layout = "compact" } }
-	return require("atlas.ui.shared.bookmarks_view").append_to_views(configured, config.bookmarks, "S", "Search")
+	local options = config.domain_options("github", "pulls") or {}
+	---@cast options AtlasGitHubPullsConfig
+	local configured = options.views
+	if not configured or #configured == 0 then
+		configured = { { name = "Me", key = "1", search = "involves:@me", layout = "compact" } }
+	end
+	return vim.tbl_map(function(view)
+		return vim.tbl_extend("force", {}, view)
+	end, configured)
 end
 
----@param opts { force_load: boolean|nil }|nil
----@param on_done fun(notifications: AtlasNotification[]|nil, err: string|nil)
+---@param view AtlasGitHubViewConfig
+---@param on_done fun(view: AtlasGitHubViewConfig)
 ---@return { cancel: fun() }|nil
-local function fetch_notifications(opts, on_done)
-	return notifications_api.fetch(vim.tbl_extend("force", { all = true, per_page = 100 }, opts or {}), on_done)
-end
-
----@param opts { repo_slug: string, repo_root: string|nil, head: string, base: string }
----@param on_done fun(reviewers: PullsCreatePRReviewer[]|nil, err: string|nil)
----@return { cancel: fun() }|nil
-local function fetch_default_reviewers(opts, on_done)
-	local slug = tostring(opts.repo_slug or "")
-	if slug == "" then
-		vim.schedule(function()
-			on_done(nil, "Missing repo slug")
-		end)
+local function resolve_view(view, on_done)
+	if not view.current_repo then
+		on_done(view)
 		return nil
 	end
-
-	return cli.gh(
-		{ "api", "--paginate", string.format("repos/%s/collaborators?per_page=100", slug) },
-		function(result, err)
-			if err then
-				on_done(nil, err)
-				return
-			end
-
-			local reviewers = {}
-			for _, raw in ipairs(type(result) == "table" and result or {}) do
-				local login = type(raw) == "table" and tostring(raw.login or "") or ""
-				if login ~= "" then
-					table.insert(reviewers, {
-						label = "@" .. login,
-						provider_id = login,
-						selected = false,
-						default = false,
-					})
-				end
-			end
-			on_done(reviewers, nil)
+	return git.local_repository(vim.fn.getcwd(), function(target)
+		local resolved = vim.tbl_extend("force", {}, view)
+		local repo = target and target.provider == "github" and target.repo_full_name or nil
+		if repo then
+			local additional = (view.search and view.search ~= "") and (" " .. view.search) or ""
+			resolved.search = string.format("repo:%s%s", repo, additional)
 		end
-	)
+		on_done(resolved)
+	end)
 end
 
-local function search()
-	actions.run("search", { source = "main" }, function() end)
-end
-
----@param value string
----@param parsed AtlasParsedUrl|nil
----@return AtlasTarget|nil, string|nil
-local function resolve_target(value, parsed)
-	if parsed == nil or parsed.host ~= "github.com" then
-		return nil, nil
-	end
-
-	local owner, repo, number, tail = parsed.path:match("^/([^/]+)/([^/]+)/pull/(%d+)(.*)$")
-	if owner then
-		if not resolver.valid_tail(tail) then
-			return nil, "Unsupported GitHub pull request URL"
-		end
-		return {
-			provider = "github",
-			domain = "pulls",
-			entity = "pr",
-			url = value,
-			host = parsed.host,
-			owner = owner,
-			repo = repo,
-			number = tonumber(number),
-		}
-	end
-
-	owner, repo = parsed.path:match("^/([^/]+)/([^/]+)$")
-	if owner then
-		return {
-			provider = "github",
-			domain = "pulls",
-			entity = "repo",
-			url = value,
-			host = parsed.host,
-			owner = owner,
-			repo = repo,
-		}
-	end
-
-	return nil, "Unsupported GitHub URL. Expected a repository, issue, or pull request URL"
+---@param view AtlasGitHubViewConfig
+---@param opts PullsFetchOpts
+---@param on_done fun(page: PullsPage, err: string[]|nil)
+---@return AtlasRequestScope
+local function fetch_pullrequests(view, opts, on_done)
+	local requests = request_scope.new()
+	requests.run(function(done)
+		return resolve_view(view, done)
+	end, function(resolved)
+		local query = search_query.query(resolved)
+		requests.run(function(done)
+			return pullrequests_api.fetch_search(search_query.queries(resolved), opts, done)
+		end, function(page, err)
+			page.query = query
+			on_done(page, err)
+		end)
+	end)
+	return requests
 end
 
 ---@param target AtlasTarget
 ---@return AtlasPullsViewConfig
-local function search_view(target)
+local function view_for_target(target)
+	local search = string.format("repo:%s/%s is:pr", target.owner, target.repo)
+	if target.number then
+		search = search .. " " .. tostring(target.number)
+	end
 	return {
 		name = "Search",
 		layout = "compact",
-		search = string.format(
-			"repo:%s/%s %s is:pr",
-			target.owner,
-			target.repo,
-			target.number and tostring(target.number) or ""
-		),
+		search = search,
 	}
-end
-
----@param info AtlasGitRemoteInfo
----@param domain AtlasDomain
----@param entity AtlasEntity
----@param number integer
----@param base_url string
----@return AtlasTarget
-local function target(info, domain, entity, number, base_url)
-	local owner, repo = info.slug:match("^(.+)/([^/]+)$")
-	return {
-		provider = "github",
-		domain = domain,
-		entity = entity,
-		host = info.host,
-		owner = owner,
-		repo = repo,
-		number = number,
-		url = string.format("%s/%s/%s/%s/%d", base_url, owner, repo, entity == "pr" and "pull" or "issues", number),
-	}
-end
-
----@param options table
----@return string[]
-local function repositories(options)
-	local result = {}
-	for _, view in ipairs(options.views or {}) do
-		for slug in tostring(view.search or ""):gmatch("repo:([%w._/-]+)") do
-			table.insert(result, slug)
-		end
-	end
-	return result
 end
 
 return {
-	resolve = resolve_target,
-	search_view = search_view,
-	target = target,
-	repositories = repositories,
+	views = views,
+	view_for_target = view_for_target,
+	resolve_search = search_query.query,
 	capabilities = {
+		actions = require("atlas.pulls.providers.github.actions.registry"),
 		core = {
-			fetch_user = fetch_user,
 			fetch_pullrequests = fetch_pullrequests,
+			fetch_by_refs = pullrequests_api.fetch_by_refs,
 			fetch_pullrequest = fetch_pullrequest,
+			fetch_links = links_api.fetch_pr,
+			fetch_reviewers = reviews_api.fetch_reviewers,
+			merge = pullrequests_api.merge,
+			decline = pullrequests_api.decline,
 			fetch_description = pullrequests_api.get_description,
-			fetch_reviewers = pullrequests_api.get_reviewers,
-			fetch_merge_checks = checks_api.get_merge_checks_summary,
-			fetch_diffstat = pullrequests_api.get_diffstat,
-			fetch_activity = activity_api.fetch_activity,
-			fetch_commits = commits_api.fetch_commits,
-			fetch_diff = commits_api.fetch_diff,
-			views = views,
+			fetch_merge_checks = checks_api.fetch,
+			fetch_diffstat = changes_api.fetch_diffstat,
+			fetch_commits = changes_api.fetch_commits,
+		},
+		write = {
+			create = pullrequests_api.create_pr,
+			update = pullrequests_api.update_pr,
+			fetch_reviewer_candidates = pullrequests_api.fetch_reviewer_candidates,
+			fetch_labels = pullrequests_api.list_labels,
+			fetch_assignees = function(repo_slug, on_done)
+				return users_api.get_assignable_users(repo_slug, nil, on_done)
+			end,
 		},
 		comments = {
-			reaction_options = require("atlas.ui.shared.emojis").github(),
-			comment_completion = require("atlas.pulls.providers.github.completion.author").build_completion,
-			fetch_conversation = fetch_conversation,
+			reaction_options = emojis.github(),
+			fetch_conversation = activity_api.fetch_conversation,
 			add_comment = comments_api.add_comment,
 			edit_comment = comments_api.edit_comment,
 			delete_comment = comments_api.delete_comment,
-			add_reaction = add_reaction,
+			add_reaction = comments_api.add_reaction,
+			set_thread_resolved = comments_api.set_thread_resolved,
 		},
 		reviews = {
-			fetch_review_context = pullrequests_api.get_review_context,
-			fetch_comments = comments_api.fetch_comments,
-			fetch_tasks = comments_api.fetch_tasks,
-			set_thread_resolved = comments_api.set_thread_resolved,
-			submit_review = comments_api.submit_review,
+			fetch = reviews_api.fetch,
+			fetch_threads = reviews_api.fetch_threads,
+			fetch_review_context = reviews_api.fetch_context,
+			edit_review = reviews_api.edit_review,
+			start_review = reviews_api.start,
+			submit_review = reviews_api.submit,
+			approve = reviews_api.approve,
+			request_changes = reviews_api.request_changes,
+			discard_review = reviews_api.discard,
+			set_file_reviewed = reviews_api.set_file_reviewed,
 		},
-		repository = {
-			fetch_details = repositories_api.fetch_detail,
-			fetch_branches = repositories_api.fetch_branches,
-			fetch_tags = repositories_api.fetch_tags,
-		},
-		pipelines = {
-			fetch = checks_api.get_pipelines,
-			fetch_details = checks_api.get_pipeline_details,
-			fetch_job_log = checks_api.get_pipeline_job_log,
-			actions = require("atlas.pulls.providers.github.actions.pipelines"),
-		},
-		notifications = {
-			fetch = fetch_notifications,
-			mark_read = notifications_api.mark_read,
-			mark_done = notifications_api.mark_done,
-		},
-		search = search,
-		create = {
-			create_pr = pullrequests_api.create_pr,
-			fetch_default_reviewers = fetch_default_reviewers,
-		},
-		actions = actions,
+		-- tasks = {
+		-- 	add_task = nil,
+		-- 	edit_task = nil,
+		-- 	delete_task = nil,
+		-- },
+		pipelines = require("atlas.pulls.pipelines.github"),
 		ui = {
-			setup = require("atlas.pulls.providers.github.highlights").setup,
-			render = require("atlas.pulls.providers.github.ui.main").render,
-			panel = require("atlas.pulls.providers.github.ui.panel"),
-			repo_panel = require("atlas.pulls.providers.github.ui.repo_panel"),
+			detail = ui_detail,
+			repository = ui_repository,
 		},
 	},
 }

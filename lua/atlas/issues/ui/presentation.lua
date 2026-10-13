@@ -1,0 +1,62 @@
+local M = {}
+
+local highlights = require("atlas.ui.highlights")
+
+---@param author AtlasUser|nil
+---@return string
+function M.person_name(author)
+	if author == nil then
+		return "Unknown"
+	end
+	if author.name and author.name ~= "" then
+		return author.name
+	end
+	if author.username and author.username ~= "" then
+		return author.username
+	end
+	if author.id and author.id ~= "" then
+		return author.id
+	end
+	return "Unknown"
+end
+
+---@param key string|nil
+---@return string
+function M.issue_hl(key)
+	local lower = tostring(key or ""):lower()
+	if lower == "" or lower == "none" then
+		return "LineNr"
+	end
+	if lower:find("#", 1, true) then
+		return "AtlasTextMuted"
+	end
+
+	return "AtlasJiraKey"
+end
+
+---@param status_id string|nil
+---@return string
+function M.status_hl(status_id)
+	return highlights.dynamic_for_bg(status_id and ("jira-status:" .. status_id) or nil) or "AtlasTextMuted"
+end
+
+---@param name string|AtlasUser|nil
+---@return string
+function M.person_hl(name)
+	if type(name) == "table" then
+		name = name.name
+	end
+
+	if type(name) ~= "string" then
+		return "AtlasTextMuted"
+	end
+
+	local lower = vim.trim(name):lower()
+	if lower == "" or lower == "unassigned" or lower == "none" then
+		return "AtlasTextMuted"
+	end
+
+	return highlights.dynamic_for(lower) or "AtlasTextMuted"
+end
+
+return M

@@ -1,125 +1,242 @@
 local M = {}
 
-local cli = require("atlas.providers.github.client").pulls
+local cli = require("atlas.providers.github.client")
 local mapper = require("atlas.pulls.providers.github.api.mapper")
-local logger = require("atlas.core.logger")
-local memory_cache = require("atlas.core.memory_cache")
+local json = require("atlas.core.json")
+local request_scope = require("atlas.core.requests")
+local reviews_api = require("atlas.pulls.providers.github.api.reviews")
+
+---@param repo string
+---@param number integer|string
+local function invalidate_details(repo, number)
+	cli.delete_mem(string.format("github:pr:%s:%s", repo, tostring(number)))
+end
 
 local GET_PR_GQL = [[
 query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
-      id number title state isDraft viewerSubscription
-      createdAt updatedAt url body
-      reactionGroups { content reactors { totalCount } }
-      additions deletions changedFiles
-      reviewDecision
-      labels(first: 10) { nodes { name color } }
-      milestone { number title state }
-      latestOpinionatedReviews(last: 10) { nodes { state author { login } } }
-      assignees(first: 10) { nodes { login } }
-      author { login ... on User { name } }
-      headRefName baseRefName headRefOid baseRefOid
-		totalCommentsCount
-      commits(last: 1) {
-        nodes { commit { statusCheckRollup { state } } }
-      }
+      viewerSubscription body
+      labels(first: 100) { nodes { name color } }
+      assignees(first: 10) { nodes { id login name } }
     }
+  }
+}
+]]
+
+local PULL_REQUEST_FIELDS_GQL = [[
+fragment PullRequestFields on PullRequest {
+  id number title state isDraft reviewDecision
+  createdAt updatedAt url
+  additions deletions
+  author { login ... on User { name } }
+  headRefName baseRefName headRefOid baseRefOid
+  totalCommentsCount
+  repository { name nameWithOwner url sshUrl }
+  commits(last: 1) {
+    nodes { commit { statusCheckRollup { state } } }
   }
 }
 ]]
 
 local SEARCH_GQL = [[
-query($search: String!, $limit: Int!) {
-  search(query: $search, type: ISSUE, first: $limit) {
+query(
+  $query1: String!
+  $query2: String!
+  $query3: String!
+  $include1: Boolean!
+  $include2: Boolean!
+  $include3: Boolean!
+  $limit: Int!
+  $after1: String
+  $after2: String
+  $after3: String
+) {
+  search1: search(query: $query1, type: ISSUE, first: $limit, after: $after1) @include(if: $include1) {
+    issueCount
     nodes {
-      ... on PullRequest {
-        id number title state isDraft
-        createdAt updatedAt url
-        additions deletions
-        reactionGroups { content reactors { totalCount } }
-        latestOpinionatedReviews(last: 10) { nodes { state } }
-        author { login ... on User { name } }
-        headRefName baseRefName headRefOid baseRefOid
-		totalCommentsCount
-        repository { name nameWithOwner }
-        commits(last: 1) {
-          nodes { commit { statusCheckRollup { state } } }
-        }
-      }
+      ... on PullRequest { ...PullRequestFields }
     }
+    pageInfo { hasNextPage endCursor }
+  }
+  search2: search(query: $query2, type: ISSUE, first: $limit, after: $after2) @include(if: $include2) {
+    issueCount
+    nodes {
+      ... on PullRequest { ...PullRequestFields }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+  search3: search(query: $query3, type: ISSUE, first: $limit, after: $after3) @include(if: $include3) {
+    issueCount
+    nodes {
+      ... on PullRequest { ...PullRequestFields }
+    }
+    pageInfo { hasNextPage endCursor }
   }
 }
-]]
+]] .. PULL_REQUEST_FIELDS_GQL
 
----@param search string
----@param on_done fun(groups: PullsGroup[], err: string[]|nil)
----@param opts { force_load?: boolean, limit?: number }|nil
+---@param queries string[]
+---@param opts PullsFetchOpts
+---@param on_done fun(page: PullsPage, err: string[]|nil)
 ---@return { cancel: fun() }|nil
-function M.search_prs(search, on_done, opts)
-	opts = opts or {}
-	local limit = math.max(1, tonumber(opts.limit) or 50)
-	local cache_key = string.format("github:search:%s:limit:%d", search, limit)
+function M.fetch_search(queries, opts, on_done)
+	local cursor_key = opts.cursor == nil and "first" or vim.json.encode(opts.cursor)
+	local cache_key = string.format(
+		"github:pulls:search:v2:%s:limit:%d:cursor:%s",
+		vim.json.encode(queries),
+		opts.pagelen,
+		cursor_key
+	)
 
-	if not opts.force_load then
+	if not opts.force_refresh then
 		local cached, ok = cli.get_cache(cache_key)
 		if ok then
+			---@cast cached PullsPage
 			on_done(cached, nil)
 			return nil
 		end
 	end
 
-	return cli.gh({
+	local args = {
 		"api",
 		"graphql",
 		"-f",
 		"query=" .. vim.trim(SEARCH_GQL),
 		"-f",
-		"search=" .. search,
-		"-F",
-		"limit=" .. tostring(limit),
-	}, function(result, err)
-		if err then
-			on_done({}, { err })
+		"query1=" .. (queries[1] or ""),
+		"-f",
+		"query2=" .. (queries[2] or ""),
+		"-f",
+		"query3=" .. (queries[3] or ""),
+	}
+	local included = {}
+	for index = 1, 3 do
+		local key = tostring(index)
+		included[index] = queries[index] ~= nil and (opts.cursor == nil or opts.cursor[key] ~= nil)
+		vim.list_extend(args, { "-F", string.format("include%d=%s", index, tostring(included[index])) })
+		if opts.cursor ~= nil and opts.cursor[key] ~= nil then
+			vim.list_extend(args, { "-f", string.format("after%d=%s", index, opts.cursor[key]) })
+		end
+	end
+	vim.list_extend(args, { "-F", "limit=" .. tostring(opts.pagelen) })
+
+	return cli.gh(args, function(result, err)
+		if err or type(result) ~= "table" then
+			on_done({ items = {} }, { err or "Failed to search pull requests" })
 			return
 		end
 
-		local nodes = type(result) == "table"
-				and type(result.data) == "table"
-				and type(result.data.search) == "table"
-				and result.data.search.nodes
-			or nil
-
-		if type(nodes) ~= "table" then
-			on_done({}, nil)
-			return
+		local pulls = {}
+		local next_cursor = {}
+		local total_pages = 1
+		for index = 1, #queries do
+			if included[index] then
+				local search = result.data["search" .. index]
+				vim.list_extend(pulls, mapper.to_search_results_from_graphql(search.nodes))
+				total_pages = math.max(total_pages, math.ceil(math.min(search.issueCount, 1000) / opts.pagelen))
+				if search.pageInfo.hasNextPage then
+					next_cursor[tostring(index)] = search.pageInfo.endCursor
+				end
+			end
 		end
-
-		local prs = mapper.to_search_results_from_graphql(nodes)
-		local groups = mapper.to_pull_request_groups(prs)
-
-		cli.set_cache(cache_key, groups)
-		logger.loginfo("GitHub GraphQL search complete", { count = #prs, groups = #groups })
-		on_done(groups, nil)
+		table.sort(pulls, function(left, right)
+			return left.updated_on > right.updated_on
+		end)
+		if next(next_cursor) == nil then
+			next_cursor = nil
+		end
+		local page = { items = pulls, next_cursor = next_cursor, total_pages = total_pages }
+		cli.set_cache(cache_key, page)
+		on_done(page, nil)
 	end, {
 		action = "Search PRs",
-		search = search,
-		limit = limit,
+		queries = queries,
+		limit = opts.pagelen,
+	})
+end
+
+---@param refs PullRequestRef[]
+---@param _ PullsFetchOpts
+---@param on_done fun(pulls: PullRequest[], err: string|nil)
+---@return { cancel: fun() }|nil
+function M.fetch_by_refs(refs, _, on_done)
+	if #refs == 0 then
+		on_done({}, nil)
+		return nil
+	end
+
+	local variables = {}
+	local selections = {}
+	local args = { "api", "graphql" }
+	for index, ref in ipairs(refs) do
+		local owner, repo = ref.repo_full_name:match("^([^/]+)/(.+)$")
+		if owner == nil or repo == nil then
+			on_done({}, "Missing repository info")
+			return nil
+		end
+		table.insert(variables, string.format("$owner%d: String!", index))
+		table.insert(variables, string.format("$repo%d: String!", index))
+		table.insert(variables, string.format("$number%d: Int!", index))
+		table.insert(
+			selections,
+			string.format(
+				"  item%d: repository(owner: $owner%d, name: $repo%d) { pullRequest(number: $number%d) { ...PullRequestFields } }",
+				index,
+				index,
+				index,
+				index
+			)
+		)
+		table.insert(args, "-f")
+		table.insert(args, string.format("owner%d=%s", index, owner))
+		table.insert(args, "-f")
+		table.insert(args, string.format("repo%d=%s", index, repo))
+		table.insert(args, "-F")
+		table.insert(args, string.format("number%d=%s", index, tostring(ref.id)))
+	end
+
+	local query = string.format(
+		"query(%s) {\n%s\n}\n%s",
+		table.concat(variables, ", "),
+		table.concat(selections, "\n"),
+		PULL_REQUEST_FIELDS_GQL
+	)
+	table.insert(args, "-f")
+	table.insert(args, "query=" .. query)
+
+	return cli.gh(args, function(result, err)
+		if err or type(result) ~= "table" then
+			on_done({}, err or "Failed to fetch pull requests")
+			return
+		end
+
+		local nodes = {}
+		for index = 1, #refs do
+			local repository = result.data["item" .. index]
+			if type(repository) == "table" and type(repository.pullRequest) == "table" then
+				table.insert(nodes, repository.pullRequest)
+			end
+		end
+		on_done(mapper.to_search_results_from_graphql(nodes), nil)
+	end, {
+		action = "Fetch PRs by refs",
+		count = #refs,
 	})
 end
 
 ---@param owner string
 ---@param repo string
 ---@param number number|string
----@param on_done fun(pr: PullRequest|nil, err: string|nil)
----@param opts { force_load?: boolean }|nil
+---@param on_done fun(details: PullRequestDetails|nil, err: string|nil)
+---@param opts { force_refresh?: boolean }|nil
 ---@return { job_id: integer, cancel: fun() }|nil
 function M.get_pr(owner, repo, number, on_done, opts)
 	opts = opts or {}
 	local repo_slug = string.format("%s/%s", owner, repo)
 	local cache_key = string.format("github:pr:%s:%s", repo_slug, tostring(number))
 
-	if not opts.force_load then
+	if not opts.force_refresh then
 		local cached, ok = cli.get_mem(cache_key)
 		if ok then
 			on_done(cached, nil)
@@ -139,25 +256,23 @@ function M.get_pr(owner, repo, number, on_done, opts)
 		"-F",
 		"number=" .. tostring(number),
 	}, function(result, err)
-		if err or not result or type(result) ~= "table" then
+		if err or type(result) ~= "table" then
 			on_done(nil, err or "Failed to fetch PR")
 			return
 		end
 
-		local pr_raw = type(result.data) == "table"
-			and type(result.data.repository) == "table"
-			and result.data.repository.pullRequest
-		if type(pr_raw) ~= "table" then
+		local repository = json.nilify(result.data.repository)
+		local pr_raw = repository and json.nilify(repository.pullRequest)
+		if not pr_raw then
 			on_done(nil, "PR not found")
 			return
 		end
 
-		pr_raw.repository = { name = repo, nameWithOwner = repo_slug }
-		local pr = mapper.to_pull_request(pr_raw)
-		cli.set_mem(cache_key, pr)
-		on_done(pr, nil)
+		local details = mapper.to_pull_request_details(pr_raw)
+		cli.set_mem(cache_key, details, cli.cache_ttl())
+		on_done(details, nil)
 	end, {
-		action = "Fetch PR",
+		action = "Fetch PR details",
 		repo = repo_slug,
 		number = number,
 	})
@@ -210,6 +325,99 @@ function M.get_description(pr, opts, on_done)
 	})
 end
 
+---@param pr GitHubPullRequest
+---@param subscribed boolean
+---@param on_done fun(subscribed: boolean|nil, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.set_subscription(pr, subscribed, on_done)
+	local node_id = pr.node_id or ""
+	local state = subscribed and "SUBSCRIBED" or "UNSUBSCRIBED"
+	local gql =
+		"mutation($id: ID!, $state: SubscriptionState!) { updateSubscription(input: { subscribableId: $id, state: $state }) { subscribable { ... on PullRequest { viewerSubscription } } } }"
+	return cli.gh(
+		{ "api", "graphql", "-F", "id=" .. node_id, "-f", "state=" .. state, "-f", "query=" .. gql },
+		function(_, err)
+			if err then
+				on_done(nil, err)
+				return
+			end
+			on_done(subscribed, nil)
+		end,
+		{
+			action = subscribed and "Subscribe to PR" or "Unsubscribe from PR",
+			repo = pr.repo_full_name,
+			number = pr.id,
+		}
+	)
+end
+
+---@param pr PullRequest
+---@param opts PullsMergeOpts
+---@param on_done fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.merge(pr, opts, on_done)
+	local args = { "pr", "merge", tostring(pr.id), "--repo", pr.repo_full_name, "--" .. opts.method }
+	if opts.delete_source_branch then
+		table.insert(args, "--delete-branch")
+	end
+	if opts.subject ~= nil then
+		vim.list_extend(args, { "--subject", opts.subject })
+	end
+	if opts.body ~= nil then
+		vim.list_extend(args, { "--body", opts.body })
+	end
+	return cli.gh(args, function(_, err)
+		on_done(not err, err)
+	end, {
+		action = "Merge PR",
+		repo = pr.repo_full_name,
+		number = pr.id,
+		method = opts.method,
+	})
+end
+
+---@param pr PullRequest
+---@param on_done fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.reopen(pr, on_done)
+	return cli.gh({ "pr", "reopen", tostring(pr.id), "--repo", pr.repo_full_name }, function(_, err)
+		on_done(not err, err)
+	end, {
+		action = "Reopen PR",
+		repo = pr.repo_full_name,
+		number = pr.id,
+	})
+end
+
+---@param pr PullRequest
+---@param adds string[]
+---@param removes string[]
+---@param on_done fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.update_assignees(pr, adds, removes, on_done)
+	local args = { "pr", "edit", tostring(pr.id), "--repo", pr.repo_full_name }
+	for _, login in ipairs(adds) do
+		table.insert(args, "--add-assignee")
+		table.insert(args, login)
+	end
+	for _, login in ipairs(removes) do
+		table.insert(args, "--remove-assignee")
+		table.insert(args, login)
+	end
+	return cli.gh(args, function(_, err)
+		if not err then
+			invalidate_details(pr.repo_full_name, pr.id)
+		end
+		on_done(not err, err)
+	end, {
+		action = "Update PR assignees",
+		repo = pr.repo_full_name,
+		number = pr.id,
+		added = #adds,
+		removed = #removes,
+	})
+end
+
 ---@param pr PullRequest
 ---@param title string
 ---@param on_done fun(ok: boolean, err: string|nil)
@@ -236,7 +444,7 @@ function M.update_title(pr, title, on_done)
 			on_done(false, err)
 			return
 		end
-		memory_cache.delete(string.format("github:pr:%s:%s", repo_slug, tostring(pr.id)))
+		invalidate_details(repo_slug, pr.id)
 		on_done(true, nil)
 	end, {
 		action = "Update PR title",
@@ -245,261 +453,372 @@ function M.update_title(pr, title, on_done)
 	})
 end
 
----@return { login: string, state: "APPROVED"|"CHANGES_REQUESTED"|"COMMENTED"|"DISMISSED" }[], string[]
-local function parse_reviews(result)
-	local latest = {}
-	local order = {}
-	for _, review in ipairs(result.reviews or {}) do
-		local login = type(review.author) == "table" and tostring(review.author.login or "") or ""
-		local state = tostring(review.state or ""):upper()
-		if login ~= "" and state ~= "PENDING" then
-			local at = tostring(review.submittedAt or "")
-			local prev = latest[login]
-			if prev == nil then
-				table.insert(order, login)
-				latest[login] = { state = state, at = at }
-			elseif at >= prev.at then
-				latest[login] = { state = state, at = at }
-			end
-		end
-	end
-
-	local reviews = {}
-	for _, login in ipairs(order) do
-		table.insert(reviews, { login = login, state = latest[login].state })
-	end
-
-	local pending = {}
-	for _, req in ipairs(result.reviewRequests or {}) do
-		local login = type(req) == "table" and tostring(req.login or "") or ""
-		if login ~= "" and latest[login] == nil then
-			table.insert(pending, login)
-		end
-	end
-
-	return reviews, pending
-end
-
 ---@param pr PullRequest
----@param opts { force_refresh: boolean|nil }|nil
----@param on_done fun(reviewers: PullsReviewer[]|nil, err: string|nil)
+---@param draft boolean
+---@param on_done fun(ok: boolean, err: string|nil)
 ---@return { cancel: fun() }|nil
-function M.get_reviewers(pr, opts, on_done)
+function M.set_draft(pr, draft, on_done)
 	local repo_slug = pr.repo_full_name or ""
 	if repo_slug == "" then
 		vim.schedule(function()
-			on_done(nil, "Missing repo")
+			on_done(false, "Missing repo")
 		end)
 		return nil
 	end
 
-	local cache_key = string.format("github:reviewers:%s:%s", repo_slug, tostring(pr.id))
-	opts = opts or {}
+	local args = {
+		"pr",
+		"ready",
+		tostring(pr.id),
+		"--repo",
+		repo_slug,
+	}
+	if draft then
+		table.insert(args, "--undo")
+	end
 
-	if not opts.force_refresh then
-		local cached, ok = cli.get_mem(cache_key)
-		if ok then
-			on_done(cached, nil)
-			return nil
+	return cli.gh(args, function(_, err)
+		if err then
+			on_done(false, err)
+			return
 		end
+		invalidate_details(repo_slug, pr.id)
+		on_done(true, nil)
+	end, {
+		action = draft and "Convert PR to draft" or "Mark PR ready for review",
+		repo = repo_slug,
+		number = pr.id,
+	})
+end
+
+---@param pr PullRequest
+---@param description string
+---@param on_done fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.update_description(pr, description, on_done)
+	local repo_slug = pr.repo_full_name or ""
+	if repo_slug == "" then
+		vim.schedule(function()
+			on_done(false, "Missing repo")
+		end)
+		return nil
 	end
 
 	return cli.gh({
 		"pr",
-		"view",
+		"edit",
 		tostring(pr.id),
 		"--repo",
 		repo_slug,
-		"--json",
-		"reviews,reviewRequests",
-	}, function(result, err)
-		if err or type(result) ~= "table" then
-			on_done(nil, err or "Failed to fetch reviewers")
+		"--body",
+		description,
+	}, function(_, err)
+		if err then
+			on_done(false, err)
 			return
 		end
+		invalidate_details(repo_slug, pr.id)
+		cli.delete_mem(string.format("github:desc:%s:%s", repo_slug, tostring(pr.id)))
+		on_done(true, nil)
+	end, {
+		action = "Update PR description",
+		repo = repo_slug,
+		number = pr.id,
+	})
+end
 
-		local reviews, pending = parse_reviews(result)
+---@param pr PullRequest
+---@param on_done fun(ok: boolean, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.decline(pr, on_done)
+	local repo_slug = pr.repo_full_name or ""
+	if repo_slug == "" then
+		on_done(false, "Missing repo")
+		return nil
+	end
+	return cli.gh({
+		"pr",
+		"close",
+		tostring(pr.id),
+		"--repo",
+		repo_slug,
+	}, function(_, err)
+		if err then
+			on_done(false, err)
+			return
+		end
+		invalidate_details(repo_slug, pr.id)
+		on_done(true, nil)
+	end, {
+		action = "Decline PR",
+		repo = repo_slug,
+		number = pr.id,
+	})
+end
+
+---@param opts { repo_slug: string, pr: PullRequest|nil }
+---@param on_done fun(reviewers: PullsReviewerCandidate[]|nil, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.fetch_reviewer_candidates(opts, on_done)
+	local slug = tostring(opts.repo_slug or "")
+	if slug == "" then
+		vim.schedule(function()
+			on_done(nil, "Missing repo slug")
+		end)
+		return nil
+	end
+
+	local starts = {
+		collaborators = function(done)
+			return cli.gh(
+				{ "api", "--paginate", "--slurp", string.format("repos/%s/collaborators?per_page=100", slug) },
+				function(result, err)
+					if err or type(result) ~= "table" then
+						done(nil, err or "Failed to fetch repository collaborators")
+						return
+					end
+					done(result, nil)
+				end,
+				{ action = "Fetch reviewer candidates", repo = slug }
+			)
+		end,
+	}
+	if opts.pr then
+		starts.current = function(done)
+			return reviews_api.fetch_reviewers(opts.pr, { force_refresh = true }, done)
+		end
+	end
+
+	local requests = request_scope.new()
+	requests.all(starts, function(results, errors)
+		local err = errors.collaborators or errors.current
+		if err then
+			on_done(nil, err)
+			return
+		end
 
 		local reviewers = {}
-		for _, r in ipairs(reviews) do
-			local decision = "pending"
-			if r.state == "APPROVED" then
-				decision = "approved"
-			elseif r.state == "CHANGES_REQUESTED" then
-				decision = "changes_requested"
+		local by_login = {}
+		for _, page in ipairs(results.collaborators or {}) do
+			for _, raw in ipairs(page) do
+				local login = tostring(raw.login or "")
+				if login ~= "" then
+					local reviewer = {
+						label = "@" .. login,
+						provider_id = login,
+						selected = false,
+					}
+					by_login[login] = reviewer
+					table.insert(reviewers, reviewer)
+				end
 			end
-			table.insert(reviewers, { name = r.login, nickname = r.login, decision = decision })
-		end
-		for _, login in ipairs(pending) do
-			table.insert(reviewers, { name = login, nickname = login, decision = "pending" })
 		end
 
-		cli.set_mem(cache_key, reviewers)
+		for _, item in ipairs(results.current or {}) do
+			local login = item.role == "reviewer" and item.username or ""
+			if login ~= "" then
+				local reviewer = by_login[login]
+				if reviewer then
+					reviewer.selected = true
+				else
+					table.insert(reviewers, {
+						label = "@" .. login,
+						provider_id = login,
+						selected = true,
+					})
+				end
+			end
+		end
 		on_done(reviewers, nil)
-	end, {
-		action = "Fetch PR reviewers",
-		repo = repo_slug,
-		number = pr.id,
-	})
-end
-
----@param raw table|nil
----@return PullsAuthor|nil
-local function review_author(raw)
-	if type(raw) ~= "table" then
-		return nil
-	end
-	local login = tostring(raw.login or "")
-	if login == "" then
-		return nil
-	end
-	return {
-		id = tostring(raw.id or login),
-		name = tostring(raw.name or login),
-		username = login,
-		nickname = login,
-	}
+	end)
+	return requests
 end
 
 ---@param pr PullRequest
----@param opts { force_refresh: boolean|nil }|nil
----@param on_done fun(context: { authors: PullsAuthor[] }|nil, err: string|nil)
+---@param selected PullsReviewerCandidate[]
+---@param original PullsReviewerCandidate[]
+---@param on_done fun(ok: boolean, err: string|nil)
 ---@return { cancel: fun() }|nil
-function M.get_review_context(pr, opts, on_done)
+function M.update_reviewers(pr, selected, original, on_done)
 	local repo_slug = pr.repo_full_name or ""
 	if repo_slug == "" then
 		vim.schedule(function()
-			on_done(nil, "Missing repo")
+			on_done(false, "Missing repo")
 		end)
 		return nil
 	end
 
-	local cache_key = string.format("github:review-context:%s:%s", repo_slug, tostring(pr.id))
-	opts = opts or {}
-	if not opts.force_refresh then
-		local cached, ok = cli.get_mem(cache_key)
-		if ok then
-			on_done(cached, nil)
-			return nil
+	local selected_set = {}
+	for _, reviewer in ipairs(selected) do
+		selected_set[reviewer.provider_id] = true
+	end
+
+	local original_set = {}
+	for _, reviewer in ipairs(original) do
+		original_set[reviewer.provider_id] = true
+	end
+
+	local added = {}
+	for _, reviewer in ipairs(selected) do
+		if not original_set[reviewer.provider_id] then
+			table.insert(added, reviewer.provider_id)
 		end
 	end
 
-	return cli.gh({
-		"pr",
-		"view",
-		tostring(pr.id),
-		"--repo",
-		repo_slug,
-		"--json",
-		"assignees,reviews,reviewRequests",
-	}, function(result, err)
-		if err or type(result) ~= "table" then
-			on_done(nil, err or "Failed to fetch review context")
+	local removed = {}
+	for _, reviewer in ipairs(original) do
+		if not selected_set[reviewer.provider_id] then
+			table.insert(removed, reviewer.provider_id)
+		end
+	end
+
+	if #added == 0 and #removed == 0 then
+		on_done(true, nil)
+		return nil
+	end
+
+	local args = { "pr", "edit", tostring(pr.id), "--repo", repo_slug }
+	for _, login in ipairs(added) do
+		table.insert(args, "--add-reviewer")
+		table.insert(args, login)
+	end
+	for _, login in ipairs(removed) do
+		table.insert(args, "--remove-reviewer")
+		table.insert(args, login)
+	end
+
+	return cli.gh(args, function(_, err)
+		if err then
+			on_done(false, err)
 			return
 		end
-
-		local authors = {}
-		local seen = {}
-		---@param author PullsAuthor|nil
-		local function add(author)
-			if author == nil then
-				return
-			end
-			local key = tostring(author.username or author.nickname or author.name or ""):lower()
-			if key == "" or seen[key] then
-				return
-			end
-			seen[key] = true
-			table.insert(authors, author)
-		end
-
-		add(pr.author)
-		for _, raw in ipairs(result.assignees or {}) do
-			add(review_author(raw))
-		end
-		for _, raw in ipairs(result.reviews or {}) do
-			add(review_author(type(raw) == "table" and raw.author or nil))
-		end
-		for _, raw in ipairs(result.reviewRequests or {}) do
-			local requested = type(raw) == "table" and (raw.requestedReviewer or raw) or nil
-			add(review_author(requested))
-		end
-
-		local context = { authors = authors }
-		cli.set_mem(cache_key, context)
-		on_done(context, nil)
+		invalidate_details(repo_slug, pr.id)
+		cli.delete_mem(string.format("github:review-context:%s:%s", repo_slug, tostring(pr.id)))
+		cli.delete_mem(string.format("github:review-details:%s:%s", repo_slug, tostring(pr.id)))
+		cli.delete_mem(string.format("github:reviewers:%s:%s", repo_slug, tostring(pr.id)))
+		cli.delete_mem(string.format("github:merge-checks:%s:%s", repo_slug, tostring(pr.id)))
+		on_done(true, nil)
 	end, {
-		action = "Fetch PR review context",
+		action = "Update PR reviewers",
 		repo = repo_slug,
 		number = pr.id,
+		added = #added,
+		removed = #removed,
 	})
 end
 
 ---@param pr PullRequest
----@param opts { force_refresh: boolean|nil }|nil
----@param on_done fun(entries: PullsDiffstatEntry[]|nil, err: string|nil)
----@return { cancel: fun() }|nil
-function M.get_diffstat(pr, opts, on_done)
-	local repo_slug = pr.repo_full_name or ""
-	if repo_slug == "" then
-		vim.schedule(function()
-			on_done(nil, "Missing repo")
-		end)
-		return nil
-	end
-
-	local cache_key = string.format("github:diffstat:%s:%s", repo_slug, tostring(pr.id))
-	opts = opts or {}
-
-	if not opts.force_refresh then
-		local cached, ok = cli.get_mem(cache_key)
-		if ok then
-			on_done(cached, nil)
-			return nil
-		end
-	end
-
-	return cli.gh({
-		"pr",
-		"view",
-		tostring(pr.id),
-		"--repo",
-		repo_slug,
-		"--json",
-		"files",
-	}, function(result, err)
-		if err or type(result) ~= "table" then
-			on_done(nil, err or "Failed to fetch files")
+---@param selected PullsReviewerCandidate[]
+---@param on_done fun(ok: boolean, err: string|nil)
+---@return AtlasRequestScope
+local function replace_reviewers(pr, selected, on_done)
+	local requests = request_scope.new()
+	requests.run(function(done)
+		return reviews_api.fetch_reviewers(pr, { force_refresh = true }, done)
+	end, function(reviewers, err)
+		if err then
+			on_done(false, err)
 			return
 		end
 
-		local entries = {}
-		for _, file in ipairs(result.files or {}) do
-			local additions = tonumber(file.additions) or 0
-			local deletions = tonumber(file.deletions) or 0
-			local status = "modified"
-			if additions > 0 and deletions == 0 then
-				status = "added"
-			elseif additions == 0 and deletions > 0 then
-				status = "removed"
+		local original = {}
+		for _, reviewer in ipairs(reviewers) do
+			if reviewer.role == "reviewer" then
+				original[#original + 1] = { label = reviewer.name, provider_id = reviewer.username }
 			end
-
-			table.insert(entries, {
-				status = status,
-				path = tostring(file.path or ""),
-				old_path = nil,
-				lines_added = additions,
-				lines_removed = deletions,
-			})
 		end
+		requests.run(function(done)
+			return M.update_reviewers(pr, selected, original, done)
+		end, on_done)
+	end)
+	return requests
+end
 
-		cli.set_mem(cache_key, entries)
-		on_done(entries, nil)
-	end, {
-		action = "Fetch PR diffstat",
-		repo = repo_slug,
-		number = pr.id,
-	})
+---@param pr PullRequest
+---@param opts PullsUpdatePROpts
+---@param on_done fun(ok: boolean, err: string|nil)
+---@return AtlasRequestScope
+function M.update_pr(pr, opts, on_done)
+	local requests = request_scope.new()
+	local updates = {}
+	local context = { action = "Update PR", repo = pr.repo_full_name, number = pr.id }
+	local args = { "pr", "edit", tostring(pr.id), "--repo", pr.repo_full_name }
+	for _, field in ipairs({ "title", "body", "base" }) do
+		if opts[field] ~= nil then
+			args[#args + 1] = "--" .. field
+			args[#args + 1] = opts[field]
+		end
+	end
+	if #args > 5 then
+		updates[#updates + 1] = function(done)
+			return cli.gh(args, function(_, err)
+				if not err then
+					invalidate_details(pr.repo_full_name, pr.id)
+					if opts.body ~= nil then
+						cli.delete_mem(string.format("github:desc:%s:%s", pr.repo_full_name, tostring(pr.id)))
+					end
+				end
+				done(not err, err)
+			end, context)
+		end
+	end
+
+	if opts.labels ~= nil or opts.assignees ~= nil then
+		local fields = { "api", "-X", "PATCH", string.format("repos/%s/issues/%s", pr.repo_full_name, pr.id) }
+		for _, field in ipairs({ "labels", "assignees" }) do
+			local values = opts[field]
+			if field == "assignees" and values then
+				values = vim.tbl_map(function(user)
+					return user.username
+				end, values)
+			end
+			if values then
+				if #values == 0 then
+					fields[#fields + 1] = "-f"
+					fields[#fields + 1] = field .. "[]"
+				end
+				for _, value in ipairs(values) do
+					fields[#fields + 1] = "-f"
+					fields[#fields + 1] = field .. "[]=" .. value
+				end
+			end
+		end
+		updates[#updates + 1] = function(done)
+			return cli.gh(fields, function(_, err)
+				if not err then
+					invalidate_details(pr.repo_full_name, pr.id)
+				end
+				done(not err, err)
+			end, context)
+		end
+	end
+
+	if opts.draft ~= nil and opts.draft ~= (pr.state == "draft") then
+		updates[#updates + 1] = function(done)
+			return M.set_draft(pr, opts.draft, done)
+		end
+	end
+	if opts.reviewers ~= nil then
+		updates[#updates + 1] = function(done)
+			return replace_reviewers(pr, opts.reviewers, done)
+		end
+	end
+
+	local function update_next(index)
+		if not updates[index] then
+			on_done(true, nil)
+			return
+		end
+		requests.run(updates[index], function(ok, err)
+			if not ok then
+				on_done(false, err)
+				return
+			end
+			update_next(index + 1)
+		end)
+	end
+	update_next(1)
+	return requests
 end
 
 ---@param opts PullsCreatePROpts
@@ -543,13 +862,10 @@ function M.create_pr(opts, on_done)
 			return
 		end
 
-		-- gh prints the new PR URL on stdout. result is either a parsed table
-		-- (unlikely here) or a string (the URL). Trim and surface it.
 		local url = nil
 		local id = nil
 		if type(result) == "string" then
 			url = vim.trim(result)
-			-- last segment of /pull/<id>
 			id = url:match("/pull/(%d+)")
 			if id then
 				id = tonumber(id) or id
@@ -567,10 +883,10 @@ function M.create_pr(opts, on_done)
 end
 
 ---@param slug string
----@param on_done fun(labels: table[]|nil, err: string|nil)
+---@param on_done fun(labels: PullsLabel[]|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
 function M.list_labels(slug, on_done)
-	if type(slug) ~= "string" or slug == "" then
+	if slug == "" then
 		vim.schedule(function()
 			on_done(nil, "Missing repository slug")
 		end)
@@ -580,21 +896,22 @@ function M.list_labels(slug, on_done)
 	return cli.gh({
 		"api",
 		"--paginate",
+		"--slurp",
 		string.format("repos/%s/labels?per_page=100", slug),
 	}, function(result, err)
-		if err then
-			on_done(nil, err)
+		if err or type(result) ~= "table" then
+			on_done(nil, err or "Failed to fetch labels")
 			return
 		end
 
 		local list = {}
-		if type(result) == "table" then
-			for _, raw in ipairs(result) do
-				if type(raw) == "table" and type(raw.name) == "string" then
+		for _, page in ipairs(result) do
+			for _, raw in ipairs(page) do
+				local name = json.safe_str(raw.name)
+				if name then
 					table.insert(list, {
-						name = raw.name,
-						color = type(raw.color) == "string" and raw.color or nil,
-						description = type(raw.description) == "string" and raw.description or nil,
+						name = name,
+						color = json.safe_str(raw.color),
 					})
 				end
 			end
@@ -634,6 +951,7 @@ function M.update_labels(slug, number, diff, on_done)
 			on_done(false, err)
 			return
 		end
+		invalidate_details(slug, number)
 		on_done(true, nil)
 	end, {
 		action = "Update PR labels",

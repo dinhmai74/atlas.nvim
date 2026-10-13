@@ -1,18 +1,10 @@
 local M = {}
 
-local service = require("atlas.pulls.providers.bitbucket.api.service")
+local service = require("atlas.providers.bitbucket.client")
 local mapper = require("atlas.pulls.providers.bitbucket.api.mapper")
 
----@param workspace string
----@param repo string
----@param pr_id string|number
----@return string
-local function task_cache_key(workspace, repo, pr_id)
-	return string.format("bitbucket:pr:tasks:%s/%s/%s", tostring(workspace), tostring(repo), tostring(pr_id))
-end
-
 ---@param raw_content string
----@param opts? { parent_id?: number|string|nil, inline?: { from?: number, to?: number, start_from?: number, start_to?: number, path?: string }|nil, pending?: boolean|nil }
+---@param opts? { parent_id?: number|string|nil, file?: PullsFileCommentPosition|nil, inline?: { from?: number, to?: number, start_from?: number, start_to?: number, path?: string }|nil, pending?: boolean|nil }
 ---@return string
 local function encode_comment_payload(raw_content, opts)
 	opts = opts or {}
@@ -35,6 +27,8 @@ local function encode_comment_payload(raw_content, opts)
 			start_to = opts.inline.start_to,
 			path = opts.inline.path,
 		}
+	elseif opts.file then
+		payload.inline = { path = opts.file.path }
 	end
 
 	return vim.json.encode(payload)
@@ -42,11 +36,12 @@ end
 
 ---@param pr PullRequest
 ---@param opts { force_refresh: boolean|nil }|nil
+---@param query string|nil
 ---@param on_done fun(comments: PullsComment[]|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
-function M.fetch_comments(pr, opts, on_done)
-	local raw = pr._raw
-	local comments_url = tostring((raw.links or {}).comments or "")
+local function fetch_comments(pr, opts, query, on_done)
+	---@cast pr BitbucketPullRequest
+	local comments_url = tostring(pr.links.comments or "")
 	if comments_url == "" then
 		on_done({}, nil)
 		return nil
@@ -54,7 +49,11 @@ function M.fetch_comments(pr, opts, on_done)
 
 	local force = (opts or {}).force_refresh == true
 	local sep = comments_url:find("?") and "&" or "?"
-	local url = string.format("%s%spagelen=%d", comments_url, sep, 100)
+	local fields = "%2Bvalues.resolution.user%2C%2Bvalues.resolution.created_on"
+		.. "%2C%2Bvalues.inline.*%2C-values.inline.context_lines"
+		.. "%2C-values.inline.src_rev%2C-values.inline.dest_rev%2C-values.inline.base_rev"
+	local filter = query and "&q=" .. query or ""
+	local url = string.format("%s%spagelen=%d&fields=%s%s", comments_url, sep, 100, fields, filter)
 	local key = "bitbucket:pr:comments:" .. url
 	if not force then
 		local cached, ok = service.get_cache(key)
@@ -70,9 +69,25 @@ function M.fetch_comments(pr, opts, on_done)
 			return
 		end
 		local comments = mapper.to_comments_list(result)
-		service.set_cache(key, comments, service.cache_ttl())
+		service.set_cache(key, comments)
 		on_done(comments, nil)
-	end)
+	end, { action = "Fetch PR comments", repo = pr.repo_full_name, id = pr.id })
+end
+
+---@param pr PullRequest
+---@param opts { force_refresh: boolean|nil }|nil
+---@param on_done fun(comments: PullsComment[]|nil, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.fetch_comments(pr, opts, on_done)
+	return fetch_comments(pr, opts, nil, on_done)
+end
+
+---@param pr PullRequest
+---@param opts { force_refresh: boolean|nil }|nil
+---@param on_done fun(comments: PullsComment[]|nil, err: string|nil)
+---@return { cancel: fun() }|nil
+function M.fetch_global_comments(pr, opts, on_done)
+	return fetch_comments(pr, opts, "inline.path%20%3D%20null", on_done)
 end
 
 ---@param pr PullRequest
@@ -81,8 +96,8 @@ end
 ---@param on_done fun(comment: PullsComment|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
 function M.add_comment(pr, content, opts, on_done)
-	local raw = pr._raw
-	local comments_url = tostring((raw.links or {}).comments or "")
+	---@cast pr BitbucketPullRequest
+	local comments_url = tostring(pr.links.comments or "")
 	if comments_url == "" then
 		on_done(nil, "No comments URL available")
 		return nil
@@ -91,8 +106,9 @@ function M.add_comment(pr, content, opts, on_done)
 	local parent = opts and opts.parent or nil
 	local body = encode_comment_payload(content, {
 		parent_id = parent and (parent.parent_id or parent.id) or nil,
+		file = opts and opts.file or nil,
 		inline = opts and opts.inline or nil,
-		pending = (opts and opts.pending == true) or (parent ~= nil and parent.state == "PENDING"),
+		pending = (opts and opts.pending == true) or (parent ~= nil and parent.pending == true),
 	})
 	return service.request("POST", comments_url, nil, body, function(result, err)
 		if err then
@@ -106,7 +122,7 @@ function M.add_comment(pr, content, opts, on_done)
 			return
 		end
 		on_done(comment, nil)
-	end)
+	end, { action = "Add PR comment", repo = pr.repo_full_name, id = pr.id })
 end
 
 ---@param pr PullRequest
@@ -114,8 +130,8 @@ end
 ---@param on_done fun(comment: PullsComment|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
 function M.edit_comment(pr, comment, on_done)
-	local raw = pr._raw
-	local comments_url = tostring((raw.links or {}).comments or "")
+	---@cast pr BitbucketPullRequest
+	local comments_url = tostring(pr.links.comments or "")
 	if comments_url == "" then
 		on_done(nil, "No comments URL available")
 		return nil
@@ -134,8 +150,10 @@ function M.edit_comment(pr, comment, on_done)
 			on_done(nil, "Bitbucket did not return the updated comment")
 			return
 		end
-		on_done(updated, nil)
-	end)
+		local merged = vim.tbl_extend("force", {}, comment, updated)
+		merged.content_display = updated.content_display
+		on_done(merged, nil)
+	end, { action = "Edit PR comment", repo = pr.repo_full_name, id = pr.id, comment_id = comment.id })
 end
 
 ---@param pr PullRequest
@@ -143,8 +161,8 @@ end
 ---@param on_done fun(ok: boolean, err: string|nil)
 ---@return { cancel: fun() }|nil
 function M.delete_comment(pr, comment, on_done)
-	local raw = pr._raw
-	local comments_url = tostring((raw.links or {}).comments or "")
+	---@cast pr BitbucketPullRequest
+	local comments_url = tostring(pr.links.comments or "")
 	if comments_url == "" then
 		on_done(false, "No comments URL available")
 		return nil
@@ -158,164 +176,34 @@ function M.delete_comment(pr, comment, on_done)
 		end
 		service.clear_cache()
 		on_done(true, nil)
-	end)
+	end, { action = "Delete PR comment", repo = pr.repo_full_name, id = pr.id, comment_id = comment.id })
 end
 
 ---@param pr PullRequest
----@param comment_id number|string
+---@param root PullsComment
 ---@param resolved boolean
 ---@param on_done fun(ok: boolean, err: string|nil)
 ---@return { cancel: fun() }|nil
-function M.set_thread_resolved(pr, comment_id, resolved, on_done)
-	local raw = pr._raw
-	local comments_url = tostring((raw.links or {}).comments or "")
+function M.set_thread_resolved(pr, root, resolved, on_done)
+	---@cast pr BitbucketPullRequest
+	local comments_url = tostring(pr.links.comments or "")
 	if comments_url == "" then
 		on_done(false, "No comments URL available")
 		return nil
 	end
 
-	local url = string.format("%s/%s/resolve", comments_url, tostring(comment_id))
+	local url = string.format("%s/%s/resolve", comments_url, tostring(root.parent_id or root.id))
 	return service.request_text(resolved and "POST" or "DELETE", url, nil, nil, function(_, err)
 		if not err then
 			service.clear_cache()
 		end
 		on_done(err == nil, err)
-	end)
-end
-
----@param workspace string
----@param repo string
----@param pr_id string|number
----@param opts? { force_refresh?: boolean }
----@param on_done fun(tasks: PullsComment[]|nil, err: string|nil)
----@return { cancel: fun() }|nil
-function M.fetch_tasks(workspace, repo, pr_id, opts, on_done)
-	opts = opts or {}
-
-	local ws = tostring(workspace or "")
-	local rp = tostring(repo or "")
-	local id = tostring(pr_id or "")
-	if ws == "" or rp == "" or id == "" then
-		on_done(nil, "Missing Bitbucket PR task endpoint params")
-		return nil
-	end
-
-	local endpoint = string.format("/repositories/%s/%s/pullrequests/%s/tasks", ws, rp, id)
-	local sep = endpoint:find("?") and "&" or "?"
-	local url = string.format("%s%spagelen=100", endpoint, sep)
-	local key = task_cache_key(ws, rp, id)
-	if opts.force_refresh ~= true then
-		local cached, ok = service.get_cache(key)
-		if ok then
-			on_done(cached, nil)
-			return nil
-		end
-	end
-
-	return service.fetch_all_values(url, function(result, err)
-		if err then
-			on_done(nil, err)
-			return
-		end
-
-		local tasks = mapper.to_tasks_list(result)
-		service.set_cache(key, tasks, service.cache_ttl())
-		on_done(tasks, nil)
-	end)
-end
-
----@param task_url string
----@param opts { state?: "RESOLVED"|"UNRESOLVED"|string, content_raw?: string }|nil
----@param on_done fun(task: PullsComment|nil, err: string|nil)
----@return { cancel: fun() }|nil
-function M.update_task(task_url, opts, on_done)
-	opts = opts or {}
-
-	local url = tostring(task_url or "")
-	if url == "" then
-		on_done(nil, "Missing Bitbucket task URL")
-		return nil
-	end
-
-	local payload = {}
-	if opts.content_raw ~= nil and opts.content_raw ~= "" then
-		payload.content = { raw = opts.content_raw }
-	end
-	if opts.state ~= nil and opts.state ~= "" then
-		payload.state = opts.state
-	end
-
-	local body = vim.json.encode(payload)
-	return service.request("PUT", url, nil, body, function(result, err)
-		if err then
-			on_done(nil, err)
-			return
-		end
-
-		service.clear_cache()
-		local entries = mapper.to_tasks_list({ values = { result } })
-		on_done(entries[1] or nil, nil)
-	end)
-end
-
----@param task_url string
----@param on_done fun(result: table|nil, err: string|nil)
----@return { cancel: fun() }|nil
-function M.delete_task(task_url, on_done)
-	local url = tostring(task_url or "")
-	if url == "" then
-		on_done(nil, "Missing Bitbucket task URL")
-		return nil
-	end
-
-	return service.request("DELETE", url, nil, nil, function(result, err)
-		if not err then
-			service.clear_cache()
-		end
-		on_done(result, err)
-	end)
-end
-
----@param workspace string
----@param repo string
----@param pr_id string|number
----@param raw string
----@param opts? { comment_id?: number|string|nil, pending?: boolean|nil }
----@param on_done fun(task: PullsComment|nil, err: string|nil)
----@return { cancel: fun() }|nil
-function M.create_task(workspace, repo, pr_id, raw, opts, on_done)
-	opts = opts or {}
-
-	local ws = tostring(workspace or "")
-	local rp = tostring(repo or "")
-	local id = tostring(pr_id or "")
-	if ws == "" or rp == "" or id == "" then
-		on_done(nil, "Missing Bitbucket PR task endpoint params")
-		return nil
-	end
-
-	local endpoint = string.format("/repositories/%s/%s/pullrequests/%s/tasks", ws, rp, id)
-	local payload = {
-		content = { raw = tostring(raw or "") },
-	}
-	if opts.pending then
-		payload.pending = true
-	end
-	if opts.comment_id ~= nil and tostring(opts.comment_id) ~= "" then
-		payload.comment = { id = tonumber(opts.comment_id) or opts.comment_id }
-	end
-
-	local body = vim.json.encode(payload)
-	return service.request("POST", endpoint, nil, body, function(result, err)
-		if err then
-			on_done(nil, err)
-			return
-		end
-
-		service.clear_cache()
-		local entries = mapper.to_tasks_list({ values = { result } })
-		on_done(entries[1] or nil, nil)
-	end)
+	end, {
+		action = resolved and "Resolve PR thread" or "Reopen PR thread",
+		repo = pr.repo_full_name,
+		id = pr.id,
+		comment_id = root.parent_id or root.id,
+	})
 end
 
 return M

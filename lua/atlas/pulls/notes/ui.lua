@@ -4,14 +4,12 @@ local keymaps = require("atlas.pulls.notes.ui.keymaps")
 local notes = require("atlas.pulls.notes")
 local notify = require("atlas.core.notify")
 local renderer = require("atlas.pulls.notes.ui.renderer")
+local resolver = require("atlas.core.keymaps")
 
 local M = {}
 
 local BUFFER_NAME = "atlas://notes"
 local namespace = vim.api.nvim_create_namespace("atlas.notes")
-
----@class AtlasNotesUIOptions
----@field target string|nil
 
 ---@class AtlasNotesUIState
 ---@field buf integer|nil
@@ -31,6 +29,13 @@ local state = {
 	expanded = {},
 }
 
+---@param action AtlasKeymapActionId
+---@return string|nil
+local function key_label(action)
+	local keys = resolver.resolve(action)
+	return keys and table.concat(keys, " / ") or nil
+end
+
 ---@return boolean
 local function valid_buffer()
 	return state.buf ~= nil and vim.api.nvim_buf_is_valid(state.buf)
@@ -46,16 +51,21 @@ local function render()
 		return
 	end
 
+	local win = valid_window() and state.win or nil
 	local selected
-	if valid_window() then
-		local item = state.line_map[vim.api.nvim_win_get_cursor(state.win)[1]]
+	if win then
+		local item = state.line_map[vim.api.nvim_win_get_cursor(win)[1]]
 		selected = item and item.tree_key or nil
 	end
 	local lines, spans, line_map = renderer.render_manager({
 		documents = state.documents,
-		width = valid_window() and vim.api.nvim_win_get_width(state.win) or vim.o.columns,
+		width = win and vim.api.nvim_win_get_width(win) or vim.o.columns,
 		target_filter = state.target_filter,
 		expanded = state.expanded,
+		action_keys = {
+			edit = key_label("ui.comments.edit"),
+			delete = key_label("ui.delete"),
+		},
 	})
 	state.line_map = line_map
 	if valid_window() then
@@ -63,8 +73,8 @@ local function render()
 		for _, document in ipairs(state.documents) do
 			note_count = note_count + #document.notes
 		end
-		local pull_icon = icons.pulls("pr")
-		local note_icon = icons.general("pin")
+		local pull_icon = icons.get("pr")
+		local note_icon = icons.get("pin")
 		vim.api.nvim_set_option_value(
 			"winbar",
 			string.format(
@@ -125,12 +135,14 @@ local function refresh()
 		documents, err = notes.documents()
 	end
 	if not documents then
-		notify.error(err or "Unable to read notes")
+		notify.error(err or "Unable to read notes", { vim_notify = true })
 		return
 	end
 	state.documents = documents
 	render()
 end
+
+M.refresh = refresh
 
 ---@return integer
 local function ensure_buffer()
@@ -144,7 +156,8 @@ local function ensure_buffer()
 	vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
 	vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
 	vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-	vim.api.nvim_set_option_value("filetype", "atlas-notes", { buf = buf })
+	vim.api.nvim_set_option_value("filetype", "atlas-ui.notes", { buf = buf })
+	pcall(vim.treesitter.stop, buf)
 	keymaps.register(buf, actions.new(state, refresh, render))
 	vim.api.nvim_create_autocmd("BufWipeout", {
 		buffer = buf,
@@ -159,16 +172,15 @@ local function ensure_buffer()
 	return buf
 end
 
----@param opts AtlasNotesUIOptions|nil
+---@param opts { target: string|nil }|nil
 function M.open(opts)
 	opts = opts or {}
-	require("atlas.ui.shared.highlights").setup()
 	local target, err
 	if opts.target and opts.target ~= "" then
 		target, err = notes.resolve_target(opts.target)
 	end
 	if err then
-		notify.error(err)
+		notify.error(err, { vim_notify = true })
 		return
 	end
 
@@ -196,6 +208,24 @@ function M.open(opts)
 	vim.api.nvim_set_option_value("scrollbind", false, { win = state.win })
 	vim.api.nvim_set_option_value("cursorbind", false, { win = state.win })
 	refresh()
+end
+
+function M.clear_all()
+	vim.ui.input({ prompt = "Delete all review notes? [y/N]: " }, function(answer)
+		answer = vim.trim(tostring(answer or "")):lower()
+		if answer ~= "y" and answer ~= "yes" then
+			return
+		end
+		local cleared, err = notes.clear_all()
+		if not cleared then
+			notify.error(err or "Unable to delete notes", { vim_notify = true })
+			return
+		end
+		state.documents = {}
+		state.expanded = {}
+		render()
+		notify.info("Review notes deleted", { vim_notify = true })
+	end)
 end
 
 return M

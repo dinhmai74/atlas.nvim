@@ -1,0 +1,603 @@
+local M = {}
+
+local utils = require("atlas.ui.shared.utils")
+local markdown = require("atlas.formats.markdown")
+local icons = require("atlas.ui.shared.icons")
+local spinner = require("atlas.ui.components.spinner")
+local box = require("atlas.ui.components.box")
+local table_tree = require("atlas.ui.components.table_tree")
+local state = require("atlas.pulls.ui.detail.tabs.overview.state")
+local detail = require("atlas.pulls.ui.detail.state")
+local keymaps = require("atlas.pulls.ui.detail.tabs.overview.keymaps")
+local presentation = require("atlas.pulls.ui.presentation")
+local pipeline_utils = require("atlas.pulls.pipelines.utils")
+local request_scope = require("atlas.core.requests")
+
+local PADDING_X = 1
+local MAX_DESCRIPTION_LINES = 15
+
+---@param pr PullRequest
+---@return boolean
+local function is_current(pr)
+	local current = detail.current_pr
+	return current ~= nil
+		and tostring(current.id or "") == tostring(pr.id or "")
+		and tostring(current.repo_full_name or "") == tostring(pr.repo_full_name or "")
+end
+
+local function reset_requests()
+	state.requests.cancel()
+	state.requests = request_scope.new()
+end
+
+function M.reset()
+	state.reset()
+end
+
+---@param pr PullRequest
+---@param refresh fun()
+---@param opts { force_refresh: boolean|nil }|nil
+function M.on_select(pr, refresh, opts)
+	opts = opts or {}
+
+	local provider = detail.provider
+	if not provider then
+		return
+	end
+	local core = provider.capabilities.core
+
+	local force_refresh = opts.force_refresh == true
+	local can_fetch_reviewers = core.fetch_reviewers ~= nil
+	local should_fetch_reviewers = can_fetch_reviewers
+		and (force_refresh or state.reviewers == nil or state.reviewers == "loading")
+	if should_fetch_reviewers then
+		reset_requests()
+		state.reviewers = "loading"
+		state.requests.run(function(done)
+			return core.fetch_reviewers(pr, opts, done)
+		end, function(reviewers, err)
+			if not is_current(pr) then
+				return
+			end
+			if err then
+				state.reviewers = err
+			else
+				state.reviewers = reviewers or {}
+			end
+			refresh()
+		end)
+	end
+end
+
+---@param title string
+---@param message string
+---@param width integer
+---@param lines string[]
+---@param spans table[]
+local function render_error(title, message, width, lines, spans)
+	utils.push(lines, spans, title, "AtlasColumnHeader", PADDING_X)
+	local content = { lines = {}, spans = {} }
+	local content_width = math.max(1, width - PADDING_X * 2 - 4)
+	for _, line in ipairs(utils.sanitize_lines(message)) do
+		for _, wrapped in ipairs(utils.wrap_line(line, content_width)) do
+			utils.push(content.lines, content.spans, wrapped, "AtlasLogError")
+		end
+	end
+	utils.append_block(lines, spans, box.render({ content }, { width = width, padding_x = PADDING_X }))
+	table.insert(lines, "")
+end
+
+-- Reviewers
+
+local DECISION_GROUPS = { "approved", "changes_requested", "reviewed", "pending" }
+local OTHER_DECISION_GROUPS = { "approved", "changes_requested" }
+
+local DECISION_ICONS = {
+	approved = { icon = icons.get("successful", "status"), hl = "AtlasTextPositive" },
+	changes_requested = { icon = icons.get("failed", "status"), hl = "AtlasLogError" },
+	reviewed = { icon = icons.get("review"), hl = "AtlasTextMuted" },
+	pending = { icon = icons.get("inprogress", "status"), hl = "AtlasTextMuted" },
+}
+
+---@param decisions PullsReviewer[]
+---@param groups string[]
+---@param width integer
+---@return BoxContentGroup
+local function decision_content(decisions, groups, width)
+	local box_lines = {}
+	local box_spans = {}
+	local grouped = { approved = {}, changes_requested = {}, reviewed = {}, pending = {} }
+	for _, decision in ipairs(decisions) do
+		local decision_state = decision.decision or "pending"
+		if grouped[decision_state] == nil then
+			decision_state = "pending"
+		end
+		table.insert(grouped[decision_state], presentation.user_handle(decision))
+	end
+
+	local box_inner = math.max(10, width - (PADDING_X * 2) - 4)
+	for _, decision_state in ipairs(groups) do
+		local names = grouped[decision_state]
+		if #names > 0 then
+			table.sort(names)
+			local display = DECISION_ICONS[decision_state] or DECISION_ICONS.pending
+			local label = table.concat(names, ", ")
+			local icon_prefix = display.icon .. " "
+			local icon_prefix_width = vim.api.nvim_strwidth(icon_prefix)
+			local label_width = math.max(1, box_inner - icon_prefix_width)
+			local wrapped = utils.wrap_line(label, label_width)
+
+			local line_text = icon_prefix .. wrapped[1]
+			table.insert(box_lines, line_text)
+			table.insert(box_spans, {
+				line = #box_lines - 1,
+				start_col = 0,
+				end_col = #display.icon,
+				hl_group = display.hl,
+			})
+
+			local continuation_prefix = string.rep(" ", icon_prefix_width)
+			for i = 2, #wrapped do
+				table.insert(box_lines, continuation_prefix .. wrapped[i])
+			end
+		end
+	end
+
+	return { lines = box_lines, spans = box_spans }
+end
+
+---@param width integer
+---@param lines string[]
+---@param spans table[]
+local function render_reviewers(width, lines, spans)
+	if state.reviewers == nil or state.reviewers == "loading" then
+		return
+	end
+
+	if type(state.reviewers) == "string" then
+		render_error("Reviewers", state.reviewers, width, lines, spans)
+		return
+	end
+
+	local decisions = {}
+	local others = {}
+	for _, reviewer in ipairs(state.reviewers) do
+		table.insert(reviewer.role == "participant" and others or decisions, reviewer)
+	end
+	local approved_count = 0
+	for _, r in ipairs(decisions) do
+		if r.decision == "approved" then
+			approved_count = approved_count + 1
+		end
+	end
+
+	local header_text = string.format("Reviewers (%d/%d)", approved_count, #decisions)
+	utils.push(lines, spans, header_text, "AtlasColumnHeader", PADDING_X)
+	local count_text = string.format("(%d/%d)", approved_count, #decisions)
+	table.insert(spans, {
+		line = #lines - 1,
+		start_col = PADDING_X + #header_text - #count_text,
+		end_col = PADDING_X + #header_text,
+		hl_group = "AtlasTextMuted",
+	})
+
+	local content
+	if #decisions == 0 then
+		local empty_text = "no reviewers yet"
+		content = {
+			lines = { empty_text },
+			spans = { { line = 0, start_col = 0, end_col = #empty_text, hl_group = "AtlasTextMuted" } },
+		}
+	else
+		content = decision_content(decisions, DECISION_GROUPS, width)
+	end
+
+	if #others > 0 then
+		table.insert(content.lines, "")
+		local label = "Other decisions"
+		table.insert(content.lines, label)
+		table.insert(content.spans, {
+			line = #content.lines - 1,
+			start_col = 0,
+			end_col = #label,
+			hl_group = "AtlasColumnHeader",
+		})
+
+		local other_content = decision_content(others, OTHER_DECISION_GROUPS, width)
+		utils.append_block(
+			content.lines,
+			content.spans,
+			{ lines = other_content.lines, highlights = other_content.spans }
+		)
+	end
+
+	utils.append_block(lines, spans, box.render({ content }, { width = width, padding_x = PADDING_X }))
+	table.insert(lines, "")
+end
+
+-- Pipelines
+
+local MAX_OVERVIEW_JOBS = 5
+
+---@param _pr PullRequest
+---@param width integer
+---@param lines string[]
+---@param spans table[]
+---@param line_map table<integer, table>
+local function render_pipelines(_pr, width, lines, spans, line_map)
+	if detail.pipelines == nil or detail.pipelines == "loading" then
+		return
+	end
+
+	if type(detail.pipelines) == "string" then
+		render_error("Pipelines", detail.pipelines, width, lines, spans)
+		return
+	end
+
+	local entries = pipeline_utils.sort_by_state(detail.pipelines)
+
+	if #entries == 0 then
+		return
+	end
+
+	utils.push(lines, spans, "Pipelines", "AtlasColumnHeader", PADDING_X)
+
+	local rows = {}
+	for _, pipeline in ipairs(entries) do
+		if #rows > 0 then
+			table.insert(rows, { kind = "separator" })
+		end
+		local state_value = tostring(pipeline.state or "UNKNOWN"):upper()
+		local icon, status_hl = icons.get(state_value, "status")
+		local label = pipeline.name
+		local job_count = tonumber(pipeline.job_count)
+		if job_count ~= nil then
+			label = string.format("%s  %d %s", label, job_count, job_count == 1 and "job" or "jobs")
+		end
+		local row = {
+			label = label,
+			status = string.format("%s %s", icon, pipeline_utils.state_label(state_value)),
+			status_hl = status_hl,
+			kind = "pipeline",
+			pipeline = pipeline,
+			url = tostring(pipeline.url or ""),
+			children = {},
+		}
+		local unnamed_jobs = {}
+		local has_named_stage = false
+		for _, pipeline_stage in ipairs(pipeline.stages) do
+			if pipeline_stage.name == nil then
+				for _, job in ipairs(pipeline_stage.jobs) do
+					table.insert(unnamed_jobs, { state = job.state, stage = pipeline_stage, job = job })
+				end
+			else
+				has_named_stage = true
+			end
+		end
+		for _, pipeline_stage in ipairs(pipeline_utils.sort_by_state(pipeline.stages)) do
+			if pipeline_stage.name ~= nil then
+				local stage_state = tostring(pipeline_stage.state or "UNKNOWN"):upper()
+				local stage_icon, stage_hl = icons.get(stage_state, "status")
+				table.insert(row.children, {
+					label = string.format("%s %s", stage_icon, pipeline_stage.name),
+					status = "",
+					status_icon = stage_icon,
+					status_hl = stage_hl,
+					kind = "stage",
+					pipeline = pipeline,
+					stage = pipeline_stage,
+				})
+			end
+		end
+		local sorted_jobs = pipeline_utils.sort_by_state(unnamed_jobs)
+		local visible_jobs = math.min(#sorted_jobs, MAX_OVERVIEW_JOBS)
+		for index = 1, visible_jobs do
+			local entry = sorted_jobs[index]
+			local job = entry.job
+			local job_state = tostring(job.state or "UNKNOWN"):upper()
+			local job_icon, job_hl = icons.get(job_state, "status")
+			table.insert(row.children, {
+				label = string.format("%s %s", job_icon, job.name),
+				status = "",
+				status_icon = job_icon,
+				status_hl = job_hl,
+				kind = "pipeline",
+				pipeline = pipeline,
+				stage = entry.stage,
+				job = job,
+				url = tostring(job.url or pipeline.url or ""),
+			})
+		end
+		local total_unnamed_jobs = #unnamed_jobs
+		if not has_named_stage then
+			total_unnamed_jobs = math.max(tonumber(pipeline.job_count) or 0, total_unnamed_jobs)
+		end
+		if total_unnamed_jobs > visible_jobs then
+			table.insert(row.children, {
+				label = string.format("+%d more", total_unnamed_jobs - visible_jobs),
+				status = "",
+				muted = true,
+			})
+		end
+		table.insert(rows, row)
+	end
+
+	local box_lines, box_lmap, box_spans = table_tree.render({
+		width = math.max(10, width - (PADDING_X * 2) - 4),
+		margin = 0,
+		show_header = false,
+		column_gap = 1,
+		columns = {
+			{ key = "label", name = "", can_grow = true },
+			{ key = "status", name = "", align = "right", can_grow = false },
+		},
+		rows = rows,
+		tree = {
+			column_key = "label",
+			leaf_prefix = "",
+			show_indicator = false,
+			default_expanded = true,
+		},
+		cell_hl = function(row, column, context)
+			if row.kind == "separator" then
+				return nil
+			end
+			if row.muted then
+				return "AtlasTextMuted"
+			end
+			if column.key == "label" and row.status_icon then
+				local start_col = context.text:find(row.status_icon, 1, true)
+				if start_col then
+					return {
+						{
+							start_col = start_col - 1,
+							end_col = start_col - 1 + #row.status_icon,
+							hl_group = row.status_hl,
+						},
+					}
+				end
+			end
+			if column.key == "status" then
+				return row.status_hl
+			end
+			return nil
+		end,
+	})
+
+	utils.append_block(
+		lines,
+		spans,
+		box.render({ { lines = box_lines, spans = box_spans, line_map = box_lmap } }, {
+			width = width,
+			padding_x = PADDING_X,
+			line_map = line_map,
+			line_offset = #lines,
+		})
+	)
+	table.insert(lines, "")
+end
+
+-- Description
+
+local function description_block(text, width)
+	if state.view_mode == "raw" then
+		local content = {
+			lines = vim.split(utils.normalize_newlines(text), "\n", { plain = true }),
+		}
+		return utils.wrap_content(content, math.max(1, width - PADDING_X * 2), string.rep(" ", PADDING_X))
+	end
+
+	return markdown.render(text, { width = width, padding = PADDING_X })
+end
+
+---@param details PullRequestDetails
+---@param width integer
+---@param lines string[]
+---@param spans table[]
+local function render_description(details, width, lines, spans)
+	local desc_text = details.description or ""
+	if vim.trim(desc_text) == "" then
+		utils.push(lines, spans, "No description provided.", "AtlasTextMuted", PADDING_X)
+		table.insert(lines, "")
+		return
+	end
+
+	local block = description_block(desc_text, width)
+	local truncated = not state.description_expanded and #block.lines > MAX_DESCRIPTION_LINES
+	if truncated then
+		block.lines = vim.list_slice(block.lines, 1, MAX_DESCRIPTION_LINES)
+		block.highlights = vim.tbl_filter(function(span)
+			return span.line < MAX_DESCRIPTION_LINES
+		end, block.highlights)
+	end
+	utils.append_block(lines, spans, block)
+
+	if truncated then
+		local keys = require("atlas.core.keymaps").resolve("ui.toggle_fold") or {}
+		local key = keys[1] or "za"
+		local prefix = "Press "
+		local suffix = " to expand"
+		local hint = prefix .. key .. suffix
+		local pad = math.max(0, math.floor((width - #hint) / 2))
+		local hint_line = string.rep(" ", pad) .. hint
+		table.insert(lines, "")
+		table.insert(lines, hint_line)
+		local line_idx = #lines - 1
+		local prefix_start = pad
+		local key_start = prefix_start + #prefix
+		local suffix_start = key_start + #key
+		local hint_end = suffix_start + #suffix
+		table.insert(
+			spans,
+			{ line = line_idx, start_col = prefix_start, end_col = key_start, hl_group = "AtlasTextMuted" }
+		)
+		table.insert(spans, { line = line_idx, start_col = key_start, end_col = suffix_start, hl_group = "Normal" })
+		table.insert(
+			spans,
+			{ line = line_idx, start_col = suffix_start, end_col = hint_end, hl_group = "AtlasTextMuted" }
+		)
+	end
+
+	table.insert(lines, "")
+end
+
+-- Merge checks
+
+local MERGE_CHECK_STATE = {
+	successful = { icon = icons.get("successful", "status"), hl = "AtlasTextPositive" },
+	failed = { icon = icons.get("failed", "status"), hl = "AtlasLogError" },
+	inprogress = { icon = icons.get("inprogress", "status"), hl = "AtlasTextMuted" },
+	warning = { icon = icons.get("inprogress", "status"), hl = "AtlasTextWarning" },
+	muted = { icon = icons.get("inprogress", "status"), hl = "AtlasTextMuted" },
+}
+
+local MERGE_CHECK_PRIORITY = {
+	failed = 1,
+	warning = 2,
+	inprogress = 3,
+	successful = 4,
+	muted = 5,
+}
+
+---@param check PullsMergeCheck
+---@param width integer
+---@return BoxContentGroup
+local function render_merge_check_group(check, width)
+	local pair = MERGE_CHECK_STATE[check.state] or MERGE_CHECK_STATE.muted
+	local lines = {}
+	local spans = {}
+	local content_width = math.max(2, width - (PADDING_X * 2) - 3)
+
+	local icon_prefix = pair.icon .. " "
+	local icon_width = vim.api.nvim_strwidth(icon_prefix)
+	local title_width = math.max(2, content_width - icon_width)
+	local title_lines = utils.wrap_line(check.label, title_width)
+	for index, title in ipairs(title_lines) do
+		local prefix = index == 1 and icon_prefix or string.rep(" ", icon_width)
+		table.insert(lines, prefix .. title)
+		if index == 1 then
+			table.insert(spans, { line = #lines - 1, start_col = 0, end_col = #pair.icon, hl_group = pair.hl })
+		end
+	end
+
+	for _, message in ipairs(check.details or {}) do
+		local indent = "  "
+		local detail_width = math.max(2, content_width - vim.api.nvim_strwidth(indent))
+		for _, detail_line in ipairs(utils.wrap_line(message, detail_width)) do
+			local text = indent .. detail_line
+			table.insert(lines, text)
+			table.insert(spans, { line = #lines - 1, start_col = 0, end_col = #text, hl_group = "AtlasTextMuted" })
+		end
+	end
+
+	return { lines = lines, spans = spans }
+end
+
+---@param width integer
+---@param lines string[]
+---@param spans table[]
+local function render_merge_checks(width, lines, spans)
+	local checks = detail.merge_checks
+	if checks == nil or checks == "loading" then
+		return
+	end
+	if type(checks) == "string" then
+		render_error("Merge Checks", checks, width, lines, spans)
+		return
+	end
+	if #checks == 0 then
+		return
+	end
+
+	utils.push(lines, spans, "Merge Checks", "AtlasColumnHeader", PADDING_X)
+
+	checks = vim.list_slice(checks)
+	table.sort(checks, function(a, b)
+		if a.key == "pipelines" then
+			return false
+		end
+		if b.key == "pipelines" then
+			return true
+		end
+		return (MERGE_CHECK_PRIORITY[a.state] or math.huge) < (MERGE_CHECK_PRIORITY[b.state] or math.huge)
+	end)
+
+	local groups = {}
+	for _, check in ipairs(checks) do
+		table.insert(groups, render_merge_check_group(check, width))
+	end
+
+	utils.append_block(lines, spans, box.render(groups, { width = width, padding_x = PADDING_X }))
+	table.insert(lines, "")
+end
+
+---@param pr PullRequest
+---@param details PullRequestDetails|nil
+---@param width integer
+---@return string[], table[], table<integer, table>|nil
+function M.render(pr, details, width)
+	local lines = {}
+	local spans = {}
+	local line_map = {}
+
+	if details then
+		render_description(details, width, lines, spans)
+	elseif not detail.details_loading then
+		utils.push(lines, spans, "Pull request details unavailable.", "AtlasTextMuted", PADDING_X)
+		table.insert(lines, "")
+	end
+	render_reviewers(width, lines, spans)
+	render_merge_checks(width, lines, spans)
+	render_pipelines(pr, width, lines, spans, line_map)
+
+	if
+		state.reviewers == "loading"
+		or detail.merge_checks == "loading"
+		or detail.details_loading
+		or detail.pipelines == "loading"
+		or detail.diffstat == "loading"
+	then
+		utils.push(lines, spans, spinner.with_text("Loading overview..."), "AtlasTextMuted", PADDING_X)
+	end
+
+	return lines, spans, line_map
+end
+
+---@param _lnum integer
+---@param entry table
+---@return boolean
+function M.is_selectable_line(_lnum, entry)
+	return entry.pipeline ~= nil
+end
+
+---@param _pr PullRequest
+---@param entry table
+---@return boolean|nil
+function M.on_enter(_pr, entry)
+	if entry.kind == "pipeline" and entry.url and entry.url ~= "" then
+		vim.ui.open(entry.url)
+		return true
+	end
+end
+
+---@return boolean
+function M.is_loading()
+	return state.reviewers == "loading" or detail.pipelines == "loading"
+end
+
+function M.activate(buf, refresh)
+	if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+		return
+	end
+	keymaps.setup(buf, refresh)
+end
+
+function M.deactivate(buf)
+	if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+		return
+	end
+	keymaps.teardown(buf)
+	reset_requests()
+end
+
+return M

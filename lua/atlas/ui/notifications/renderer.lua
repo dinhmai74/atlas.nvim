@@ -23,18 +23,25 @@ function M.render(notifications, width)
 			end_col = #empty,
 			hl_group = "AtlasTextMuted",
 		})
+		table.insert(lines, "")
 		return lines, spans, line_map
 	end
 
 	for i, n in ipairs(notifications) do
 		local dot, dot_hl = " ", "AtlasTextMuted"
 		if n.unread then
-			dot = icons.general("dot")
+			dot = icons.get("dot")
 			dot_hl = "AtlasLogInfo"
 		end
 
-		local type_icon = n.icon or ""
-		local type_hl = n.icon_hl or "AtlasTextMuted"
+		local type_icon, type_hl = icons.get("info")
+		if n.kind == "pr" then
+			type_icon, type_hl = icons.get("pr")
+		elseif n.kind == "issue" then
+			type_icon, type_hl = icons.get("issue")
+		elseif n.kind == "checks" then
+			type_icon, type_hl = icons.get("tasks")
+		end
 
 		local prefix
 		if type_icon ~= "" then
@@ -125,6 +132,7 @@ function M.render(notifications, width)
 			table.insert(spans, { line = #lines - 1, start_col = 0, end_col = #sep, hl_group = "AtlasBorder" })
 		end
 	end
+	table.insert(lines, "")
 
 	return lines, spans, line_map
 end

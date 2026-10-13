@@ -1,19 +1,15 @@
 local M = {}
 
-local service = require("atlas.issues.providers.jira.api.service")
+local service = require("atlas.providers.jira.client")
 local normalizer = require("atlas.issues.providers.jira.api.mapper")
-local cache = require("atlas.core.cache")
-local logger = require("atlas.core.logger")
-local config = require("atlas.issues.providers.jira.api.config")
+local json = require("atlas.core.json")
+local config = require("atlas.config")
+local users_api = require("atlas.providers.jira.users")
+local url_encode = require("atlas.core.utils").url_encode
+local request_scope = require("atlas.core.requests")
 
-local CACHE_TTL = 300
-
-local function story_points_field()
-	local project_config = config.jira_config().project_config or {}
-	return tostring(project_config.story_points_field or "customfield_10016")
-end
-
-local function search_fields()
+---@param story_points_field string
+local function search_fields(story_points_field)
 	return {
 		"summary",
 		"status",
@@ -25,96 +21,87 @@ local function search_fields()
 		"issuetype",
 		"duedate",
 		"watches",
-		story_points_field(),
+		"created",
+		"updated",
+		"resolutiondate",
+		story_points_field,
 	}
 end
 
----@param str string
----@return string
-local function url_encode(str)
-	return (str:gsub("([^%w%-_.~])", function(c)
-		return string.format("%%%02X", string.byte(c))
-	end))
-end
-
----@param data table
----@param on_done fun(result: table|nil, err: string|nil)
----@param ctx table|nil
----@return { job_id: integer, cancel: fun() }|nil
-local function search_jql_request(data, on_done, ctx)
-	if config.jira_config().api_type == "server" then
-		local payload = vim.deepcopy(data)
-		payload.startAt = tonumber(payload.nextPageToken) or 0
-		payload.nextPageToken = nil
-
-		return service.request("POST", "/search", payload, function(result, err)
-			if result then
-				local start_at = tonumber(result.startAt) or 0
-				local max_results = tonumber(result.maxResults) or #(result.issues or {})
-				local total = tonumber(result.total) or 0
-				local next_start = start_at + max_results
-				result.isLast = next_start >= total
-				result.nextPageToken = result.isLast and nil or tostring(next_start)
-			end
-			on_done(result, err)
-		end, ctx)
-	else
-		return service.request("POST", "/search/jql", data, function(result, err)
-			on_done(result, err)
-		end, ctx)
+---@param fields_config AtlasJiraProjectFieldsConfig
+---@return string[]
+local function custom_field_ids(fields_config)
+	local ids = {}
+	for field_id in pairs(fields_config) do
+		table.insert(ids, field_id)
 	end
+	table.sort(ids)
+	return ids
 end
 
----@class JiraIssueSearchPage
----@field issues Issue[]
----@field nextPageToken string|nil
----@field isLast boolean
+---@param extra_fields string[]
+---@return string[]
+local function detail_fields(extra_fields)
+	local fields = { "summary", "description", "issuetype", "labels", "status", "priority", "assignee", "reporter" }
+	vim.list_extend(fields, extra_fields)
+	return fields
+end
 
 ---@param jql string
----@param on_done fun(page: JiraIssueSearchPage|nil, err: string|nil)
----@param opts { force_load?: boolean, next_page_token?: string|nil, max_results?: number|nil }|nil
+---@param on_done fun(page: IssuesPage|nil, err: string|nil)
+---@param opts { force_refresh?: boolean, pagelen: integer, cursor?: string }
 ---@return { job_id: integer, cancel: fun() }|nil
 function M.search_issues(jql, on_done, opts)
-	opts = opts or {}
-	local ttl = service.cache_ttl()
-	local page_token = opts.next_page_token or ""
-	local page_size = math.max(1, tonumber(opts.max_results) or 50)
-	local cache_key = "jira:search:" .. jql .. ":page:" .. page_token .. ":size:" .. tostring(page_size)
+	local cache_key = string.format("jira:search:v7:%s:%d:%s", jql, opts.pagelen, opts.cursor or "first")
 
-	if not opts.force_load then
-		local cached = cache.get(cache_key)
-		if cached and cached.value then
-			logger.loginfo("Jira search cache hit", { jql = jql })
-			on_done(cached.value, nil)
+	if opts.force_refresh then
+		service.clear_memory_cache()
+	else
+		local cached = service.get_cache(cache_key)
+		if cached then
+			on_done(cached, nil)
 			return nil
 		end
 	end
 
+	local story_points_field = config.options.issues.jira.project_config.story_points_field
 	local data = {
 		jql = jql,
-		fields = search_fields(),
-		nextPageToken = page_token,
-		maxResults = page_size,
+		fields = search_fields(story_points_field),
+		maxResults = opts.pagelen,
 	}
+	local endpoint = "/search/jql"
+	local start_at = 0
+	if service.is_server() then
+		endpoint = "/search"
+		start_at = tonumber(opts.cursor) or 0
+		data.startAt = start_at
+	elseif opts.cursor then
+		data.nextPageToken = opts.cursor
+	end
 
-	return search_jql_request(data, function(result, err)
+	return service.request("POST", endpoint, data, function(result, err)
 		if err or not result then
 			on_done(nil, err or "Empty response")
 			return
 		end
 
-		local page = {
-			issues = normalizer.to_issues_list(result.issues or {}, story_points_field()),
-			nextPageToken = result.nextPageToken,
-			isLast = result.isLast == true,
-		}
+		local items = normalizer.to_issues_list(result.issues or {}, story_points_field)
+		local next_cursor
+		local total_pages
+		if service.is_server() then
+			local total = tonumber(result.total) or #items
+			local next_start = start_at + #items
+			if next_start < total then
+				next_cursor = tostring(next_start)
+			end
+			total_pages = math.max(1, math.ceil(total / opts.pagelen))
+		elseif result.isLast == false then
+			next_cursor = result.nextPageToken
+		end
 
-		cache.set(cache_key, page, ttl)
-		logger.loginfo("Jira search page complete", {
-			jql = jql,
-			count = #page.issues,
-			is_last = page.isLast,
-		})
+		local page = { items = items, next_cursor = next_cursor, total_pages = total_pages }
+		service.set_cache(cache_key, page)
 		on_done(page, nil)
 	end, {
 		action = "Search issues",
@@ -125,47 +112,48 @@ end
 ---@class JiraIssuePickerItem
 ---@field id string
 ---@field key string
----@field summary string
+---@field title string
 
+---@param project JiraIssueProject|nil
 ---@param query string
 ---@param on_done fun(items: JiraIssuePickerItem[]|nil, err: string|nil)
----@param opts { force_load?: boolean }|nil
 ---@return { job_id: integer, cancel: fun() }|nil
-function M.search_issue(query, on_done, opts)
-	opts = opts or {}
+function M.issue_picker(project, query, on_done)
 	local q = vim.trim(tostring(query or ""))
+	local project_key = project and project.key
 
-	local cache_key = "jira:issue_picker:" .. q
-	if not opts.force_load then
-		local cached_items, ok = service.get_memory_cache(cache_key)
-		if ok then
-			on_done(cached_items, nil)
-			return nil
-		end
+	local cache_key = string.format("jira:issue_picker:%s:%s", project_key or "all", q)
+	local cached_items, ok = service.get_memory_cache(cache_key)
+	if ok then
+		on_done(cached_items, nil)
+		return nil
 	end
 
-	local endpoint = "/issue/picker?query=" .. url_encode(q) .. "&showSubTasks=true&showSubTaskParent=true"
+	local jql = project_key and "project = " .. project_key .. " ORDER BY updated DESC" or "ORDER BY updated DESC"
+	local endpoint = "/issue/picker?query=" .. url_encode(q) .. "&currentJQL=" .. url_encode(jql)
+	if project then
+		endpoint = endpoint .. "&currentProjectId=" .. url_encode(project.id)
+	end
+	endpoint = endpoint .. "&showSubTasks=true&showSubTaskParent=true"
 
 	return service.request("GET", endpoint, nil, function(result, err)
-		if err ~= nil or type(result) ~= "table" then
-			on_done(nil, err or "Empty response")
+		if err ~= nil then
+			on_done(nil, err)
 			return
 		end
 
 		---@type JiraIssuePickerItem[]
 		local items = {}
 		for _, section in ipairs(result.sections or {}) do
-			for _, issue in ipairs((type(section) == "table" and section.issues) or {}) do
-				if type(issue) == "table" then
-					local key = tostring(issue.key or "")
-					if key ~= "" then
-						local summary = tostring(issue.summaryText or issue.summary or "")
-						table.insert(items, {
-							id = tostring(issue.id or key),
-							key = key,
-							summary = summary,
-						})
-					end
+			for _, issue in ipairs(section.issues or {}) do
+				local key = tostring(issue.key or "")
+				if not project_key or key:find(project_key .. "-", 1, true) == 1 then
+					local title = tostring(issue.summaryText or issue.summary or "")
+					table.insert(items, {
+						id = tostring(issue.id or key),
+						key = key,
+						title = title,
+					})
 				end
 			end
 		end
@@ -178,16 +166,30 @@ function M.search_issue(query, on_done, opts)
 	})
 end
 
----@param issue_key string
----@param callback fun(issue: Issue|nil, err: string|nil)
+---@param ref IssueRef
+---@param opts IssuesFetchOpts|nil
+---@param callback fun(details: JiraIssueDetails|nil, err: string|nil)
 ---@return { job_id: integer, cancel: fun() }|nil
-function M.get_issue(issue_key, callback)
-	if type(issue_key) ~= "string" or issue_key == "" then
+function M.fetch_issue(ref, opts, callback)
+	local issue_key = tostring(ref.key or "")
+	if issue_key == "" then
 		callback(nil, "Missing issue key")
 		return nil
 	end
+	opts = opts or {}
+	local cache_key = "jira:issue-details:" .. issue_key
+	if not opts.force_refresh then
+		local cached, ok = service.get_memory_cache(cache_key)
+		if ok then
+			callback(cached, nil)
+			return nil
+		end
+	end
 
-	local endpoint = string.format("/issue/%s?fields=%s", issue_key, table.concat(search_fields(), ","))
+	local project_key = issue_key:match("^([^-]+)-")
+	local configured = config.options.issues.jira.project_config[project_key] or {}
+	local extra_fields = custom_field_ids(configured)
+	local endpoint = string.format("/issue/%s?fields=%s", issue_key, table.concat(detail_fields(extra_fields), ","))
 
 	return service.request("GET", endpoint, nil, function(result, err)
 		if err or not result then
@@ -195,7 +197,9 @@ function M.get_issue(issue_key, callback)
 			return
 		end
 
-		callback(normalizer.to_issue(result, story_points_field()), nil)
+		local details = normalizer.to_issue_details(result, configured)
+		service.set_memory_cache(cache_key, details)
+		callback(details, nil)
 	end, {
 		action = "Fetch issue",
 		issue_key = issue_key,
@@ -203,37 +207,33 @@ function M.get_issue(issue_key, callback)
 end
 
 ---@param issue_key string
----@param start_at number|nil
----@param max_results number|nil
----@param on_done fun(page: { values: IssueActivityEntry[], total: number, is_last: boolean }|nil, err: string|nil)
----@param opts { force_load?: boolean }|nil
+---@param on_done fun(entries: IssueActivityEntry[]|nil, err: string|nil)
+---@param opts { force_refresh?: boolean }|nil
 ---@return { job_id: integer, cancel: fun() }|nil
-function M.get_issue_history_page(issue_key, start_at, max_results, on_done, opts)
-	if type(issue_key) ~= "string" or issue_key == "" then
+function M.get_issue_history(issue_key, on_done, opts)
+	if issue_key == "" then
 		on_done(nil, "Missing issue key")
 		return nil
 	end
 
 	opts = opts or {}
-	local start = math.max(0, tonumber(start_at) or 0)
-	local size = math.max(1, tonumber(max_results) or 100)
-	local cache_key = string.format("jira:panel:history:%s:start:%d:size:%d", issue_key, start, size)
+	local cache_key = "jira:panel:history:" .. issue_key
 
-	if not opts.force_load then
-		local cached_page, ok = service.get_memory_cache(cache_key)
+	if not opts.force_refresh then
+		local cached, ok = service.get_memory_cache(cache_key)
 		if ok then
-			on_done(cached_page, nil)
+			on_done(cached, nil)
 			return nil
 		end
 	end
 
-	local is_server = config.jira_config().api_type == "server"
+	local is_server = service.is_server()
 
 	local endpoint
 	if is_server then
 		endpoint = string.format("/issue/%s?expand=changelog", issue_key)
 	else
-		endpoint = string.format("/issue/%s/changelog?startAt=%d&maxResults=%d", issue_key, start, size)
+		endpoint = string.format("/issue/%s/changelog?maxResults=100", issue_key)
 	end
 
 	return service.request("GET", endpoint, nil, function(result, err)
@@ -244,184 +244,22 @@ function M.get_issue_history_page(issue_key, start_at, max_results, on_done, opt
 
 		local raw = result
 		if is_server then
-			raw = type(result.changelog) == "table" and result.changelog or { values = {} }
+			raw = json.safe_table(result.changelog)
 		end
 
-		local page = normalizer.to_history_page(raw, start, size)
-		service.set_memory_cache(cache_key, page, CACHE_TTL)
-		on_done(page, nil)
+		local entries = normalizer.to_history(raw)
+		service.set_memory_cache(cache_key, entries)
+		on_done(entries, nil)
 	end, {
-		action = "Fetch issue history page",
+		action = "Fetch issue history",
 		issue_key = issue_key,
-		start_at = start,
-		max_results = size,
 	})
 end
 
----@class JiraIssueDetailResult
----@field description any
----@field custom_fields table<string, any>|nil
-
----@param issue_key string
----@param on_done fun(detail: JiraIssueDetailResult|nil, err: string|nil)
----@param opts { extra_fields?: string[], force_load?: boolean }|nil
+---@param fields table
+---@param callback fun(result: JiraIssueEditorResult|nil, err: string|nil)
 ---@return { job_id: integer, cancel: fun() }|nil
-function M.get_issue_detail(issue_key, on_done, opts)
-	if type(issue_key) ~= "string" or issue_key == "" then
-		on_done(nil, "Missing issue key")
-		return nil
-	end
-
-	opts = opts or {}
-	local fields = { "description" }
-	local extra = opts.extra_fields or {}
-	for _, f in ipairs(extra) do
-		table.insert(fields, f)
-	end
-
-	local fields_suffix = "description"
-	if #extra > 0 then
-		local sorted_extra = vim.deepcopy(extra)
-		table.sort(sorted_extra)
-		fields_suffix = "description+" .. table.concat(sorted_extra, ",")
-	end
-
-	local cache_key = string.format("jira:panel:detail:%s:fields:%s", issue_key, fields_suffix)
-	if not opts.force_load then
-		local cached_detail, ok = service.get_memory_cache(cache_key)
-		if ok then
-			on_done(cached_detail, nil)
-			return nil
-		end
-	end
-
-	local data = {
-		jql = "key = " .. issue_key,
-		fields = fields,
-		maxResults = 1,
-	}
-
-	return search_jql_request(data, function(result, err)
-		if err or not result then
-			logger.logerror("Jira detail fetch failed", {
-				issue_key = issue_key,
-				error = err or "Empty response",
-			})
-			on_done(nil, err or "Empty response")
-			return
-		end
-
-		local first_issue = (result.issues or {})[1]
-		local raw_fields = first_issue and first_issue.fields or {}
-
-		local custom_fields = nil
-		if #extra > 0 then
-			custom_fields = {}
-			for _, field_id in ipairs(extra) do
-				custom_fields[field_id] = raw_fields[field_id]
-			end
-		end
-
-		logger.loginfo("Jira detail fetch complete", {
-			issue_key = issue_key,
-			has_description = raw_fields.description ~= nil,
-			custom_field_count = custom_fields and #extra or 0,
-		})
-
-		local detail = {
-			description = raw_fields.description,
-			custom_fields = custom_fields,
-		}
-
-		service.set_memory_cache(cache_key, detail, CACHE_TTL)
-		on_done(detail, nil)
-	end, {
-		action = "Fetch issue detail",
-		issue_key = issue_key,
-		fields = fields,
-	})
-end
-
----@param issue_key string
----@param fields string[]
----@param on_done fun(values: table<string, any>|nil, err: string|nil)
----@param opts { force_load?: boolean }|nil
----@return { job_id: integer, cancel: fun() }|nil
-function M.get_custom_fields(issue_key, fields, on_done, opts)
-	if type(issue_key) ~= "string" or issue_key == "" then
-		on_done(nil, "Missing issue key")
-		return nil
-	end
-
-	if #fields == 0 then
-		on_done({}, nil)
-		return nil
-	end
-
-	opts = opts or {}
-	local sorted = vim.deepcopy(fields)
-	table.sort(sorted)
-	local cache_key = string.format("jira:panel:custom_fields:%s:%s", issue_key, table.concat(sorted, ","))
-
-	if not opts.force_load then
-		local cached, ok = service.get_memory_cache(cache_key)
-		if ok then
-			on_done(cached, nil)
-			return nil
-		end
-	end
-
-	local data = {
-		jql = "key = " .. issue_key,
-		fields = fields,
-		maxResults = 1,
-	}
-
-	return search_jql_request(data, function(result, err)
-		if err or not result then
-			on_done(nil, err or "Empty response")
-			return
-		end
-
-		local raw_fields = ((result.issues or {})[1] or {}).fields or {}
-		local values = {}
-		for _, field_id in ipairs(fields) do
-			values[field_id] = raw_fields[field_id]
-		end
-
-		service.set_memory_cache(cache_key, values, CACHE_TTL)
-		on_done(values, nil)
-	end, {
-		action = "Fetch custom fields",
-		issue_key = issue_key,
-		fields = fields,
-	})
-end
-
----@param issue_key string
----@param on_done fun(description: any, err: string|nil)
----@param opts { force_load?: boolean }|nil
----@return { job_id: integer, cancel: fun() }|nil
-function M.get_issue_description(issue_key, on_done, opts)
-	return M.get_issue_detail(issue_key, function(detail, err)
-		if err or not detail then
-			on_done(nil, err)
-			return
-		end
-		on_done(detail.description, nil)
-	end, opts)
-end
-
 function M.create_issue(fields, callback)
-	if type(callback) ~= "function" then
-		return nil
-	end
-
-	if type(fields) ~= "table" then
-		callback(nil, "Missing fields")
-		return nil
-	end
-
 	if not fields.summary or fields.summary == "" then
 		callback(nil, "Missing summary")
 		return nil
@@ -437,24 +275,18 @@ function M.create_issue(fields, callback)
 		return nil
 	end
 
-	local payload = { fields = fields }
-
-	return service.request("POST", "/issue", payload, function(result, err)
-		if err ~= nil then
+	return service.request("POST", "/issue", { fields = fields }, function(result, err)
+		if err then
 			callback(nil, err)
 			return
 		end
-
 		if not result or not result.key then
 			callback(nil, "Invalid response")
 			return
 		end
 
-		callback({
-			key = result.key,
-			id = result.id,
-			self = result.self,
-		}, nil)
+		service.clear_memory_cache()
+		callback({ key = result.key, id = result.id, self = result.self }, nil)
 	end, {
 		action = "Create issue",
 		summary = fields.summary,
@@ -466,17 +298,8 @@ end
 ---@param callback fun(ok: boolean, err: string|nil)
 ---@return { job_id: integer, cancel: fun() }|nil
 function M.update_issue(issue_key, fields, callback)
-	if type(callback) ~= "function" then
-		return nil
-	end
-
-	if type(issue_key) ~= "string" or issue_key == "" then
+	if issue_key == "" then
 		callback(false, "Missing issue key")
-		return nil
-	end
-
-	if type(fields) ~= "table" then
-		callback(false, "Missing fields")
 		return nil
 	end
 
@@ -484,12 +307,10 @@ function M.update_issue(issue_key, fields, callback)
 	local payload = { fields = fields }
 
 	return service.request("PUT", endpoint, payload, function(_, err)
-		if err ~= nil then
-			callback(false, err)
-			return
+		if err == nil then
+			service.clear_memory_cache()
 		end
-
-		callback(true, nil)
+		callback(err == nil, err)
 	end, {
 		action = "Update issue",
 		issue_key = issue_key,
@@ -500,11 +321,7 @@ end
 ---@param callback fun(ok: boolean, err: string|nil)
 ---@return { job_id: integer, cancel: fun() }|nil
 function M.delete_issue(issue_key, callback)
-	if type(callback) ~= "function" then
-		return nil
-	end
-
-	if type(issue_key) ~= "string" or issue_key == "" then
+	if issue_key == "" then
 		callback(false, "Missing issue key")
 		return nil
 	end
@@ -512,93 +329,286 @@ function M.delete_issue(issue_key, callback)
 	local endpoint = string.format("/issue/%s", issue_key)
 
 	return service.request("DELETE", endpoint, nil, function(_, err)
-		if err ~= nil then
-			callback(false, err)
-			return
-		end
-
-		callback(true, nil)
+		callback(err == nil, err)
 	end, {
 		action = "Delete issue",
 		issue_key = issue_key,
 	})
 end
 
+---@param raw_types table[]
+---@return IssueType[]
+local function map_issue_types(raw_types)
+	local issue_types = {}
+	for _, raw in ipairs(raw_types) do
+		local issue_type = normalizer.to_issue_type(raw)
+		if issue_type ~= nil then
+			table.insert(issue_types, issue_type)
+		end
+	end
+	return issue_types
+end
+
 ---@param project_key string
 ---@param callback fun(issue_types: IssueType[]|nil, err: string|nil)
----@return { job_id: integer, cancel: fun() }|nil
+---@return AtlasRequestScope|nil
 function M.get_create_meta(project_key, callback)
-	if type(project_key) ~= "string" or project_key == "" then
+	if project_key == "" then
 		callback(nil, "Missing project key")
 		return nil
 	end
 
-	local escaped_key = vim.fn.escape(project_key, "&=?")
-
-	if config.jira_config().api_type == "server" then
-		local endpoint = string.format("/issue/createmeta/%s/issuetypes", escaped_key)
-		return service.request("GET", endpoint, nil, function(result, err)
-			if err ~= nil or type(result) ~= "table" then
+	local endpoint = string.format("/issue/createmeta/%s/issuetypes", url_encode(project_key))
+	local requests = request_scope.new()
+	local issue_types = {}
+	local function fetch(start_at)
+		requests.run(function(done)
+			return service.request(
+				"GET",
+				string.format("%s?startAt=%d&maxResults=100", endpoint, start_at),
+				nil,
+				done,
+				{ action = "Fetch create metadata", project_key = project_key }
+			)
+		end, function(result, err)
+			if err or not result then
 				callback(nil, err or "Empty response")
 				return
 			end
 
-			local raw_types = type(result.values) == "table" and result.values or {}
-			local issue_types = {}
-			for _, raw in ipairs(raw_types) do
-				local issue_type = normalizer.to_issue_type(raw)
-				if issue_type ~= nil then
-					table.insert(issue_types, issue_type)
-				end
+			local raw_types = (service.is_server() and result.values or result.issueTypes) or {}
+			vim.list_extend(issue_types, map_issue_types(raw_types))
+			local next_start = start_at + #raw_types
+			if #raw_types > 0 and result.isLast ~= true and next_start < result.total then
+				fetch(next_start)
+			else
+				callback(issue_types, nil)
 			end
-			callback(issue_types, nil)
-		end, {
-			action = "Fetch create metadata",
-			project_key = project_key,
-		})
+		end)
+	end
+	fetch(0)
+	return requests
+end
+
+---@param opts { project: string|nil, issue_key: string|nil }
+---@param query string|nil
+---@param callback fun(users: AtlasUser[]|nil, err: string|nil)
+---@return { job_id: integer, cancel: fun() }|nil
+function M.get_assignable_users(opts, query, callback)
+	opts = opts or {}
+	local project = opts.project or ""
+	local issue_key = opts.issue_key or ""
+
+	if project == "" and issue_key == "" then
+		callback(nil, "Missing project or issue key")
+		return nil
 	end
 
-	local endpoint = string.format("/issue/createmeta?projectKeys=%s&expand=projects.issuetypes", escaped_key)
+	local is_server = service.is_server()
+
+	local q = tostring(query or "")
+	local params = {}
+	if is_server then
+		table.insert(params, "username=" .. url_encode(q))
+	else
+		table.insert(params, "query=" .. url_encode(q))
+	end
+	if issue_key ~= "" then
+		table.insert(params, "issueKey=" .. url_encode(issue_key))
+	end
+	if project ~= "" then
+		table.insert(params, "project=" .. url_encode(project))
+	end
+	local endpoint = "/user/assignable/search?" .. table.concat(params, "&")
 
 	return service.request("GET", endpoint, nil, function(result, err)
-		if err ~= nil or type(result) ~= "table" then
+		if err ~= nil then
+			callback(nil, err)
+			return
+		end
+
+		local users = {}
+		for _, raw in ipairs(result) do
+			local user = users_api.to_user(raw)
+			if user then
+				table.insert(users, user)
+			end
+		end
+
+		callback(users, nil)
+	end, {
+		action = "Fetch assignable users",
+		issue_key = issue_key,
+		project = project,
+		query = q,
+	})
+end
+
+---@param opts { permissions?: string[]|nil, project_ids?: integer[]|nil, issue_ids?: integer[]|nil, account_id?: string|nil }
+---@param callback fun(permissions: table<string, table<number, boolean>>|nil, err: string|nil)
+---@return { job_id: integer, cancel: fun() }|nil
+function M.get_permissions_bulk(opts, callback)
+	opts = opts or {}
+
+	local permissions_list = {}
+	for _, key in ipairs(opts.permissions or {}) do
+		local value = vim.trim(key)
+		if value ~= "" then
+			table.insert(permissions_list, value)
+		end
+	end
+
+	if #permissions_list == 0 then
+		callback(nil, "Missing permissions")
+		return nil
+	end
+
+	local project_ids = opts.project_ids or {}
+	local issue_ids = opts.issue_ids or {}
+
+	local payload = {
+		projectPermissions = {
+			{
+				permissions = permissions_list,
+				projects = project_ids,
+				issues = issue_ids,
+			},
+		},
+	}
+
+	if opts.account_id and opts.account_id ~= "" then
+		payload.accountId = opts.account_id
+	end
+
+	return service.request("POST", "/permissions/check", payload, function(result, err)
+		if err ~= nil then
+			-- Handle 404 as a fallback since Jira server API don't have bulk permissions endpoint
+			if err and err:find("HTTP 404", 1, true) == 1 then
+				local fallback = {}
+				for _, key in ipairs(permissions_list) do
+					fallback[key] = {}
+					for _, pid in ipairs(project_ids) do
+						fallback[key][pid] = true
+					end
+					for _, iid in ipairs(issue_ids) do
+						fallback[key][iid] = true
+					end
+				end
+				callback(fallback, nil)
+				return
+			end
 			callback(nil, err or "Empty response")
 			return
 		end
 
-		local projects = result.projects
-		if type(projects) ~= "table" then
-			callback({}, nil)
-			return
-		end
-
-		local matched_project = nil
-		for _, project in ipairs(projects) do
-			if type(project) == "table" and tostring(project.key or "") == project_key then
-				matched_project = project
-				break
+		---@type table<string, table<number, boolean>>
+		local permissions = {}
+		for _, entry in ipairs(result.projectPermissions or {}) do
+			local permission_key = type(entry.permission) == "string" and entry.permission or ""
+			if permission_key ~= "" then
+				permissions[permission_key] = permissions[permission_key] or {}
+				for _, project_id in ipairs(entry.projects or {}) do
+					local id_num = tonumber(project_id)
+					if id_num ~= nil then
+						permissions[permission_key][id_num] = true
+					end
+				end
 			end
 		end
 
-		local project = matched_project or projects[1]
-		local raw_types = type(project) == "table" and project.issuetypes or nil
-		if type(raw_types) ~= "table" then
-			callback({}, nil)
-			return
-		end
-
-		local issue_types = {}
-		for _, raw in ipairs(raw_types) do
-			local issue_type = normalizer.to_issue_type(raw)
-			if issue_type ~= nil then
-				table.insert(issue_types, issue_type)
-			end
-		end
-
-		callback(issue_types, nil)
+		callback(permissions, nil)
 	end, {
-		action = "Fetch create metadata",
-		project_key = project_key,
+		action = "Fetch bulk permissions",
+		permissions = permissions_list,
+		project_count = #project_ids,
+		issue_count = #issue_ids,
+		account_id = opts.account_id,
+	})
+end
+
+---@param issue_key string
+---@param account_id string|nil
+---@param callback fun(ok: boolean, err: string|nil)
+---@return { job_id: integer, cancel: fun() }|nil
+function M.assign_issue(issue_key, account_id, callback)
+	if issue_key == "" then
+		callback(false, "Missing issue key")
+		return nil
+	end
+
+	local normalized_account_id = nil
+	if account_id and account_id ~= "" then
+		normalized_account_id = account_id
+	end
+
+	local endpoint = string.format("/issue/%s/assignee", issue_key)
+	local payload = {}
+	if service.is_server() then
+		payload.name = normalized_account_id or vim.NIL
+	else
+		payload.accountId = normalized_account_id or vim.NIL
+	end
+
+	return service.request("PUT", endpoint, payload, function(_, err)
+		callback(err == nil, err)
+	end, {
+		action = "Assign issue",
+		issue_key = issue_key,
+		unassign = normalized_account_id == nil,
+	})
+end
+
+---@param issue_key string
+---@param account_id string
+---@param callback fun(ok: boolean, err: string|nil)
+---@return { job_id: integer, cancel: fun() }|nil
+function M.change_reporter(issue_key, account_id, callback)
+	if issue_key == "" then
+		callback(false, "Missing issue key")
+		return nil
+	end
+
+	if account_id == "" then
+		callback(false, "Missing account id")
+		return nil
+	end
+
+	local endpoint = string.format("/issue/%s", issue_key)
+	local payload = { fields = { reporter = {} } }
+	if service.is_server() then
+		payload.fields.reporter.name = account_id
+	else
+		payload.fields.reporter.accountId = account_id
+	end
+
+	return service.request("PUT", endpoint, payload, function(_, err)
+		callback(err == nil, err)
+	end, {
+		action = "Change reporter",
+		issue_key = issue_key,
+	})
+end
+
+---@param issue_key string
+---@param subscribed boolean
+---@param account_id string|nil Required when unsubscribing.
+---@param on_done fun(subscribed: boolean|nil, err: string|nil)
+---@return { job_id: integer, cancel: fun() }|nil
+function M.set_subscription(issue_key, subscribed, account_id, on_done)
+	local endpoint = "/issue/" .. issue_key .. "/watchers"
+	if not subscribed then
+		local param_name = service.is_server() and "username" or "accountId"
+		endpoint = string.format("%s?%s=%s", endpoint, param_name, url_encode(account_id))
+	end
+	return service.request(subscribed and "POST" or "DELETE", endpoint, nil, function(_, err)
+		if err then
+			on_done(nil, err)
+			return
+		end
+		on_done(subscribed, nil)
+	end, {
+		action = subscribed and "Subscribe to issue" or "Unsubscribe from issue",
+		issue_key = issue_key,
 	})
 end
 

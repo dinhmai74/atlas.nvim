@@ -1,20 +1,28 @@
+---@alias AtlasJiraIssueActionId
+---| AtlasIssueActionId
+---| "reporter"
+---| "delete_issue"
+---| "open_project"
+---| "search_jql"
+
 local M = {}
 
+local actions = require("atlas.issues.actions")
 local icons = require("atlas.ui.shared.icons")
-local statusline = require("atlas.ui.statusline")
-local async_picker = require("atlas.ui.components.async_picker")
+local picker = require("atlas.ui.picker")
 local issues_api = require("atlas.issues.providers.jira.api.issues")
+local projects_api = require("atlas.issues.providers.jira.api.projects")
+local service = require("atlas.providers.jira.client")
 local notify = require("atlas.core.notify")
 local transitions_api = require("atlas.issues.providers.jira.api.transitions")
-local users_api = require("atlas.issues.providers.jira.api.users")
+local users_api = require("atlas.providers.jira.users")
 local issues_state = require("atlas.issues.state")
-local config = require("atlas.issues.providers.jira.api.config")
 
----@param ctx table
+---@param ctx AtlasIssueActionContext
 ---@return boolean
 local function has_issue_key(ctx)
 	local issue = ctx.issue
-	if type(issue) ~= "table" then
+	if issue == nil then
 		return false
 	end
 	local key = tostring(issue.key or "")
@@ -23,1159 +31,770 @@ end
 
 ---@return string
 local function current_jql()
-	local view = issues_state.active_view or issues_state.current_view
-	if type(view) ~= "table" then
-		return ""
-	end
-	---@cast view AtlasJiraViewConfig
-	return tostring(view.jql or "")
+	return issues_state.query
 end
 
----@type table[]
-local ACTIONS = {
-	{
-		id = "transition",
-		label = "Transition",
-		is_available = has_issue_key,
-		run = function(ctx, done)
-			local issue = ctx.issue
-			if not has_issue_key(ctx) or issue == nil then
-				done(nil, "No issue selected")
-				return
+---@type AtlasIssueAction[]
+local ACTIONS = {}
+M.items = ACTIONS
+
+---@param action AtlasIssueAction
+local function register(action)
+	table.insert(ACTIONS, action)
+end
+
+---@param ctx AtlasIssueActionContext
+---@param done fun(result: IssuesActionResult|nil, err: string|nil)
+local function transition(ctx, done)
+	local issue = assert(ctx.issue)
+
+	local issue_key = issue.key
+	local current_status = tostring(issue.status or "")
+	local all_items = nil
+
+	local function filter_items(query)
+		local normalized = vim.trim(query):lower()
+		if normalized == "" then
+			return all_items
+		end
+		local filtered = {}
+		for _, item in ipairs(all_items) do
+			if item.label:lower():find(normalized, 1, true) then
+				table.insert(filtered, item)
 			end
+		end
+		return filtered
+	end
 
-			local issue_key = issue.key
-			local current_status = tostring(issue.status or "")
-			local all_items = nil
-
-			local status_category_icons = {
-				new = icons.fallback(),
-				indeterminate = icons.general("info"),
-				done = icons.general("success"),
-			}
-
-			async_picker.open({
-				title = string.format("Transition %s", issue_key),
-				prompt = "Filter transitions",
-				debounce_ms = 0,
-				identifier = "jira_transitions:" .. issue_key,
-				format_item = function(item)
-					local transition = item.value
-					local category = type(transition) == "table" and transition.to_status_category or nil
-					local icon = (category and status_category_icons[category]) or icons.fallback()
-					return string.format("%s %s", icon, item.label)
-				end,
-				fetch = function(fetch_ctx, fetch_done)
-					if all_items then
-						local query = vim.trim(fetch_ctx.query):lower()
-						if query == "" then
-							fetch_done(all_items, nil)
-							return
-						end
-						local filtered = {}
-						for _, item in ipairs(all_items) do
-							if item.label:lower():find(query, 1, true) then
-								table.insert(filtered, item)
-							end
-						end
-						fetch_done(filtered, nil)
-						return
-					end
-
-					transitions_api.get_transitions(issue_key, function(transitions, err)
-						if err ~= nil or transitions == nil then
-							fetch_done(nil, err or "Failed to load transitions")
-							return
-						end
-
-						all_items = {}
-						for _, transition in ipairs(transitions) do
-							local to_status = tostring((transition and transition.to_status_name) or "")
-							if current_status == "" or to_status == "" or to_status ~= current_status then
-								table.insert(all_items, {
-									id = tostring(transition.id or ""),
-									label = tostring(transition.name or ""),
-									value = transition,
-								})
-							end
-						end
-						fetch_done(all_items, nil)
-					end)
-				end,
-				on_select = function(item)
-					local selected = item.value
-					statusline.notify("loading", string.format("Transitioning %s...", issue_key))
-					transitions_api.transition_issue(issue_key, selected.id, function(ok, err)
-						if not ok then
-							statusline.notify("error", err or "Transition failed")
-							done(nil, err or "Transition failed")
-							return
-						end
-
-						statusline.notify(
-							"success",
-							string.format("Transitioned %s to %s", issue_key, selected.name or ""),
-							1200
-						)
-						done({
-							changed_issue_key = issue_key,
-							message = string.format("Transitioned to %s", selected.name or ""),
-						}, nil)
-					end)
-				end,
-				on_cancel = function()
-					done({ changed_issue_key = nil, message = "Transition cancelled" }, nil)
-				end,
-			})
+	picker.search({
+		title = string.format("Transition %s", issue_key),
+		debounce_ms = 0,
+		format_item = function(item)
+			local icon = item.value.icon and item.value.icon.icon or icons.get("fallback")
+			return icon ~= "" and string.format("%s %s", icon, item.label) or item.label
 		end,
-	},
-	{
-		id = "assign",
-		label = "Change assignee",
-		is_available = has_issue_key,
-		run = function(ctx, done)
-			local issue = ctx.issue
-			if not has_issue_key(ctx) or issue == nil then
-				done(nil, "No issue selected")
+		fetch = function(query, fetch_done)
+			if all_items then
+				fetch_done(filter_items(query), nil)
 				return
 			end
 
-			local issue_key = issue.key
-			local issue_project_key = issue.project and issue.project.key or nil
-			local current_assignee_key = vim.trim(tostring(issue.assignee and issue.assignee.display_name or ""))
-				:lower()
-
-			local function to_picker_items(users)
-				local items = {}
-				local current_user = issues_state.current_user
-				local current_user_account_id = current_user and current_user.account_id or nil
-				local current_user_item = nil
-				local seen_current_user = false
-
-				if current_assignee_key ~= "" and current_assignee_key ~= "unassigned" then
-					table.insert(items, {
-						id = "__unassign__",
-						label = "Unassign",
-						value = { account_id = nil, display_name = "Unassign" },
-					})
-				end
-
-				for _, user in ipairs(users or {}) do
-					local user_name = vim.trim(tostring(user.display_name or "")):lower()
-					if user_name ~= current_assignee_key then
-						local item = { id = user.account_id or "", label = user.display_name or "", value = user }
-						if current_user_account_id and user.account_id == current_user_account_id then
-							seen_current_user = true
-							current_user_item = item
-						else
-							table.insert(items, item)
-						end
-					end
-				end
-
-				if current_user_account_id and current_user then
-					if not seen_current_user then
-						current_user_item = {
-							id = current_user_account_id,
-							label = current_user.display_name or "",
-							value = current_user,
-						}
-					end
-					if current_user_item then
-						table.insert(items, 1, current_user_item)
-					end
-				end
-
-				return items
-			end
-
-			async_picker.open({
-				title = string.format("Assign %s", issue_key),
-				prompt = "Search users",
-				initial_items = to_picker_items({}),
-				debounce_ms = 250,
-				cache_ttl_ms = 60000,
-				identifier = "jira_users:" .. (issue_project_key or ""),
-				fetch_on_open = false,
-				format_item = function(item)
-					if item.id == "__unassign__" then
-						return item.label
-					end
-					return string.format("%s %s", icons.general("user"), item.label)
-				end,
-				fetch = function(fetch_ctx, fetch_done)
-					users_api.get_assignable_users(
-						{ issue_key = issue_key, project = issue_project_key },
-						fetch_ctx.query,
-						function(users, err)
-							if err then
-								fetch_done(nil, err)
-								return
-							end
-							fetch_done(to_picker_items(users), nil)
-						end
-					)
-				end,
-				on_select = function(item)
-					local selected = item.value
-					statusline.notify("loading", string.format("Assigning %s...", issue_key))
-					users_api.assign_issue(issue_key, selected.account_id, function(ok, err)
-						if not ok then
-							statusline.notify("error", err or "Assign failed")
-							done(nil, err or "Assign failed")
-							return
-						end
-
-						if selected.account_id == nil then
-							statusline.notify("success", string.format("Unassigned %s", issue_key), 1200)
-							done({ changed_issue_key = issue_key, message = "Unassigned" }, nil)
-							return
-						end
-
-						statusline.notify(
-							"success",
-							string.format("Assigned %s to %s", issue_key, selected.display_name),
-							1200
-						)
-						done({
-							changed_issue_key = issue_key,
-							message = string.format("Assigned to %s", selected.display_name),
-						}, nil)
-					end)
-				end,
-				on_cancel = function()
-					done({ changed_issue_key = nil, message = "Assign cancelled" }, nil)
-				end,
-			})
-		end,
-	},
-	{
-		id = "reporter",
-		label = "Change reporter",
-		is_available = has_issue_key,
-		run = function(ctx, done)
-			local issue = ctx.issue
-			if not has_issue_key(ctx) or issue == nil then
-				done(nil, "No issue selected")
-				return
-			end
-
-			local issue_key = issue.key
-			local current_reporter_key =
-				vim.trim(tostring(type(issue.reporter) == "table" and issue.reporter.display_name or "")):lower()
-
-			local function to_picker_items(users)
-				local items = {}
-				for _, user in ipairs(users or {}) do
-					local user_name = vim.trim(tostring(user.display_name or "")):lower()
-					if user_name ~= current_reporter_key then
-						table.insert(
-							items,
-							{ id = user.account_id or "", label = user.display_name or "", value = user }
-						)
-					end
-				end
-				return items
-			end
-
-			async_picker.open({
-				title = string.format("Reporter for %s", issue_key),
-				prompt = "Search users",
-				initial_items = {},
-				debounce_ms = 250,
-				cache_ttl_ms = 60000,
-				fetch_on_open = false,
-				format_item = function(item)
-					return string.format("%s %s", icons.general("user"), item.label)
-				end,
-				fetch = function(fetch_ctx, fetch_done)
-					users_api.get_assignable_users(
-						{ issue_key = issue_key, project = nil },
-						fetch_ctx.query,
-						function(users, err)
-							if err then
-								fetch_done(nil, err)
-								return
-							end
-							fetch_done(to_picker_items(users), nil)
-						end
-					)
-				end,
-				on_select = function(item)
-					local selected = item.value
-					statusline.notify("loading", string.format("Changing reporter for %s...", issue_key))
-					users_api.change_reporter(issue_key, selected.account_id, function(ok, err)
-						if not ok then
-							statusline.notify("error", err or "Reporter change failed")
-							done(nil, err or "Reporter change failed")
-							return
-						end
-
-						statusline.notify(
-							"success",
-							string.format("Reporter for %s changed to %s", issue_key, selected.display_name),
-							1200
-						)
-						done({
-							changed_issue_key = issue_key,
-							message = string.format("Reporter changed to %s", selected.display_name),
-						}, nil)
-					end)
-				end,
-				on_cancel = function()
-					done({ changed_issue_key = nil, message = "Reporter change cancelled" }, nil)
-				end,
-			})
-		end,
-	},
-	{
-		id = "delete_issue",
-		label = "Delete Issue",
-		is_available = has_issue_key,
-		run = function(ctx, done)
-			local issue = ctx.issue
-			if not has_issue_key(ctx) or issue == nil then
-				done(nil, "No issue selected")
-				return
-			end
-
-			local issue_key = issue.key
-			vim.ui.input({
-				prompt = string.format("Delete issue %s? [y/N]: ", issue_key),
-			}, function(input)
-				if input == nil then
-					done({ changed_issue_key = nil, message = "Delete cancelled" }, nil)
+			return transitions_api.get_transitions(issue_key, function(transitions, err)
+				if err ~= nil or transitions == nil then
+					fetch_done(nil, err or "Failed to load transitions")
 					return
 				end
 
-				if vim.trim(tostring(input)):lower() ~= "y" then
-					done({ changed_issue_key = nil, message = "Delete cancelled" }, nil)
-					return
-				end
-
-				statusline.notify("loading", string.format("Deleting %s...", issue_key))
-				issues_api.delete_issue(issue_key, function(ok, err)
-					if not ok then
-						statusline.notify("error", err or "Delete failed")
-						done(nil, err or "Delete failed")
-						return
+				all_items = {}
+				for _, candidate in ipairs(transitions) do
+					local to_status = tostring((candidate and candidate.to_status_name) or "")
+					if current_status == "" or to_status == "" or to_status ~= current_status then
+						table.insert(all_items, {
+							id = tostring(candidate.id or ""),
+							label = to_status ~= "" and to_status or candidate.name,
+							value = candidate,
+						})
 					end
-
-					statusline.notify("success", string.format("Deleted %s", issue_key), 1200)
-					require("atlas.issues.ui.main.controller").refresh_current_view(function()
-						done({ changed_issue_key = nil, message = string.format("Deleted %s", issue_key) }, nil)
-					end)
-				end)
+				end
+				fetch_done(filter_items(query), nil)
 			end)
 		end,
-	},
-	{
-		id = "edit_issue",
-		label = "Edit Issue",
-		is_available = has_issue_key,
-		run = function(ctx, done)
-			local issue = ctx.issue
-			if not has_issue_key(ctx) or issue == nil then
-				done(nil, "No issue selected")
-				return
+		on_select = function(item)
+			local selected = item.value
+			notify.loading(string.format("Transitioning %s...", issue_key))
+			transitions_api.transition_issue(issue_key, selected.id, function(ok, err)
+				if not ok then
+					notify.error(err or "Transition failed")
+					done(nil, err or "Transition failed")
+					return
+				end
+
+				notify.success(string.format("Transitioned %s to %s", issue_key, item.label), { timeout = 1200 })
+				done({ issue_key = issue_key }, nil)
+			end)
+		end,
+		on_cancel = function()
+			done(nil, nil)
+		end,
+	})
+end
+
+---@param ctx AtlasIssueActionContext
+---@param done fun(result: IssuesActionResult|nil, err: string|nil)
+local function assign(ctx, done)
+	local issue = assert(ctx.issue)
+	---@cast issue JiraIssue
+
+	local issue_key = issue.key
+	local issue_project_key = issue.project and issue.project.key or nil
+	local current_assignee_id = issue.assignee and issue.assignee.id or nil
+
+	local function to_picker_items(users)
+		local items = {}
+		local current_user = ctx.current_user
+		local current_user_id = current_user and current_user.id or nil
+		local current_user_item = nil
+
+		if current_assignee_id then
+			table.insert(items, {
+				id = "__unassign__",
+				label = "Unassign",
+				value = { id = nil, name = "Unassign" },
+			})
+		end
+
+		for _, user in ipairs(users or {}) do
+			if user.id ~= current_assignee_id then
+				local item = { id = user.id or "", label = user.name or "", value = user }
+				if current_user_id and user.id == current_user_id then
+					current_user_item = item
+				else
+					table.insert(items, item)
+				end
 			end
+		end
 
-			local issue_key = issue.key
-			local adf = require("atlas.issues.providers.jira.converted.adf")
-			local md_to_adf = require("atlas.issues.providers.jira.converted.markdown")
-			local issue_editor = require("atlas.issues.create.jira.issue")
+		if current_user_id and current_user_id ~= current_assignee_id then
+			if not current_user_item then
+				current_user_item = {
+					id = current_user_id,
+					label = current_user.name or "",
+					value = current_user,
+				}
+			end
+			table.insert(items, 1, current_user_item)
+		end
 
-			local function open_editor(initial_description)
-				issue_editor.open(function(fields, submit_done)
-					local is_server = config.jira_config().api_type == "server"
+		return items
+	end
 
-					local desc = fields.description
-					local payload = {
-						summary = fields.summary,
-						description = type(desc) == "string" and (is_server and desc or md_to_adf.to_adf(desc))
-							or vim.NIL,
-					}
-
-					if fields.issue_type and fields.issue_type.id and fields.issue_type.id ~= "" then
-						payload.issuetype = { id = fields.issue_type.id }
+	picker.search({
+		title = string.format("Assign %s", issue_key),
+		initial_items = to_picker_items({}),
+		fetch_on_open = false,
+		format_item = function(item)
+			if item.id == "__unassign__" then
+				return item.label
+			end
+			return string.format("%s %s", icons.get("user"), item.label)
+		end,
+		fetch = function(query, fetch_done)
+			return issues_api.get_assignable_users(
+				{ issue_key = issue_key, project = issue_project_key },
+				query,
+				function(users, err)
+					if err then
+						fetch_done(nil, err)
+						return
 					end
+					fetch_done(to_picker_items(users), nil)
+				end
+			)
+		end,
+		on_select = function(item)
+			local selected = item.value
+			notify.loading(string.format("Assigning %s...", issue_key))
+			issues_api.assign_issue(issue_key, selected.id, function(ok, err)
+				if not ok then
+					notify.error(err or "Assign failed")
+					done(nil, err or "Assign failed")
+					return
+				end
 
-					if fields.assignee and fields.assignee.account_id then
-						payload.assignee = is_server and { name = fields.assignee.account_id }
-							or { id = fields.assignee.account_id }
-					else
-						payload.assignee = vim.NIL
-					end
+				if selected.id == nil then
+					notify.success(string.format("Unassigned %s", issue_key), { timeout = 1200 })
+					done({ issue_key = issue_key }, nil)
+					return
+				end
 
-					statusline.notify("loading", string.format("Updating issue %s...", issue_key))
-					issues_api.update_issue(issue_key, payload, function(ok, err)
-						if not ok then
-							submit_done(false, err or "Failed to update issue")
-							done(nil, err or "Failed to update issue")
-							return
-						end
+				notify.success(string.format("Assigned %s to %s", issue_key, selected.name), { timeout = 1200 })
+				done({ issue_key = issue_key }, nil)
+			end)
+		end,
+		on_cancel = function()
+			done(nil, nil)
+		end,
+	})
+end
 
-						submit_done(true, nil)
-						vim.schedule(function()
-							done({ changed_issue_key = issue_key, message = "Issue updated" }, nil)
-						end)
-					end)
-				end, {
-					summary = tostring(issue.summary or ""),
-					description = initial_description,
-					assignee = issue.assignee,
-					reporter = issue.reporter or issues_state.current_user,
-					project = issue.project and issue.project.key or "",
-					issue_key = issue.key,
-					issue_type = issue.type,
-				}, {
-					preview_fn = function(markdown)
-						local utils = require("atlas.ui.shared.utils")
-						return utils.encode_pretty_json(md_to_adf.to_adf(markdown))
-					end,
-				})
+---@param ctx AtlasIssueActionContext
+---@param done fun(result: IssuesActionResult|nil, err: string|nil)
+local function reporter(ctx, done)
+	local issue = assert(ctx.issue)
+
+	local issue_key = issue.key
+	local current_reporter_id = issue.reporter and issue.reporter.id or nil
+
+	local function to_picker_items(users)
+		local items = {}
+		for _, user in ipairs(users or {}) do
+			if user.id ~= current_reporter_id then
+				table.insert(items, { id = user.id or "", label = user.name or "", value = user })
 			end
+		end
+		return items
+	end
 
-			if ctx.description then
-				open_editor(ctx.description)
-				return
-			end
-
-			statusline.notify("loading", string.format("Loading description for %s...", issue_key))
-			issues_api.get_issue_description(issue_key, function(description, err)
+	picker.search({
+		title = string.format("Reporter for %s", issue_key),
+		fetch_on_open = false,
+		format_item = function(item)
+			return string.format("%s %s", icons.get("user"), item.label)
+		end,
+		fetch = function(query, fetch_done)
+			return issues_api.get_assignable_users({ issue_key = issue_key, project = nil }, query, function(users, err)
 				if err then
-					statusline.notify("warn", string.format("Failed loading description for %s", issue_key), 1200)
-					open_editor("")
+					fetch_done(nil, err)
 					return
 				end
-
-				statusline.notify("success", string.format("Loaded description for %s", issue_key), 1200)
-				if type(description) == "table" then
-					open_editor(adf.to_markdown(description))
-					return
-				elseif type(description) == "string" then
-					-- Description is a sting in Jira server API
-					open_editor(description)
-					return
-				end
-				open_editor("")
+				fetch_done(to_picker_items(users), nil)
 			end)
 		end,
-	},
-	{
-		id = "create_issue",
-		label = "Create Issue",
-		is_available = function()
-			return true, nil
-		end,
-		run = function(_, done)
-			local projects_api = require("atlas.issues.providers.jira.api.projects")
-			local md_to_adf = require("atlas.issues.providers.jira.converted.markdown")
-			local issue_editor = require("atlas.issues.create.jira.issue")
-			local function run_create(project_key)
-				issue_editor.open(function(fields, submit_done)
-					local issue_type = fields.issue_type
-					local issue_type_id = issue_type and tostring(issue_type.id or "") or ""
-					local issue_type_name = issue_type and tostring(issue_type.name or "") or ""
-
-					local api_fields = {
-						project = { key = fields.project },
-						summary = fields.summary,
-					}
-
-					if issue_type_id ~= "" then
-						api_fields.issuetype = { id = issue_type_id }
-					elseif issue_type_name ~= "" then
-						api_fields.issuetype = { name = issue_type_name }
-					else
-						submit_done(false, "Issue type is required")
-						done(nil, "Issue type is required")
-						return
-					end
-
-					local is_server = config.jira_config().api_type == "server"
-
-					local desc = fields.description
-					if type(desc) == "string" then
-						api_fields.description = is_server and desc or md_to_adf.to_adf(desc)
-					end
-
-					if fields.assignee and fields.assignee.account_id then
-						api_fields.assignee = is_server and { name = fields.assignee.account_id }
-							or { id = fields.assignee.account_id }
-					end
-
-					local raw_desc = desc
-					-- Jira Server workaround: some configs omit `description` from the create screen.
-					-- See: https://support.atlassian.com/jira/kb/can-not-create-issue-via-rest-api-field-xxx-cannot-be-set-it-is-not-on-the-appropriate-screen-or-unknown-when-using-workflow-property-jirapermissioncreateclonedenied/
-					local function commit_create(payload, was_retry)
-						issues_api.create_issue(payload, function(result, err)
-							if err then
-								if
-									not was_retry
-									and type(raw_desc) == "string"
-									and err:find("Field 'description' cannot be set", 1, true)
-								then
-									local retry = vim.deepcopy(payload)
-									retry.description = nil
-									commit_create(retry, true)
-									return
-								end
-								submit_done(false, err)
-								done(nil, err)
-								return
-							end
-
-							if result and result.key then
-								if was_retry and type(raw_desc) == "string" then
-									local update = { description = raw_desc }
-									issues_api.update_issue(result.key, update, function(ok)
-										if ok then
-											notify.info(string.format("Created %s", result.key), { timeout = 2000 })
-											submit_done(true, nil)
-											done(
-												{ changed_issue_key = result.key, message = "Created " .. result.key },
-												nil
-											)
-										else
-											notify.warn(
-												"Issue created but failed to set description",
-												{ timeout = 3000 }
-											)
-											submit_done(true, "Description not set")
-											done(
-												{ changed_issue_key = result.key, message = "Created " .. result.key },
-												nil
-											)
-										end
-									end)
-									return
-								end
-
-								notify.info(string.format("Created %s", result.key), { timeout = 2000 })
-								submit_done(true, nil)
-								done({
-									changed_issue_key = result.key,
-									message = string.format("Created %s", result.key),
-								}, nil)
-								return
-							end
-
-							submit_done(false, "Invalid response")
-							done(nil, "Invalid response")
-						end)
-					end
-
-					commit_create(api_fields, false)
-				end, {
-					summary = "",
-					description = nil,
-					assignee = nil,
-					reporter = issues_state.current_user,
-					project = project_key,
-					issue_key = nil,
-					issue_type = nil,
-				}, {
-					preview_fn = function(markdown)
-						local utils = require("atlas.ui.shared.utils")
-						return utils.encode_pretty_json(md_to_adf.to_adf(markdown))
-					end,
-				})
-			end
-
-			local all_items = nil
-
-			async_picker.open({
-				title = "Create Issue",
-				prompt = "Select project",
-				debounce_ms = 0,
-				identifier = "jira_creatable_projects",
-				format_item = function(item)
-					local provider_icon, provider_hl = icons.issues_provider("jira", "provider")
-					local project = item.value
-					local category_name = project.category and project.category.name or ""
-					if category_name ~= "" then
-						return string.format("%s %s - %s (%s)", provider_icon, item.label, project.name, category_name),
-							provider_hl
-					end
-					return string.format("%s %s - %s", provider_icon, item.label, project.name), provider_hl
-				end,
-				fetch = function(fetch_ctx, fetch_done)
-					if all_items then
-						local query = vim.trim(fetch_ctx.query):lower()
-						if query == "" then
-							fetch_done(all_items, nil)
-							return
-						end
-						local filtered = {}
-						for _, item in ipairs(all_items) do
-							local project = item.value
-							local haystack = (
-								item.label
-								.. " "
-								.. (project.name or "")
-								.. " "
-								.. (project.category and project.category.name or "")
-							):lower()
-							if haystack:find(query, 1, true) then
-								table.insert(filtered, item)
-							end
-						end
-						fetch_done(filtered, nil)
-						return
-					end
-
-					projects_api.get_projects({ maxResults = 50, total = 2, status = "live" }, function(groups, err)
-						if fetch_ctx.signal.cancelled then
-							return
-						end
-						if err or not groups then
-							fetch_done(nil, err or "Failed to load projects")
-							return
-						end
-
-						local projects = {}
-						for _, group in ipairs(groups) do
-							for _, project in ipairs(group.projects or {}) do
-								table.insert(projects, project)
-							end
-						end
-
-						local project_ids = {}
-						for _, project in ipairs(projects) do
-							local project_id = tonumber(project.id)
-							if project_id then
-								table.insert(project_ids, project_id)
-							end
-						end
-
-						users_api.get_permissions_bulk({
-							permissions = { "CREATE_ISSUES" },
-							project_ids = project_ids,
-						}, function(permission_map, perm_err)
-							if fetch_ctx.signal.cancelled then
-								return
-							end
-							if perm_err or not permission_map then
-								fetch_done(nil, perm_err or "Failed to load project permissions")
-								return
-							end
-
-							local allowed_map = permission_map.CREATE_ISSUES or {}
-							all_items = {}
-							for _, project in ipairs(projects) do
-								local project_id = tonumber(project.id)
-								if project_id and allowed_map[project_id] == true then
-									table.insert(all_items, {
-										id = tostring(project.id or ""),
-										label = tostring(project.key or ""),
-										value = project,
-									})
-								end
-							end
-
-							fetch_done(all_items, nil)
-						end)
-					end)
-				end,
-				on_select = function(item)
-					run_create(item.value.key)
-				end,
-				on_cancel = function()
-					notify.info("Create issue cancelled", { timeout = 1200 })
-					done({ changed_issue_key = nil, message = "Create issue cancelled" }, nil)
-				end,
-			})
-		end,
-	},
-	{
-		id = "search_query_issue",
-		label = "Search Issue",
-		is_available = function()
-			return true, nil
-		end,
-		run = function(_, done)
-			async_picker.open({
-				title = "Search Issues",
-				prompt = "Issue name or key",
-				debounce_ms = 200,
-				identifier = "jira_issue_picker_search",
-				cache_ttl_ms = 30000,
-				fetch_on_open = true,
-				format_item = function(item)
-					local provider_icon = icons.issues_provider("jira", "provider")
-					return string.format("%s %s", provider_icon, tostring(item.label or "")), "AtlasJiraKey"
-				end,
-				fetch = function(fetch_ctx, fetch_done)
-					local query = vim.trim(fetch_ctx.query)
-					issues_api.search_issue(query, function(items, err)
-						if fetch_ctx.signal.cancelled then
-							return
-						end
-
-						if err ~= nil or items == nil then
-							fetch_done(nil, err or "Failed to search tickets")
-							return
-						end
-
-						local picker_items = {}
-						for _, issue in ipairs(items) do
-							table.insert(picker_items, {
-								id = tostring(issue.id or issue.key),
-								label = string.format("%s - %s", issue.key, issue.summary),
-								secondary = issue.key,
-								value = issue,
-							})
-						end
-
-						fetch_done(picker_items, nil)
-					end)
-				end,
-				on_select = function(item)
-					local issue = item.value
-					local issue_key = tostring((issue or {}).key or "")
-					if issue_key == "" then
-						done(nil, "Selected issue is missing key")
-						return
-					end
-
-					local search_view = {
-						name = string.format("Search (%s)", issue_key),
-						jql = string.format('key = "%s"', issue_key),
-					}
-
-					require("atlas.issues.ui.main.controller").switch_view(search_view)
-					done({ changed_issue_key = issue_key, message = string.format("Opened %s", issue_key) }, nil)
-				end,
-				on_cancel = function()
-					done({ changed_issue_key = nil, message = "Search cancelled" }, nil)
-				end,
-			})
-		end,
-	},
-	{
-		id = "manage_templates",
-		label = "Manage Issue Templates",
-		is_available = function()
-			return true, nil
-		end,
-		run = function(ctx, done)
-			local template_store = require("atlas.issues.templates")
-			local markdown_editor = require("atlas.ui.popups.editor")
-
-			local options = {
-				{ id = "create", label = "Create template" },
-				{ id = "edit", label = "Edit template" },
-			}
-
-			vim.ui.select(options, {
-				prompt = "Templates",
-				kind = "atlas_jira_template_actions",
-				format_item = function(item)
-					return tostring((item and item.label) or "")
-				end,
-			}, function(choice)
-				if choice == nil then
-					done({ changed_issue_key = nil, message = "Template action cancelled" }, nil)
+		on_select = function(item)
+			local selected = item.value
+			notify.loading(string.format("Changing reporter for %s...", issue_key))
+			issues_api.change_reporter(issue_key, selected.id, function(ok, err)
+				if not ok then
+					notify.error(err or "Reporter change failed")
+					done(nil, err or "Reporter change failed")
 					return
 				end
 
-				if choice.id == "create" then
-					local finalized = false
-					local function finish(result, err)
-						if finalized then
-							return
-						end
-						finalized = true
-						done(result, err)
-					end
-
-					markdown_editor.open({
-						key = string.format("template_new_%d", vim.loop.hrtime()),
-						title = " New Issue Template ",
-						initial_text = tostring(ctx and ctx.description or ""),
-						on_save = function(text)
-							local markdown = tostring(text or "")
-							vim.ui.input({ prompt = "Template name: " }, function(name_input)
-								if name_input == nil then
-									finish({ changed_issue_key = nil, message = nil }, nil)
-									return
-								end
-
-								local name = vim.trim(tostring(name_input))
-								if name == "" then
-									finish(nil, "Template name is required")
-									return
-								end
-
-								local ok, write_err, existed, normalized_name =
-									template_store.write(name, markdown, { overwrite = false })
-								if ok then
-									finish({
-										changed_issue_key = nil,
-										message = string.format(
-											"Created template %s",
-											tostring(normalized_name or name)
-										),
-									}, nil)
-									return
-								end
-
-								if existed then
-									vim.ui.input({
-										prompt = string.format(
-											'Template "%s" exists. Overwrite? [y/N]: ',
-											tostring(normalized_name or name)
-										),
-									}, function(confirm)
-										if confirm == nil or vim.trim(tostring(confirm)):lower() ~= "y" then
-											finish({ changed_issue_key = nil, message = nil }, nil)
-											return
-										end
-
-										local overwrite_ok, overwrite_err, _, final_name =
-											template_store.write(name, markdown, { overwrite = true })
-										if not overwrite_ok then
-											finish(nil, overwrite_err or "Failed to overwrite template")
-											return
-										end
-
-										finish({
-											changed_issue_key = nil,
-											message = string.format(
-												"Updated template %s",
-												tostring(final_name or normalized_name or name)
-											),
-										}, nil)
-									end)
-									return
-								end
-
-								finish(nil, write_err or "Failed to create template")
-							end)
-						end,
-						on_cancel = function()
-							finish({ changed_issue_key = nil, message = nil }, nil)
-						end,
-					})
-					return
-				end
-
-				local templates, list_err = template_store.list()
-				if list_err then
-					done(nil, list_err)
-					return
-				end
-
-				if templates == nil or #templates == 0 then
-					done({ changed_issue_key = nil, message = "No templates found" }, nil)
-					return
-				end
-
-				vim.ui.select(templates, {
-					prompt = "Edit template",
-					kind = "atlas_jira_templates",
-					format_item = function(item)
-						return tostring((item and item.name) or "")
-					end,
-				}, function(selected)
-					if selected == nil then
-						done({ changed_issue_key = nil, message = "Template edit cancelled" }, nil)
-						return
-					end
-
-					local template_name = tostring(selected.name or "")
-					if template_name == "" then
-						done(nil, "Invalid template selected")
-						return
-					end
-
-					local content, read_err = template_store.read(template_name)
-					if read_err then
-						done(nil, read_err)
-						return
-					end
-
-					local finalized = false
-					local function finish(result, err)
-						if finalized then
-							return
-						end
-						finalized = true
-						done(result, err)
-					end
-
-					local key = ("template_" .. template_name):gsub("[^%w%-_]+", "_")
-					markdown_editor.open({
-						key = key,
-						title = string.format(" Template: %s ", template_name),
-						initial_text = content,
-						actions = {
-							{
-								key = "<C-d>",
-								description = "delete",
-								callback = function(editor_ctx)
-									vim.ui.input({
-										prompt = string.format('Delete template "%s"? [y/N]: ', template_name),
-									}, function(confirm)
-										if confirm == nil or vim.trim(tostring(confirm)):lower() ~= "y" then
-											return
-										end
-
-										local deleted, delete_err = template_store.delete(template_name)
-										if not deleted then
-											finish(nil, delete_err or "Failed to delete template")
-											return
-										end
-
-										editor_ctx.close()
-										finish({
-											changed_issue_key = nil,
-											message = string.format("Deleted template %s", template_name),
-										}, nil)
-									end)
-								end,
-							},
-						},
-						on_save = function(text)
-							local ok, write_err = template_store.write(template_name, text, { overwrite = true })
-							if not ok then
-								finish(nil, write_err or "Failed to update template")
-								return
-							end
-
-							finish({
-								changed_issue_key = nil,
-								message = string.format("Updated template %s", template_name),
-							}, nil)
-						end,
-						on_cancel = function()
-							finish({ changed_issue_key = nil, message = "Template edit cancelled" }, nil)
-						end,
-					})
-				end)
-			end)
-		end,
-	},
-	{
-		id = "search_issues",
-		label = "Search JQL",
-		is_available = function()
-			return true, nil
-		end,
-		run = function(_, done)
-			require("atlas.issues.providers.jira.completion.search").open(current_jql())
-			done({ changed_issue_key = nil, message = "Searching..." }, nil)
-		end,
-	},
-	{
-		id = "browse_issue",
-		label = "Open Issue In Browser",
-		hidden = true,
-		is_available = has_issue_key,
-		run = function(ctx, done)
-			local issue = ctx.issue
-			if not has_issue_key(ctx) or issue == nil then
-				done(nil, "No issue selected")
-				return
-			end
-
-			local base_url = tostring(config.jira_config().base_url or ""):gsub("/$", "")
-			local issue_key = tostring(issue.key or "")
-			if base_url == "" or issue_key == "" then
-				done(nil, "No URL found for issue")
-				return
-			end
-
-			vim.ui.open(string.format("%s/browse/%s", base_url, issue_key))
-			done({ changed_issue_key = nil, message = string.format("Opened %s in browser", issue_key) }, nil)
-		end,
-	},
-	{
-		id = "copy_issue_key",
-		label = "Copy Issue Key",
-		hidden = true,
-		is_available = has_issue_key,
-		run = function(ctx, done)
-			local issue = ctx.issue
-			if not has_issue_key(ctx) or issue == nil then
-				done(nil, "No issue selected")
-				return
-			end
-
-			local issue_key = tostring(issue.key or "")
-			if issue_key == "" then
-				done(nil, "Nothing to copy")
-				return
-			end
-
-			vim.fn.setreg("+", issue_key)
-			vim.fn.setreg('"', issue_key)
-			done({ changed_issue_key = nil, message = "Copied issue key" }, nil)
-		end,
-	},
-	{
-		id = "copy_issue_url",
-		label = "Copy Issue URL",
-		hidden = true,
-		is_available = has_issue_key,
-		run = function(ctx, done)
-			local issue = ctx.issue
-			if not has_issue_key(ctx) or issue == nil then
-				done(nil, "No issue selected")
-				return
-			end
-
-			local base_url = tostring(config.jira_config().base_url or ""):gsub("/$", "")
-			local issue_key = tostring(issue.key or "")
-			local url = (base_url ~= "" and issue_key ~= "") and string.format("%s/browse/%s", base_url, issue_key)
-				or ""
-			if url == "" then
-				done(nil, "No URL found for issue")
-				return
-			end
-
-			vim.fn.setreg("+", url)
-			vim.fn.setreg('"', url)
-			done({ changed_issue_key = nil, message = "Copied issue URL" }, nil)
-		end,
-	},
-	{
-		id = "toggle_subscription",
-		label = "Toggle subscription",
-		is_available = function(ctx)
-			if not has_issue_key(ctx) then
-				return false, "No issue selected"
-			end
-			return true, nil
-		end,
-		run = function(ctx, done)
-			local svc = require("atlas.issues.providers.jira.api.service")
-			local issue = ctx.issue
-			local issue_key = tostring(issue.key or "")
-			statusline.notify("loading", issue.is_subscribed and "Unsubscribing..." or "Subscribing...")
-
-			local function finish(subscribed, err)
-				if err then
-					statusline.notify("error", tostring(err))
-					done(nil, tostring(err))
-					return
-				end
-				issue.is_subscribed = subscribed == true
-				statusline.notify("success", issue.is_subscribed and "Subscribed" or "Unsubscribed", 1200)
-				done(
-					{ changed_issue_key = issue.key, message = issue.is_subscribed and "Subscribed" or "Unsubscribed" },
-					nil
+				notify.success(
+					string.format("Reporter for %s changed to %s", issue_key, selected.name),
+					{ timeout = 1200 }
 				)
-			end
-
-			if issue.is_subscribed ~= true then
-				svc.request("POST", "/issue/" .. issue_key .. "/watchers", nil, function(_, err)
-					finish(err == nil and true or nil, err)
-				end)
-				return
-			end
-
-			local function unsubscribe(account_id)
-				local param_name = "accountId"
-				if config.jira_config().api_type == "server" then
-					param_name = "username"
-				end
-
-				svc.request(
-					"DELETE",
-					string.format("/issue/%s/watchers?%s=%s", issue_key, param_name, account_id),
-					nil,
-					function(_, err)
-						finish(err == nil and false or nil, err)
-					end
-				)
-			end
-
-			local st = require("atlas.issues.state")
-			local current = st.current_user
-			if current and tostring(current.account_id or "") ~= "" then
-				unsubscribe(current.account_id)
-				return
-			end
-
-			require("atlas.issues.providers.jira.api.users").get_myself(function(user, err)
-				if err or not user or user.account_id == "" then
-					finish(nil, err or "Failed to fetch Jira user")
-					return
-				end
-				unsubscribe(user.account_id)
+				done({ issue_key = issue_key }, nil)
 			end)
 		end,
-	},
-}
+		on_cancel = function()
+			done(nil, nil)
+		end,
+	})
+end
 
----@param ctx table
+---@param ctx AtlasIssueActionContext
+---@param done fun(result: IssuesActionResult|nil, err: string|nil)
+local function delete_issue(ctx, done)
+	local issue = assert(ctx.issue)
+
+	local issue_key = issue.key
+	vim.ui.input({
+		prompt = string.format("Delete issue %s? [y/N]: ", issue_key),
+	}, function(input)
+		if input == nil then
+			done(nil, nil)
+			return
+		end
+
+		if vim.trim(tostring(input)):lower() ~= "y" then
+			done(nil, nil)
+			return
+		end
+
+		notify.loading(string.format("Deleting %s...", issue_key))
+		issues_api.delete_issue(issue_key, function(ok, err)
+			if not ok then
+				notify.error(err or "Delete failed")
+				done(nil, err or "Delete failed")
+				return
+			end
+
+			notify.success(string.format("Deleted %s", issue_key), { timeout = 1200 })
+			done({ issue_key = issue_key, removed = true }, nil)
+		end)
+	end)
+end
+
+---@param ctx AtlasIssueActionContext
+---@param done fun(result: IssuesActionResult|nil, err: string|nil)
+local function edit_issue(ctx, done)
+	local issue = assert(ctx.issue)
+	---@cast issue JiraIssue
+
+	return require("atlas.issues.providers.jira.ui.editor").edit(issue, function(result, err)
+		done(result and { issue_key = result.key } or nil, err)
+	end)
+end
+
+---@param groups JiraProjectGroup[]
+---@return JiraIssueProject[]
+local function flatten_projects(groups)
+	local projects = {}
+	for _, group in ipairs(groups) do
+		vim.list_extend(projects, group.projects)
+	end
+	return projects
+end
+
+---@param project JiraIssueProject
+---@return string
+local function format_project(project)
+	local label = string.format("%s %s - %s", icons.provider_icon("jira", "issues"), project.key, project.name)
+	local category = project.category and project.category.name or ""
+	return category ~= "" and label .. " (" .. category .. ")" or label
+end
+
+---@param items { label: string, value?: JiraIssueProject }[]
+---@param query string
 ---@return table[]
-function M.available(ctx)
-	local out = {}
-	for _, action in ipairs(ACTIONS) do
-		if not action.hidden and action.is_available(ctx) then
-			table.insert(out, action)
-		end
-	end
-
-	local issues_cfg = require("atlas.config").options.issues or {}
-	local custom_actions = issues_cfg.custom_actions or {}
-
-	for _, item in ipairs(custom_actions) do
-		if type(item) == "table" and type(item.label) == "string" and type(item.run) == "function" then
-			table.insert(out, {
-				id = tostring(item.id or item.label),
-				label = item.label,
-				is_available = function(action_ctx)
-					if not has_issue_key(action_ctx) then
-						return false, "No issue selected"
-					end
-					return true, nil
-				end,
-				run = function(action_ctx, done)
-					statusline.notify("loading", string.format("Running %s...", tostring(item.label)))
-
-					local done_called = false
-					local function custom_done(ok, message)
-						if done_called then
-							return
-						end
-						done_called = true
-
-						vim.schedule(function()
-							if ok == false then
-								statusline.notify("error", tostring(message or (item.label .. " failed")))
-								done(nil, tostring(message or (item.label .. " failed")))
-								return
-							end
-							statusline.notify("success", tostring(message or (item.label .. " done")))
-							done(
-								{ changed_issue_key = nil, message = tostring(message or (item.label .. " done")) },
-								nil
-							)
-						end)
-					end
-
-					local ok, err = pcall(item.run, action_ctx.issue, {
-						issue = action_ctx.issue,
-						user = issues_state.current_user,
-					}, custom_done)
-
-					if not ok then
-						custom_done(false, string.format("Custom action failed: %s", tostring(err)))
-					end
-				end,
-			})
-		end
-	end
-
-	return out
+local function filter_projects(items, query)
+	query = vim.trim(query):lower()
+	return vim.tbl_filter(function(item)
+		local project = item.value
+		local name = project and project.name or ""
+		local category = project and project.category and project.category.name or ""
+		local text = string.format("%s %s %s", item.label, name, category):lower()
+		return text:find(query, 1, true) ~= nil
+	end, items)
 end
 
----@param id string
----@return table|nil
+---@param _ AtlasIssueActionContext
+---@param done fun(result: IssuesActionResult|nil, err: string|nil)
+local function create_issue(_, done)
+	local function open_editor(project)
+		if not project then
+			notify.info("Create issue cancelled", { timeout = 1200, vim_notify = true })
+			done(nil, nil)
+			return
+		end
+
+		require("atlas.issues.providers.jira.ui.editor").open(project.key, function(result, err)
+			done(result and { issue_key = result.key } or nil, err)
+		end)
+	end
+
+	notify.loading("Loading projects...")
+	return projects_api.get_projects({ maxResults = 50, total = math.huge, status = "live" }, function(groups, err)
+		if err or not groups then
+			err = err or "Failed to load projects"
+			notify.error(err)
+			done(nil, err)
+			return
+		end
+
+		local projects = flatten_projects(groups)
+		if #projects == 0 then
+			notify.info("No Jira projects found")
+			done(nil, nil)
+			return
+		end
+
+		local project_ids = {}
+		for _, project in ipairs(projects) do
+			local project_id = tonumber(project.id)
+			if project_id then
+				table.insert(project_ids, project_id)
+			end
+		end
+
+		issues_api.get_permissions_bulk({
+			permissions = { "CREATE_ISSUES" },
+			project_ids = project_ids,
+		}, function(permission_map, perm_err)
+			if perm_err or not permission_map then
+				perm_err = perm_err or "Failed to load project permissions"
+				notify.error(perm_err)
+				done(nil, perm_err)
+				return
+			end
+
+			local allowed_map = permission_map.CREATE_ISSUES or {}
+			local allowed_projects = vim.tbl_filter(function(project)
+				return allowed_map[tonumber(project.id)] == true
+			end, projects)
+
+			notify.clear()
+			if #allowed_projects == 0 then
+				notify.info("No Jira projects allow creating issues")
+				done(nil, nil)
+			elseif #allowed_projects == 1 then
+				open_editor(allowed_projects[1])
+			else
+				picker.select({
+					title = "Create Issue",
+					items = allowed_projects,
+					format_item = format_project,
+					on_select = open_editor,
+				})
+			end
+		end)
+	end)
+end
+
+---@param issue Issue
+---@param details JiraIssueDetails
+---@return AtlasPickerPreview
+local function format_preview(issue, details)
+	local assignee = details.assignees[1]
+	local status = "**Status:** " .. (details.status or "Unknown")
+	local assignee_name = "**Assignee:** " .. (assignee and assignee.name or "Unassigned")
+	local column = math.max(vim.fn.strdisplaywidth(status), vim.fn.strdisplaywidth(assignee_name)) + 4
+	local lines = {
+		status
+			.. string.rep(" ", column - vim.fn.strdisplaywidth(status))
+			.. "**Priority:** "
+			.. (details.priority or "None"),
+		assignee_name
+			.. string.rep(" ", column - vim.fn.strdisplaywidth(assignee_name))
+			.. "**Reporter:** "
+			.. (details.reporter and details.reporter.name or "Unknown"),
+	}
+	local labels = vim.tbl_map(function(label)
+		return label.name
+	end, details.labels)
+	if #labels > 0 then
+		table.insert(lines, "**Labels:** " .. table.concat(labels, ", "))
+	end
+	for _, field in ipairs(details.custom_fields) do
+		table.insert(lines, string.format("**%s:** %s", field.name, field.formatted))
+	end
+	table.insert(lines, "")
+	table.insert(lines, "## Description")
+	table.insert(lines, "")
+	local description = vim.trim(details.description)
+	vim.list_extend(lines, vim.split(description ~= "" and description or "No description", "\n", { plain = true }))
+	return {
+		title = string.format("%s - %s", issue.key, issue.title),
+		lines = lines,
+	}
+end
+
+---@param project JiraIssueProject|nil
+---@param ctx AtlasIssueActionContext
+---@param done fun(result: IssuesActionResult|nil, err: string|nil)
+local function search_issues(project, ctx, done)
+	picker.search({
+		title = project and "Search " .. project.key .. " Issues" or "Search Issues",
+		debounce_ms = 200,
+		format_item = function(item)
+			return tostring(item.label or "")
+		end,
+		preview_item = function(item, preview_done)
+			local issue = item.value
+			return issues_api.fetch_issue({ key = issue.key }, nil, function(details, err)
+				if err or details == nil then
+					preview_done({ title = issue.key, lines = { err or "Failed to load issue" } })
+					return
+				end
+				---@cast details JiraIssueDetails
+				preview_done(format_preview(issue, details))
+			end)
+		end,
+		fetch = function(query, fetch_done)
+			return issues_api.issue_picker(project, vim.trim(query), function(items, err)
+				if err ~= nil or items == nil then
+					fetch_done(nil, err or "Failed to search tickets")
+					return
+				end
+
+				local picker_items = {}
+				for _, issue in ipairs(items) do
+					table.insert(picker_items, {
+						id = tostring(issue.id or issue.key),
+						label = string.format("%s - %s", issue.key, issue.title),
+						value = issue,
+					})
+				end
+
+				fetch_done(picker_items, nil)
+			end)
+		end,
+		on_select = function(item)
+			local issue = item.value
+			require("atlas.issues.ui.detail").open_ref({ key = issue.key }, { provider = ctx.provider })
+			done(nil, nil)
+		end,
+		on_cancel = function()
+			done(nil, nil)
+		end,
+	})
+end
+
+---@param ctx AtlasIssueActionContext
+---@param done fun(result: IssuesActionResult|nil, err: string|nil)
+local function search_issue(ctx, done)
+	return projects_api.get_projects({ maxResults = 50, total = 2, status = "live" }, function(groups, err)
+		if err or not groups then
+			notify.error(err or "Failed to load projects")
+			done(nil, err or "Failed to load projects")
+			return
+		end
+
+		local projects = flatten_projects(groups)
+		if #projects <= 1 then
+			search_issues(projects[1], ctx, done)
+			return
+		end
+
+		local items = vim.tbl_map(function(project)
+			return { id = project.id, label = project.key, value = project }
+		end, projects)
+		table.insert(items, 1, { id = "all", label = "All projects" })
+		picker.search({
+			title = "Search Issues - Project",
+			initial_items = items,
+			fetch_on_open = false,
+			debounce_ms = 0,
+			format_item = function(item)
+				local project = item.value
+				if not project then
+					return icons.provider_icon("jira", "issues") .. " " .. item.label
+				end
+				return format_project(project)
+			end,
+			fetch = function(query, fetch_done)
+				fetch_done(filter_projects(items, query), nil)
+			end,
+			on_select = function(item)
+				search_issues(item.value, ctx, done)
+			end,
+			on_cancel = function()
+				done(nil, nil)
+			end,
+		})
+	end)
+end
+
+---@param _ AtlasIssueActionContext
+---@param done fun(result: IssuesActionResult|nil, err: string|nil)
+local function open_project(_, done)
+	return projects_api.get_projects({ maxResults = 50, total = 2, status = "live" }, function(groups, err)
+		if err or not groups then
+			notify.error(err or "Failed to load projects")
+			done(nil, err or "Failed to load projects")
+			return
+		end
+
+		local projects = flatten_projects(groups)
+		if #projects == 0 then
+			notify.info("No Jira projects found")
+			done(nil, nil)
+			return
+		end
+		picker.select({
+			title = "Open Project",
+			items = projects,
+			format_item = format_project,
+			on_select = function(project)
+				if not project then
+					done(nil, nil)
+					return
+				end
+				require("atlas.issues.providers.jira.completion.search").open_query(
+					"project = " .. project.key .. " ORDER BY updated DESC"
+				)
+				done(nil, nil)
+			end,
+		})
+	end)
+end
+
+---@param _ AtlasIssueActionContext
+---@param done fun(result: IssuesActionResult|nil, err: string|nil)
+local function search_jql(_, done)
+	require("atlas.issues.providers.jira.completion.search").open(current_jql())
+	done(nil, nil)
+end
+
+---@param issue Issue
+---@return string|nil
+local function issue_url(issue)
+	local base_url = service.base_url():gsub("/$", "")
+	if base_url == "" then
+		return nil
+	end
+	return base_url .. "/browse/" .. issue.key
+end
+
+---@param ctx AtlasIssueActionContext
+---@param done fun(result: IssuesActionResult|nil, err: string|nil)
+local function browse_issue(ctx, done)
+	local issue = assert(ctx.issue)
+
+	local url = issue_url(issue)
+	if url == nil then
+		notify.error("No URL found for issue")
+		done(nil, "No URL found for issue")
+		return
+	end
+
+	vim.ui.open(url)
+	notify.success(string.format("Opened %s in browser", issue.key), { timeout = 1200 })
+	done(nil, nil)
+end
+
+---@param ctx AtlasIssueActionContext
+---@param done fun(result: IssuesActionResult|nil, err: string|nil)
+local function copy_issue_url(ctx, done)
+	local issue = assert(ctx.issue)
+
+	local url = issue_url(issue)
+	if url == nil then
+		notify.error("No URL found for issue")
+		done(nil, "No URL found for issue")
+		return
+	end
+
+	vim.fn.setreg("+", url)
+	vim.fn.setreg('"', url)
+	notify.success("Copied issue URL", { timeout = 1200 })
+	done(nil, nil)
+end
+
+---@param ctx AtlasIssueActionContext
+---@return boolean, string|nil
+local function toggle_subscription_available(ctx)
+	if not has_issue_key(ctx) then
+		return false, "No issue selected"
+	end
+	return true, nil
+end
+
+---@param ctx AtlasIssueActionContext
+---@param done fun(result: IssuesActionResult|nil, err: string|nil)
+local function toggle_subscription(ctx, done)
+	local issue = assert(ctx.issue)
+	local issue_key = tostring(issue.key or "")
+	notify.loading(issue.is_subscribed and "Unsubscribing..." or "Subscribing...")
+
+	local function finish(subscribed, err)
+		if err then
+			notify.error(tostring(err))
+			done(nil, tostring(err))
+			return
+		end
+		issue.is_subscribed = subscribed == true
+		notify.success(issue.is_subscribed and "Subscribed" or "Unsubscribed", { timeout = 1200 })
+		done({ issue_key = issue.key }, nil)
+	end
+
+	if issue.is_subscribed ~= true then
+		issues_api.set_subscription(issue_key, true, nil, finish)
+		return
+	end
+
+	local function unsubscribe(account_id)
+		issues_api.set_subscription(issue_key, false, account_id, finish)
+	end
+
+	local current = ctx.current_user
+	if current and (current.id or "") ~= "" then
+		unsubscribe(current.id)
+		return
+	end
+
+	users_api.fetch_user(function(user, err)
+		if err or not user or user.id == "" then
+			finish(nil, err or "Failed to fetch Jira user")
+			return
+		end
+		unsubscribe(user.id)
+	end)
+end
+
+register({
+	id = "transition",
+	label = "Transition",
+	icon = icons.get("transition", "actions"),
+	is_available = has_issue_key,
+	run = transition,
+})
+register({
+	id = "assign",
+	label = "Edit Assignee",
+	icon = icons.get("edit", "actions"),
+	is_available = has_issue_key,
+	run = assign,
+})
+register({
+	id = "reporter",
+	label = "Edit Reporter",
+	icon = icons.get("edit", "actions"),
+	is_available = has_issue_key,
+	run = reporter,
+})
+register({
+	id = "edit_issue",
+	label = "Edit Issue",
+	icon = icons.get("edit", "actions"),
+	is_available = has_issue_key,
+	run = edit_issue,
+})
+register({
+	id = "search",
+	label = "Search Issue",
+	icon = icons.get("search", "actions"),
+	run = search_issue,
+})
+register({
+	id = "open_project",
+	label = "Open Project",
+	icon = icons.get("search", "actions"),
+	run = open_project,
+})
+register({
+	id = "search_jql",
+	label = "Search JQL",
+	icon = icons.get("search", "actions"),
+	run = search_jql,
+})
+register({
+	id = "edit_search",
+	label = "Edit Current Search",
+	icon = icons.get("search", "actions"),
+	run = function(_, done)
+		require("atlas.issues.providers.jira.completion.search").edit(current_jql(), function(query)
+			local view = issues_state.search_view()
+			if view then
+				---@cast view AtlasJiraViewConfig
+				view.jql = query
+				view.search = nil
+				require("atlas.issues.ui.dashboard.controller").refresh_view()
+			end
+		end)
+		done(nil, nil)
+	end,
+})
+register(actions.manage_templates)
+register({
+	id = "browse_issue",
+	label = "Open Issue In Browser",
+	hidden = true,
+	is_available = has_issue_key,
+	run = browse_issue,
+})
+register(actions.copy_issue_key)
+register({
+	id = "copy_issue_url",
+	label = "Copy Issue URL",
+	hidden = true,
+	is_available = has_issue_key,
+	run = copy_issue_url,
+})
+register({
+	id = "toggle_subscription",
+	label = "Toggle subscription",
+	icon = icons.get("notification", "actions"),
+	is_available = toggle_subscription_available,
+	run = toggle_subscription,
+})
+register({
+	id = "create_issue",
+	label = "Create Issue",
+	icon = icons.get("create", "actions"),
+	run = create_issue,
+})
+register({
+	id = "delete_issue",
+	label = "Delete Issue",
+	icon = icons.get("delete", "actions"),
+	is_available = has_issue_key,
+	run = delete_issue,
+})
+
+---@param id AtlasJiraIssueActionId
+---@return AtlasIssueAction|nil
 function M.find(id)
 	for _, action in ipairs(ACTIONS) do
 		if action.id == id then

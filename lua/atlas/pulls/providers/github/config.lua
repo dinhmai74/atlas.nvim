@@ -1,23 +1,38 @@
 -- Example:
 --   require("atlas").setup({
+--     providers = {
+--       ---@type AtlasGitHubConfig
+--       github = {
+--         -- hostname = "github.company.com", -- Defaults to GH_HOST, then github.com.
+--         cache_ttl = 300, -- Seconds; 0 disables caching.
+--         -- CI options: https://github.com/emrearmagan/atlas.nvim#pipeline-configuration
+--       },
+--     },
 --     pulls = {
---       providers = {
---         github = {
---           cache_ttl = 300,
---           views = {
---             { name = "Assigned",  key = "1", search = "is:pr assignee:@me archived:false" },
---             { name = "Authored",  key = "2", search = "is:pr author:@me archived:false" },
---             { name = "Reviewing", key = "3", search = "is:pr review-requested:@me archived:false" },
---             { name = "Reviewed",  key = "4", search = "is:pr reviewed-by:@me archived:false" },
---             { name = "Mention",   key = "5", search = "is:pr mentions:@me archived:false" },
+--       ---@type AtlasGitHubPullsConfig
+--       github = {
+--         views = {
+--           {
+--             name = "Assigned",
+--             key = "1",
+--             layout = "compact", -- "compact" | "grouped" | "plain"
+--             -- current_repo = true, -- Restrict the search to the current Git repository.
+--             search = "is:pr assignee:@me archived:false",
 --           },
---           bookmarks = {
---             -- key   = "S",      -- default
---             -- label = "Search", -- default
---             items = {
---               ["Drafts"]          = "is:pr is:draft author:@me",
---               ["Recently merged"] = "is:pr is:merged author:@me sort:updated-desc",
+--           { name = "Authored",  key = "2", search = "is:pr author:@me archived:false" },
+--           { name = "Reviewing", key = "3", search = "is:pr review-requested:@me archived:false" },
+--           { name = "Reviewed",  key = "4", search = "is:pr reviewed-by:@me archived:false" },
+--           { name = "Mention",   key = "5", search = "is:pr mentions:@me archived:false" },
+--         },
+--         bookmarks = {
+--           -- key   = "S",      -- default
+--           -- label = "Search", -- default
+--           items = {
+--             ["Drafts"] = {
+--               layout = "compact",
+--               search = "is:pr is:draft author:@me",
 --             },
+--             ["Recently merged"] = "is:pr is:merged author:@me sort:updated-desc",
 --           },
 --         },
 --       },
@@ -25,14 +40,14 @@
 --   })
 
 ---@class AtlasGitHubViewConfig : AtlasPullsViewConfig
----@field search string
+
+---@class AtlasGitHubBookmarkConfig : AtlasPullsBookmarkConfig
 
 ---@class AtlasGitHubBookmarksConfig
 ---@field key string|nil    -- default "S"
 ---@field label string|nil  -- default "Search"
----@field items table<string, string>|nil
+---@field items table<string, string|AtlasGitHubBookmarkConfig>|nil
 
----@class AtlasGitHubConfig
----@field cache_ttl number|nil
+---@class AtlasGitHubPullsConfig
 ---@field views AtlasGitHubViewConfig[]|nil
 ---@field bookmarks AtlasGitHubBookmarksConfig|nil

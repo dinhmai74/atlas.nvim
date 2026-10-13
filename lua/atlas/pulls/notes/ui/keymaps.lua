@@ -11,48 +11,42 @@ local M = {}
 ---@field refresh fun()
 ---@field close fun()
 
+---@param items AtlasHelpKeyItem[]
+---@param action AtlasKeymapActionId
+---@param description string
+---@param index integer
+---@param callback function
+---@param options { mode: string[]|nil, silent: boolean|nil }|nil
+local function add(items, action, description, index, callback, options)
+	local keys = resolver.resolve(action)
+	if not keys then
+		return
+	end
+	table.insert(items, {
+		key = keys,
+		mode = options and options.mode,
+		desc = description,
+		index = index,
+		callback = callback,
+		opts = { nowait = true, silent = options and options.silent },
+	})
+end
+
 ---@param buf integer
 ---@param actions AtlasNotesUIActions
 function M.register(buf, actions)
-	local note_actions = {
-		{ key = "K", desc = "Show note details", index = 1, callback = actions.details, opts = { nowait = true } },
-		{ key = "e", desc = "Edit note", index = 2, callback = actions.edit, opts = { nowait = true } },
-		{
-			key = "d",
-			mode = { "n", "x" },
-			desc = "Delete selected notes",
-			index = 3,
-			callback = actions.delete,
-			opts = { nowait = true },
-		},
-	}
-	local fold_keys = resolver.resolve("ui.toggle_fold")
-	if fold_keys then
-		table.insert(note_actions, {
-			key = #fold_keys == 1 and fold_keys[1] or fold_keys,
-			desc = "Expand / collapse",
-			index = 4,
-			callback = actions.toggle,
-			opts = { nowait = true, silent = true },
-		})
-	end
+	local note_actions = {}
+	add(note_actions, "ui.show_details", "Show note details", 1, actions.details)
+	add(note_actions, "ui.comments.edit", "Edit note", 2, actions.edit)
+	add(note_actions, "ui.delete", "Delete selected notes", 3, actions.delete, { mode = { "n", "x" } })
+	add(note_actions, "ui.toggle_fold", "Expand / collapse", 4, actions.toggle, { silent = true })
 	help.register("Notes", note_actions, { buffer = buf, index = 100 })
-	local view = {
-		{ key = "R", desc = "Reload notes", index = 5, callback = actions.refresh, opts = { nowait = true } },
-		{ key = "q", desc = "Close notes", index = 7, callback = actions.close, opts = { nowait = true } },
-	}
-	local help_keys = resolver.resolve("ui.help")
-	if help_keys then
-		table.insert(view, {
-			key = #help_keys == 1 and help_keys[1] or help_keys,
-			desc = "Toggle help",
-			index = 6,
-			callback = function()
-				help.toggle({ buffer = buf })
-			end,
-			opts = { nowait = true },
-		})
-	end
+	local view = {}
+	add(view, "ui.refresh_view", "Reload notes", 5, actions.refresh)
+	add(view, "ui.help", "Toggle help", 6, function()
+		help.toggle({ buffer = buf })
+	end)
+	add(view, "ui.close", "Close notes", 7, actions.close)
 	help.register("View", view, { buffer = buf, index = 110 })
 end
 

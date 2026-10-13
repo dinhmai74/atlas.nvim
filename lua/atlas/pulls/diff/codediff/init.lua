@@ -1,473 +1,454 @@
-local M = {}
-
-local comments = require("atlas.pulls.diff.shared.comments")
-local events = require("atlas.core.events")
-local notes = require("atlas.pulls.diff.shared.notes")
+-- Uses CodeDiff internals for now, so upstream changes can break this.
+-- A public plugin API is planned: https://github.com/esmuellert/codediff.nvim/issues/267
+local config = require("codediff.config")
+local lifecycle = require("codediff.ui.lifecycle")
+local layout = require("codediff.ui.layout")
+local path = require("codediff.core.path")
+local virtual_file = require("codediff.core.virtual_file")
+local codediff = require("codediff.ui.view")
+local inline = require("codediff.ui.view.inline_view")
+local side_by_side = require("codediff.ui.view.side_by_side")
+local annotation_ui = require("atlas.pulls.diff.ui.annotations")
+local annotations = require("atlas.pulls.diff.codediff.annotations")
+local keymaps = require("atlas.pulls.diff.codediff.keymaps")
+local logger = require("atlas.core.logger")
 local notify = require("atlas.core.notify")
-local overlay = require("atlas.pulls.diff.shared.comments.overlay")
-local review_keymaps = require("atlas.pulls.diff.shared.keymaps")
-local statusline = require("atlas.pulls.diff.shared.statusline")
+local worktree = require("atlas.pulls.diff.worktree")
+local winbar = require("atlas.pulls.diff.ui.winbar")
+local has_refresh, refresh = pcall(require, "codediff.ui.refresh")
 
-local STATUSLINE = "%!v:lua.require'atlas.pulls.diff.codediff'.statusline()"
-
----@type table<string, DiffFileStatus>
-local FILE_STATUSES = {
-	A = "added",
-	D = "deleted",
-	M = "modified",
-	R = "renamed",
-	T = "type_changed",
-}
-
----@type table<integer, AtlasCodeDiffReview>
-local sessions = {}
-local READY_RETRIES = 80
-
----@class AtlasCodeDiffRange
----@field start_line integer
----@field end_line integer
-
----@class AtlasCodeDiffChange
----@field original AtlasCodeDiffRange
----@field modified AtlasCodeDiffRange
-
----@class AtlasCodeDiffSession
----@field original { relative: string|nil }|nil
----@field modified { relative: string|nil }|nil
----@field original_bufnr integer|nil
----@field modified_bufnr integer|nil
----@field original_win integer|nil
----@field modified_win integer|nil
----@field layout "side-by-side"|"inline"
----@field stored_diff_result { changes: AtlasCodeDiffChange[] }|nil
-
----@class AtlasCodeDiffSelection
----@field path string
----@field status string|nil
-
----@class AtlasCodeDiffExplorer
----@field bufnr integer|nil
----@field winid integer|nil
----@field current_selection AtlasCodeDiffSelection|nil
----@field current_file_path string|nil
-
----@class AtlasCodeDiffLifecycle
----@field get_session fun(tabpage: integer): AtlasCodeDiffSession|nil
----@field get_explorer fun(tabpage: integer): AtlasCodeDiffExplorer|nil
----@field find_tabpage_by_buffer fun(buf: integer): integer|nil
----@field close fun(tabpage: integer): boolean
-
----@class AtlasCodeDiffReview
----@field tabpage integer
----@field lifecycle AtlasCodeDiffLifecycle
----@field context AtlasPreparedReviewContext
----@field root string
----@field base_revision string
----@field head_revision string
----@field reload (fun(target: AtlasLoadingTarget|nil))|nil
----@field session AtlasReviewSession|nil
----@field actions AtlasReviewKeymapActions|nil
+---@class AtlasDiffCodeDiffView: AtlasDiffView
+---@field observer integer
 ---@field group integer
----@field generation integer
----@field closed boolean
----@field session_id string
+---@field loading_buf integer|nil
+---@field on_done (fun(err?: string))|nil
 
----@class AtlasCodeDiffAttachOptions
----@field root string
----@field base_revision string
----@field head_revision string
----@field reload (fun(target: AtlasLoadingTarget|nil))|nil
-
----@param value string|nil
----@return string
-local function clean_path(value)
-	local path = tostring(value or "")
-	path = path:gsub("\\", "/"):gsub("/+$", "")
-	return path
+---@param view AtlasDiffView
+local function update_panes(view)
+	local original_win, modified_win = lifecycle.get_windows(view.tabpage)
+	view.right.win = modified_win or original_win
+	view.right.buf = vim.api.nvim_win_get_buf(view.right.win)
+	view.left.win = original_win ~= view.right.win and original_win or nil
+	-- CodeDiff owns the hidden original buffer in inline mode.
+	view.left.buf = view.left.win and vim.api.nvim_win_get_buf(view.left.win) or view.right.buf
 end
 
----@param root string
----@param path string|nil
----@return string
-local function relative_path(root, path)
-	path = clean_path(path)
-	root = clean_path(root)
-	local prefix = root ~= "" and root .. "/" or ""
-	if prefix ~= "" and path:sub(1, #prefix) == prefix then
-		return path:sub(#prefix + 1)
-	end
-	path = path:gsub("^%./", "")
-	return path
-end
-
----@param entry AtlasCodeDiffReview
----@param reason string|nil
----@return table
-local function event_data(entry, reason)
-	local data = {
-		version = 1,
-		session_id = entry.session_id,
-		viewer = "codediff",
-		tabpage = entry.tabpage,
-		root = entry.root,
-		base_revision = entry.base_revision,
-		head_revision = entry.head_revision,
-	}
-	if reason then
-		data.reason = reason
-	end
-	return data
-end
-
----@param buf integer
----@param path string
----@return string[]
-local function buffer_lines(buf, path)
-	if path == "" or not vim.api.nvim_buf_is_valid(buf) then
-		return {}
-	end
-	return vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-end
-
----@param changes AtlasCodeDiffChange[]
----@param status DiffFileStatus
----@param old_line_count integer
----@param new_line_count integer
----@return AtlasDiffLineChange[]
-local function line_changes(changes, status, old_line_count, new_line_count)
-	local result = {}
-	for _, change in ipairs(changes) do
-		local old_count = math.max(0, change.original.end_line - change.original.start_line)
-		local new_count = math.max(0, change.modified.end_line - change.modified.start_line)
-		table.insert(result, {
-			old_start = math.max(0, change.original.start_line - (old_count == 0 and 1 or 0)),
-			old_count = old_count,
-			new_start = math.max(0, change.modified.start_line - (new_count == 0 and 1 or 0)),
-			new_count = new_count,
-		})
-	end
-	if #result == 0 and status == "added" and new_line_count > 0 then
-		table.insert(result, { old_start = 0, old_count = 0, new_start = 1, new_count = new_line_count })
-	elseif #result == 0 and status == "deleted" and old_line_count > 0 then
-		table.insert(result, { old_start = 1, old_count = old_line_count, new_start = 0, new_count = 0 })
-	end
-	return result
-end
-
----@param entry AtlasCodeDiffReview
-local function reload(entry)
-	if not entry.reload then
+---@param view AtlasDiffCodeDiffView
+local function redraw(view)
+	local session = lifecycle.get_session(view.tabpage)
+	if view.loading_buf or not view.current_file or not session or not session.stored_diff_result then
 		return
 	end
-	local callback = entry.reload
-	vim.cmd("tabnew")
-	local win = vim.api.nvim_get_current_win()
-	local target = {
-		tabpage = vim.api.nvim_get_current_tabpage(),
-		buf = vim.api.nvim_get_current_buf(),
-		win = win,
-		number = vim.wo[win].number,
-		relativenumber = vim.wo[win].relativenumber,
-		statuscolumn = vim.wo[win].statuscolumn,
-		statusline = vim.wo[win].statusline,
-		winbar = vim.wo[win].winbar,
-	}
-	if not entry.lifecycle.close(entry.tabpage) then
-		vim.cmd("tabclose")
+
+	update_panes(view)
+	local buf = session.single_side == "original" and session.original_bufnr or session.modified_bufnr
+	-- Older CodeDiff updates can finish after we've already selected another file.
+	if view.right.buf ~= buf then
 		return
 	end
-	M.detach(entry.tabpage, "reload")
-	vim.schedule(function()
-		callback(target)
-	end)
+
+	-- CodeDiff's inline revision buffer has no name for bufferlines or window lists.
+	if vim.bo[buf].buftype == "nofile" and vim.api.nvim_buf_get_name(buf) == "" then
+		vim.api.nvim_buf_set_name(
+			buf,
+			string.format("atlas-diff://%d/%d/%s", view.tabpage, buf, view.current_file.path)
+		)
+	end
+
+	annotations.render(view, view.current_file, session)
+
+	local on_done = view.on_done
+	view.on_done = nil
+	if on_done then
+		on_done()
+	end
 end
 
----@param entry AtlasCodeDiffReview
-local function map_review(entry)
-	local session = entry.session
-	local actions = entry.actions
-	if not session or not actions then
-		return
-	end
-	local explorer = entry.lifecycle.get_explorer(entry.tabpage)
-	local explorer_buf = explorer and explorer.bufnr
-	local buffers = { session.left.buf, session.right.buf }
-	if explorer_buf and vim.api.nvim_buf_is_valid(explorer_buf) then
-		table.insert(buffers, explorer_buf)
-	end
-	review_keymaps.register(session, actions, {
-		buffers = buffers,
-		reload = entry.reload and function()
-			reload(entry)
-		end or nil,
-	})
+---@param view AtlasDiffCodeDiffView
+local function resize(view)
+	layout.arrange(view.tabpage)
+	redraw(view)
 end
 
----@param entry AtlasCodeDiffReview
----@param session AtlasReviewSession
-local function refresh_scroll(entry, session)
-	local scroll = require("codediff.ui.scroll")
-	local current = vim.api.nvim_get_current_win()
-	local current_is_diff = current == session.left.win or current == session.right.win
-	local leader = current_is_diff and current or session.right.win or session.left.win
-	scroll.refresh(entry.tabpage, leader)
-	vim.cmd("redrawstatus")
-end
+---@param view AtlasDiffCodeDiffView
+local function observe_rendering(view)
+	local last_result, last_buf, last_tick, last_width
 
----@param entry AtlasCodeDiffReview
----@return boolean
-local function sync(entry)
-	if entry.closed or not vim.api.nvim_tabpage_is_valid(entry.tabpage) then
-		return false
-	end
-	---@type AtlasCodeDiffSession|nil
-	local codediff = entry.lifecycle.get_session(entry.tabpage)
-	if not codediff or not codediff.stored_diff_result then
-		return false
-	end
-	local explorer = entry.lifecycle.get_explorer(entry.tabpage)
-	if not explorer then
-		return false
-	end
-	local root = entry.root
-	local old_path = relative_path(root, codediff.original and codediff.original.relative)
-	local new_path = relative_path(root, codediff.modified and codediff.modified.relative)
-	local path = new_path ~= "" and new_path or old_path
-	local selection = explorer.current_selection
-	local selected_path = relative_path(root, selection and selection.path or explorer.current_file_path)
-	local status = FILE_STATUSES[tostring(selection and selection.status or ""):sub(1, 1)] or "modified"
-	if root == "" or path == "" then
-		return false
-	end
-	if selected_path ~= "" and selected_path ~= old_path and selected_path ~= new_path then
-		return false
-	end
-	if
-		not codediff.original_bufnr
-		or not codediff.modified_bufnr
-		or not vim.api.nvim_buf_is_valid(codediff.original_bufnr)
-		or not vim.api.nvim_buf_is_valid(codediff.modified_bufnr)
-	then
-		return false
-	end
-	local left_buf, left_win = codediff.original_bufnr, codediff.original_win
-	local right_buf, right_win = codediff.modified_bufnr, codediff.modified_win
-	local inline_deleted = status == "deleted"
-		and codediff.layout == "inline"
-		and right_win
-		and vim.api.nvim_win_is_valid(right_win)
-		and vim.api.nvim_win_get_buf(right_win) == left_buf
-	if inline_deleted then
-		left_win = right_win
-		right_win = nil
-	elseif right_win and vim.api.nvim_win_is_valid(right_win) and vim.api.nvim_win_get_buf(right_win) ~= right_buf then
-		return false
-	elseif
-		left_win
-		and left_win ~= right_win
-		and vim.api.nvim_win_is_valid(left_win)
-		and vim.api.nvim_win_get_buf(left_win) ~= left_buf
-	then
-		return false
-	end
-
-	local old_lines = buffer_lines(left_buf, old_path)
-	local new_lines = status == "deleted" and {} or buffer_lines(right_buf, new_path)
-	local changes = line_changes(codediff.stored_diff_result.changes or {}, status, #old_lines, #new_lines)
-	local previous = entry.session
-	local buffers_changed = not previous or previous.left.buf ~= left_buf or previous.right.buf ~= right_buf
-	if previous and buffers_changed then
-		overlay.clear_comments(previous.left.buf)
-		overlay.clear_comments(previous.right.buf)
-		notes.clear(previous)
-	end
-	local context = entry.context
-	local session = previous or { tabpage = entry.tabpage, closing = false }
-	session.head_revision = entry.head_revision
-	session.layout = codediff.layout == "inline" and not inline_deleted and "inline" or "side-by-side"
-	session.left = { buf = left_buf, win = left_win }
-	session.right = { buf = right_buf, win = right_win }
-	session.document = {
-		status = status,
-		old = { path = old_path ~= "" and old_path or path, lines = old_lines },
-		new = { path = new_path ~= "" and new_path or path, lines = new_lines },
-		changes = changes,
-		binary = false,
-	}
-	entry.session = session
-	if left_win and vim.api.nvim_win_is_valid(left_win) then
-		vim.api.nvim_set_option_value("statusline", STATUSLINE, { win = left_win, scope = "local" })
-	end
-	if right_win and vim.api.nvim_win_is_valid(right_win) then
-		vim.api.nvim_set_option_value("statusline", STATUSLINE, { win = right_win, scope = "local" })
-	end
-	if explorer.winid and vim.api.nvim_win_is_valid(explorer.winid) then
-		vim.api.nvim_set_option_value("statusline", STATUSLINE, { win = explorer.winid, scope = "local" })
-	end
-	vim.cmd("redrawstatus")
-	session.refresh_ui = function()
-		comments.render(session)
-		notes.render(session)
-		refresh_scroll(entry, session)
-	end
-	session.review_view = {
-		notify = function(level, message)
-			local notify_level = level == "error" and vim.log.levels.ERROR
-				or level == "warn" and vim.log.levels.WARN
-				or vim.log.levels.INFO
-			notify.show(notify_level, message)
-		end,
-		register_keymaps = function(actions)
-			entry.actions = actions
-			map_review(entry)
-		end,
-	}
-	if not session.review then
-		notes.attach(session, context)
-		local ok, err = pcall(comments.attach, session, context)
-		if not ok then
-			comments.detach(session)
-			notify.error("Unable to load comments: " .. tostring(err))
-		else
-			events.emit("AtlasReviewAttached", event_data(entry))
-		end
-	else
-		if buffers_changed then
-			map_review(entry)
-		end
-		session.refresh_ui()
-	end
-	return true
-end
-
----@param entry AtlasCodeDiffReview
-local function wait_until_ready(entry)
-	entry.generation = entry.generation + 1
-	local generation = entry.generation
-	local attempt = 0
-	local function check()
-		if entry.closed or entry.generation ~= generation then
-			return
-		end
-		if sync(entry) then
-			return
-		end
-		attempt = attempt + 1
-		if attempt < READY_RETRIES then
-			vim.defer_fn(check, 25)
-		end
-	end
-	vim.schedule(check)
-end
-
----@param entry AtlasCodeDiffReview
-local function register_events(entry)
+	-- Single-file panes have no diff to wait for, just their Git contents.
 	vim.api.nvim_create_autocmd("User", {
-		group = entry.group,
-		pattern = "CodeDiffFileSelect",
-		callback = function(args)
-			if args.data and args.data.tabpage == entry.tabpage then
-				wait_until_ready(entry)
-			end
-		end,
-	})
-	vim.api.nvim_create_autocmd("User", {
-		group = entry.group,
+		group = view.group,
 		pattern = "CodeDiffVirtualFileLoaded",
-		callback = function(args)
-			local buf = args.data and args.data.buf
-			if buf and entry.lifecycle.find_tabpage_by_buffer(buf) == entry.tabpage then
-				wait_until_ready(entry)
-			end
-		end,
-	})
-	vim.api.nvim_create_autocmd("User", {
-		group = entry.group,
-		pattern = "CodeDiffClose",
-		callback = function(args)
-			if args.data and args.data.tabpage == entry.tabpage then
+		callback = function(event)
+			if event.data.buf == view.loading_buf then
+				view.loading_buf = nil
 				vim.schedule(function()
-					M.detach(entry.tabpage, "viewer_closed")
+					redraw(view)
 				end)
 			end
 		end,
 	})
+
+	-- CodeDiff's file-loaded event fires before rendering finishes.
+	-- Observe its finished result during redraw, then draw our annotations afterwards.
+	vim.api.nvim_set_decoration_provider(view.observer, {
+		on_win = function(_, win, buf)
+			local session = lifecycle.get_session(view.tabpage)
+			if not session or win ~= (session.modified_win or session.original_win) then
+				return false
+			end
+
+			local result = session.stored_diff_result
+			if not view.current_file or not result then
+				return false
+			end
+
+			-- Single-file panes get their result before their contents arrive.
+			local tick = vim.api.nvim_buf_get_changedtick(buf)
+			local width = vim.api.nvim_win_get_width(win)
+			if result ~= last_result or buf ~= last_buf or tick ~= last_tick or width ~= last_width then
+				last_result, last_buf, last_tick, last_width = result, buf, tick, width
+				vim.schedule(function()
+					if lifecycle.get_session(view.tabpage) == session then
+						redraw(view)
+					end
+				end)
+			end
+			return false
+		end,
+	})
 end
 
----@param context AtlasPreparedReviewContext
----@param tabpage integer|nil
----@param opts AtlasCodeDiffAttachOptions
----@return string|nil err
-function M.attach(context, tabpage, opts)
-	local ok, lifecycle = pcall(require, "codediff.ui.lifecycle")
-	if not ok then
-		return "CodeDiff lifecycle is unavailable"
+---@param view AtlasDiffCodeDiffView
+---@param file AtlasDiffFile
+---@param on_done fun(err?: string)
+local function show_file(view, file, on_done)
+	view.on_done = nil
+	annotation_ui.close(view.tabpage)
+	annotations.clear(view)
+
+	local result = view.result
+	local root = result.worktree_root or result.root
+	local head_buf
+	if result.worktree_root and not file.binary and file.status ~= "deleted" then
+		head_buf = worktree.load(result.worktree_root, file.path)
+		if head_buf then
+			-- Our own file switches should not be handled as LSP jumps.
+			view.right.buf = head_buf
+		end
 	end
-	tabpage = tabpage or vim.api.nvim_get_current_tabpage()
-	if not lifecycle.get_session(tabpage) then
-		return "CodeDiff session is unavailable"
+
+	if file.status == "added" or file.status == "deleted" then
+		-- Tell CodeDiff we're switching files so old refresh results are ignored.
+		if has_refresh and refresh.begin then
+			refresh.begin(view.tabpage)
+		end
+
+		local deleted = file.status == "deleted"
+		---@type string|nil
+		local revision = deleted and result.base_revision or result.head_revision
+		if head_buf then
+			view.loading_buf = nil
+			revision = nil
+		else
+			local buf = vim.fn.bufadd(virtual_file.create_url(root, revision, file.path))
+			if not vim.api.nvim_buf_is_loaded(buf) then
+				view.loading_buf = buf
+			elseif view.loading_buf ~= buf then
+				view.loading_buf = nil
+			end
+		end
+
+		if codediff.get_current_layout(view.tabpage) == "inline" then
+			inline.show_single_file(view.tabpage, vim.fs.joinpath(root, file.path), {
+				git_root = root,
+				revision = revision,
+				rel_path = file.path,
+				side = deleted and "original" or "modified",
+			})
+		elseif head_buf then
+			side_by_side.show_untracked_file(view.tabpage, vim.fs.joinpath(root, file.path))
+		elseif deleted then
+			-- These helpers show a single pane, even when they are in side-by-side mode.
+			side_by_side.show_deleted_virtual_file(view.tabpage, root, file.path, revision)
+		else
+			side_by_side.show_added_virtual_file(view.tabpage, root, file.path, revision)
+		end
+	else
+		view.loading_buf = nil
+		local updated = codediff.update(view.tabpage, {
+			git_root = root,
+			original = path.make_ref(file.old_path or file.path, root),
+			modified = path.make_ref(file.path, root),
+			original_revision = result.base_revision,
+			modified_revision = head_buf and "WORKING" or result.head_revision,
+		}, config.options.diff.jump_to_first_change)
+
+		if not updated then
+			on_done("CodeDiff could not update the diff")
+			return
+		end
 	end
-	M.detach(tabpage, "replaced")
-	---@type AtlasCodeDiffReview
-	local entry = {
-		tabpage = tabpage,
-		lifecycle = lifecycle,
-		context = context,
-		root = clean_path(opts.root),
-		base_revision = opts.base_revision,
-		head_revision = opts.head_revision,
-		reload = opts.reload,
-		session = nil,
-		actions = nil,
-		group = vim.api.nvim_create_augroup("AtlasCodeDiffReview" .. tabpage, { clear = true }),
-		generation = 0,
-		closed = false,
-		session_id = events.new_id("codediff"),
-	}
-	sessions[tabpage] = entry
-	register_events(entry)
-	wait_until_ready(entry)
-	return nil
+
+	update_panes(view)
+
+	view.callbacks.on_file(file)
+	view.on_done = on_done
+	redraw(view)
 end
 
----@param tabpage integer|nil
----@param reason string|nil
-function M.detach(tabpage, reason)
-	tabpage = tabpage or vim.api.nvim_get_current_tabpage()
-	local entry = sessions[tabpage]
-	if not entry then
+---@param view AtlasDiffCodeDiffView
+local function setup_worktree(view)
+	local root = view.result.worktree_root
+	if not root then
 		return
 	end
-	sessions[tabpage] = nil
-	entry.closed = true
-	entry.generation = entry.generation + 1
-	local attached = entry.session and entry.session.review ~= nil
-	if entry.session then
-		entry.session.closing = true
-		comments.detach(entry.session)
-		notes.detach(entry.session)
-	end
-	pcall(vim.api.nvim_del_augroup_by_id, entry.group)
-	if attached then
-		events.emit("AtlasReviewDetached", event_data(entry, reason or "viewer_closed"))
-	end
+
+	vim.api.nvim_create_autocmd("BufEnter", {
+		group = view.group,
+		callback = function(event)
+			local buf = event.buf
+			local name = vim.api.nvim_buf_get_name(buf)
+			local relative = worktree.relative_path(root, name)
+			if relative and not vim.bo[buf].modified then
+				worktree.protect(buf)
+			end
+			if
+				vim.api.nvim_get_current_win() ~= view.right.win
+				or buf == view.right.buf
+				or vim.bo[buf].buftype ~= ""
+			then
+				return
+			end
+
+			view.on_done = nil
+			view.loading_buf = nil
+			view.right.buf = buf
+			annotation_ui.close(view.tabpage)
+			annotations.clear(view)
+			view.callbacks.on_file(nil)
+
+			-- LSP sets the destination cursor after entering the buffer.
+			vim.schedule(function()
+				if not vim.api.nvim_win_is_valid(view.right.win) or vim.api.nvim_win_get_buf(view.right.win) ~= buf then
+					return
+				end
+
+				local file
+				for _, item in ipairs(view.result.files) do
+					if item.path == relative then
+						file = item
+						break
+					end
+				end
+
+				if not file then
+					-- Use the same file on both sides so LSP destinations have no diff highlights.
+					local target = path.make_ref(name, root)
+					codediff.update(view.tabpage, {
+						git_root = root,
+						original = target,
+						modified = target,
+						original_revision = "WORKING",
+						modified_revision = "WORKING",
+					}, false)
+					update_panes(view)
+					return
+				end
+
+				local position = vim.api.nvim_win_call(view.right.win, vim.fn.winsaveview)
+				show_file(view, file, function(err)
+					if err then
+						logger.logerror(
+							"diff.show_file failed",
+							{ root = view.result.root, path = file.path, error = err }
+						)
+						notify.error("Unable to open " .. file.path .. "\n\n" .. err, { vim_notify = true })
+						return
+					end
+
+					vim.api.nvim_win_call(view.right.win, function()
+						vim.fn.winrestview(position)
+						vim.cmd("normal! zv")
+					end)
+				end)
+			end)
+		end,
+	})
 end
 
----@return string
-function M.statusline()
-	local entry = sessions[vim.api.nvim_get_current_tabpage()]
-	local session = entry and entry.session
-	if not session then
-		return ""
+---@param result AtlasDiffResult
+---@param callbacks AtlasDiffCallbacks
+---@return AtlasDiffCodeDiffView
+local function open(result, callbacks)
+	local options = {
+		panel = { name = "explorer" },
+		git_root = result.worktree_root or result.root,
+		original = path.empty(),
+		modified = path.empty(),
+		original_revision = result.base_revision,
+		modified_revision = result.head_revision,
+	}
+
+	local previous_tab = vim.api.nvim_get_current_tabpage()
+	local ok, state = pcall(function()
+		local opened = codediff.create(options, "")
+		---@cast opened table
+		local tabpage = vim.api.nvim_win_get_tabpage(opened.modified_win)
+
+		-- Empty panes need a valid diff result when returning to the tab.
+		if not lifecycle.get_session(tabpage).stored_diff_result.changes then
+			lifecycle.update_diff_result(tabpage, { changes = {}, moves = {} })
+		end
+		-- Panel mode creates the empty panes; Atlas supplies the explorer afterwards.
+		lifecycle.get_session(tabpage).panel = nil
+
+		---@type AtlasDiffCodeDiffView
+		local view = {
+			tabpage = tabpage,
+			result = result,
+			callbacks = callbacks,
+			annotations = {},
+			expanded_threads = {},
+			observer = vim.api.nvim_create_namespace("atlas.diff.codediff.observe." .. tabpage),
+			group = vim.api.nvim_create_augroup("AtlasDiffCodeDiff" .. tabpage, { clear = true }),
+			left = { buf = opened.original_buf, win = opened.original_win },
+			right = { buf = opened.modified_buf, win = opened.modified_win },
+		}
+		observe_rendering(view)
+		setup_worktree(view)
+
+		-- CodeDiff clears both winbars on these events, so restore our file titles afterwards.
+		vim.api.nvim_create_autocmd({ "BufWinEnter", "BufEnter", "WinEnter", "FileType" }, {
+			group = view.group,
+			callback = function()
+				local win = vim.api.nvim_get_current_win()
+				if win == view.left.win or win == view.right.win then
+					winbar.update(view)
+				end
+			end,
+		})
+		return view
+	end)
+
+	if ok then
+		return state
 	end
-	local pr = entry.context.pr
-	return statusline.render(
-		string.format("#%s %s", tostring(pr.id), tostring(pr.title)),
-		nil,
-		nil,
-		session.review,
-		session.notes
-	)
+
+	-- CodeDiff could fail after opening its tab.
+	-- so we use the new current tab to clean up what it left behind.. (hopefully)
+	-- because otherwise the broken tab would stay open
+	local tabpage = vim.api.nvim_get_current_tabpage()
+	if tabpage ~= previous_tab then
+		local session = lifecycle.get_session(tabpage)
+		local buffers = session and { session.original_bufnr, session.modified_bufnr } or {}
+
+		vim.cmd.tabclose({ range = { vim.api.nvim_tabpage_get_number(tabpage) } })
+		lifecycle.cleanup(tabpage)
+
+		for _, buf in ipairs(buffers) do
+			if vim.api.nvim_buf_is_valid(buf) then
+				vim.api.nvim_buf_delete(buf, { force = true })
+			end
+		end
+	end
+
+	error(state, 0)
 end
+
+---@param view AtlasDiffCodeDiffView
+---@return AtlasDiffSelection|nil, string|nil
+local function get_selection(view)
+	local file = view.current_file
+	local win, buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
+	local left = win == view.left.win and buf == view.left.buf
+	local right = win == view.right.win and buf == view.right.buf
+
+	if not file or not (left or right) then
+		return nil, "Select a line in the diff"
+	end
+	if file.binary then
+		return nil, "Binary files do not have review lines"
+	end
+
+	local side = (left or file.status == "deleted") and "LEFT" or "RIGHT"
+	local source = side == "LEFT" and "original" or "modified"
+	local target = side == "LEFT" and "modified" or "original"
+	local session = lifecycle.get_session(view.tabpage)
+	if view.loading_buf or not session or not session.stored_diff_result or buf ~= session[source .. "_bufnr"] then
+		return nil, "The diff is still loading"
+	end
+
+	local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+
+	local function position(line)
+		local value = { from = side == "LEFT" and line or nil, to = side == "RIGHT" and line or nil }
+		if file.status == "added" or file.status == "deleted" then
+			return value
+		end
+
+		local offset = 0
+		for _, change in ipairs(session.stored_diff_result.changes) do
+			local current, other = change[source], change[target]
+			if line < current.start_line then
+				break
+			end
+			if line < current.end_line then
+				return value
+			end
+			offset = offset + (other.end_line - other.start_line) - (current.end_line - current.start_line)
+		end
+
+		-- GitLab needs both positions for unchanged lines.
+		if side == "LEFT" then
+			value.to = line + offset
+		else
+			value.from = line + offset
+		end
+		return value
+	end
+
+	return annotation_ui.selection(view, file, side, lines, position)
+end
+
+---@param session AtlasDiffSession
+---@param actions AtlasDiffKeymapActions
+---@param groups AtlasDiffKeymapGroup[]
+local function setup_keymaps(session, actions, groups)
+	local view = session.view
+	---@cast view AtlasDiffCodeDiffView
+	keymaps.setup(session, actions, groups, {
+		toggle_layout = function()
+			local file = session.explorer.selected
+			if file and (file.status == "added" or file.status == "deleted") then
+				return
+			end
+
+			annotations.clear(view)
+			codediff.toggle_layout(view.tabpage)
+			update_panes(view)
+			view.callbacks.on_file(session.explorer.selected)
+		end,
+	})
+end
+
+---@param view AtlasDiffCodeDiffView
+local function dispose(view)
+	vim.api.nvim_set_decoration_provider(view.observer, {})
+	vim.api.nvim_del_augroup_by_id(view.group)
+	annotations.clear(view)
+	lifecycle.cleanup(view.tabpage)
+end
+
+---@type AtlasDiffRenderer
+local M = {
+	open = open,
+	show_file = show_file,
+	get_selection = get_selection,
+	navigate_annotation = annotations.navigate,
+	redraw = redraw,
+	resize = resize,
+	setup_keymaps = setup_keymaps,
+	dispose = dispose,
+}
 
 return M

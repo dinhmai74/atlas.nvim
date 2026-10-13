@@ -1,5 +1,6 @@
 local M = {}
 
+local keymaps = require("atlas.core.keymaps")
 local logger = require("atlas.core.logger")
 local table_view = require("atlas.ui.components.table_tree")
 local utils = require("atlas.ui.shared.utils")
@@ -13,13 +14,12 @@ local level_hl = {
 }
 
 local LOGS_BUFFER_NAME = "atlas://logs"
-local LOGS_WINBAR = " Atlas Logs %=%#AtlasTextMuted#↵ Toggle details   R Refresh   q Close %*"
 local REFRESH_INTERVAL_MS = 2000
 local logs_buf = nil
 local logs_win = nil
 local refresh_timer = nil
 local line_map = {}
-local expanded_row = nil
+local expanded_rows = {}
 
 ---@param line string
 ---@return table
@@ -68,9 +68,8 @@ local function ensure_buf()
 	vim.api.nvim_set_option_value("buftype", "nofile", { buf = logs_buf })
 	vim.api.nvim_set_option_value("bufhidden", "hide", { buf = logs_buf })
 	vim.api.nvim_set_option_value("swapfile", false, { buf = logs_buf })
-	vim.api.nvim_set_option_value("filetype", "atlas-logs", { buf = logs_buf })
+	vim.api.nvim_set_option_value("filetype", "atlas-ui.logs", { buf = logs_buf })
 	vim.api.nvim_set_option_value("modifiable", false, { buf = logs_buf })
-	vim.api.nvim_set_option_value("syntax", "OFF", { buf = logs_buf })
 	pcall(vim.treesitter.stop, logs_buf)
 
 	return logs_buf
@@ -84,10 +83,9 @@ local function refresh_buffer()
 	local lines = logger.read_lines()
 	local rows = {}
 	for index, line in ipairs(lines) do
-		local raw = tostring(line or "")
-		local row = parse_log_line(raw)
+		local row = parse_log_line(line)
 		row._log_index = index
-		row.display_message = (index == expanded_row and "▾ " or "▸ ") .. row.message
+		row.display_message = (expanded_rows[index] and "▾ " or "▸ ") .. row.message
 		table.insert(rows, row)
 	end
 	if #rows == 0 then
@@ -131,7 +129,7 @@ local function refresh_buffer()
 		if row ~= nil then
 			final_line_map[#final_lines] = row
 		end
-		if row ~= nil and row._log_index == expanded_row then
+		if row ~= nil and expanded_rows[row._log_index] then
 			local content = row.context ~= "" and row.context or row.message
 			for _, chunk in ipairs(utils.wrap_line(content, math.max(width - 4, 1))) do
 				table.insert(final_lines, "  " .. chunk)
@@ -142,9 +140,6 @@ local function refresh_buffer()
 		end
 	end
 
-	for _, span in ipairs(spans or {}) do
-		span.line = translated_lines[span.line] or span.line
-	end
 	line_map = final_line_map
 
 	vim.api.nvim_set_option_value("modifiable", true, { buf = logs_buf })
@@ -152,9 +147,10 @@ local function refresh_buffer()
 	vim.api.nvim_set_option_value("modifiable", false, { buf = logs_buf })
 
 	vim.api.nvim_buf_clear_namespace(logs_buf, ns, 0, -1)
-	for _, span in ipairs(spans or {}) do
-		vim.api.nvim_buf_set_extmark(logs_buf, ns, span.line, span.start_col, {
-			end_row = span.line,
+	for _, span in ipairs(spans) do
+		local line = translated_lines[span.line] or span.line
+		vim.api.nvim_buf_set_extmark(logs_buf, ns, line, span.start_col, {
+			end_row = line,
 			end_col = span.end_col,
 			hl_group = span.hl_group,
 		})
@@ -167,10 +163,10 @@ local function toggle_details()
 		return
 	end
 
-	if expanded_row == row._log_index then
-		expanded_row = nil
+	if expanded_rows[row._log_index] then
+		expanded_rows[row._log_index] = nil
 	else
-		expanded_row = row._log_index
+		expanded_rows[row._log_index] = true
 	end
 	refresh_buffer()
 	local target_line = nil
@@ -182,6 +178,23 @@ local function toggle_details()
 	if target_line ~= nil then
 		vim.api.nvim_win_set_cursor(0, { target_line, 0 })
 	end
+end
+
+local function toggle_all_details()
+	local expand = false
+	for _, row in pairs(line_map) do
+		if row._log_index and not expanded_rows[row._log_index] then
+			expand = true
+			break
+		end
+	end
+
+	for _, row in pairs(line_map) do
+		if row._log_index then
+			expanded_rows[row._log_index] = expand or nil
+		end
+	end
+	refresh_buffer()
 end
 
 local function stop_refresh_timer()
@@ -223,9 +236,6 @@ local function move_cursor_to_last_line()
 	end
 
 	local line_count = vim.api.nvim_buf_line_count(logs_buf)
-	if line_count < 1 then
-		line_count = 1
-	end
 
 	vim.api.nvim_win_set_cursor(logs_win, { line_count, 0 })
 end
@@ -251,17 +261,40 @@ function M.open()
 	vim.api.nvim_set_option_value("wrap", false, { win = logs_win })
 	vim.api.nvim_set_option_value("cursorline", true, { win = logs_win })
 	vim.api.nvim_set_option_value("winfixheight", true, { win = logs_win })
-	vim.api.nvim_set_option_value("winbar", LOGS_WINBAR, { win = logs_win })
+	local fold_keys = keymaps.resolve("ui.toggle_fold") or {}
+	local fold_all_keys = keymaps.resolve("ui.toggle_all_folds") or {}
+	local refresh_keys = keymaps.resolve("ui.refresh_view") or {}
+	local close_keys = keymaps.resolve("ui.close") or {}
+	local hints = {}
+	if #fold_keys > 0 then
+		table.insert(hints, table.concat(fold_keys, " / ") .. " Toggle details")
+	end
+	if #refresh_keys > 0 then
+		table.insert(hints, table.concat(refresh_keys, " / ") .. " Refresh")
+	end
+	if #close_keys > 0 then
+		table.insert(hints, table.concat(close_keys, " / ") .. " Close")
+	end
+	vim.api.nvim_set_option_value(
+		"winbar",
+		" Atlas Logs %=%#AtlasTextMuted#" .. table.concat(hints, "   ") .. (#hints > 0 and " " or "") .. "%*",
+		{ win = logs_win }
+	)
 	pcall(vim.api.nvim_win_set_height, logs_win, 12)
 
 	local opts = { buffer = buf, silent = true, nowait = true }
-	vim.keymap.set("n", "q", function()
-		M.close()
-	end, opts)
-	vim.keymap.set("n", "R", function()
-		refresh_buffer()
-	end, opts)
-	vim.keymap.set("n", "<CR>", toggle_details, opts)
+	for _, key in ipairs(close_keys) do
+		vim.keymap.set("n", key, M.close, opts)
+	end
+	for _, key in ipairs(refresh_keys) do
+		vim.keymap.set("n", key, refresh_buffer, opts)
+	end
+	for _, key in ipairs(fold_keys) do
+		vim.keymap.set("n", key, toggle_details, opts)
+	end
+	for _, key in ipairs(fold_all_keys) do
+		vim.keymap.set("n", key, toggle_all_details, opts)
+	end
 
 	refresh_buffer()
 	move_cursor_to_last_line()
@@ -283,10 +316,6 @@ function M.toggle()
 		return
 	end
 	M.open()
-end
-
-function M.refresh()
-	refresh_buffer()
 end
 
 return M

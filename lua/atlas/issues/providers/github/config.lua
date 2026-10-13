@@ -1,22 +1,36 @@
 -- Example:
 --   require("atlas").setup({
+--     providers = {
+--       ---@type AtlasGitHubConfig
+--       github = {
+--         -- hostname = "github.company.com", -- Defaults to GH_HOST, then github.com.
+--         cache_ttl = 300, -- Seconds; 0 disables caching.
+--       },
+--     },
 --     issues = {
---       providers = {
---         github = {
---           cache_ttl = 300,
---           views = {
---             { name = "Assigned", key = "1", search = "assignee:@me is:open" },
---             { name = "Created",  key = "2", search = "author:@me is:open" },
---             { name = "Mention",  key = "3", search = "mentions:@me is:open" },
---             { name = "Updated",  key = "4", search = "involves:@me sort:updated-desc" },
+--       ---@type AtlasGitHubIssuesConfig
+--       github = {
+--         views = {
+--           {
+--             name = "Assigned",
+--             key = "1",
+--             layout = "plain", -- "plain" | "compact"
+--             -- current_repo = true, -- Restrict the search to the current Git repository.
+--             search = "assignee:@me is:open",
 --           },
---           bookmarks = {
---             -- key   = "S",      -- default
---             -- label = "Search", -- default
---             items = {
---               ["Bugs"]       = "is:issue is:open label:bug",
---               ["Recently closed"] = "is:issue is:closed author:@me sort:updated-desc",
+--           { name = "Created",  key = "2", search = "author:@me is:open" },
+--           { name = "Mention",  key = "3", search = "mentions:@me is:open" },
+--           { name = "Updated",  key = "4", search = "involves:@me sort:updated-desc" },
+--         },
+--         bookmarks = {
+--           -- key   = "S",      -- default
+--           -- label = "Search", -- default
+--           items = {
+--             ["Bugs"] = {
+--               layout = "compact",
+--               search = "is:issue is:open label:bug",
 --             },
+--             ["Recently closed"] = "is:issue is:closed author:@me sort:updated-desc",
 --           },
 --         },
 --       },
@@ -25,13 +39,16 @@
 
 ---@class AtlasGitHubIssuesViewConfig : IssuesViewConfig
 ---@field search string
+---@field current_repo boolean|nil
+
+---@class AtlasGitHubIssuesBookmarkConfig : AtlasIssuesBookmarkConfig
+---@field search string
 
 ---@class AtlasGitHubIssuesBookmarksConfig
 ---@field key string|nil    -- default "S"
 ---@field label string|nil  -- default "Search"
----@field items table<string, string>|nil
+---@field items table<string, string|AtlasGitHubIssuesBookmarkConfig>|nil
 
 ---@class AtlasGitHubIssuesConfig
----@field cache_ttl number|nil
 ---@field views AtlasGitHubIssuesViewConfig[]|nil
 ---@field bookmarks AtlasGitHubIssuesBookmarksConfig|nil
