@@ -135,8 +135,46 @@ function M.resolve_repo_path(repo_paths, repo_name, opts)
 	return resolved, nil
 end
 
+---@param repo_name string
+---@param opts {require_git: boolean|nil, require_existing: boolean|nil, cwd: string|nil}
+---@return string|nil repo_path
+---@return string|nil err
+function M.resolve_repo_path_from_cwd(repo_name, opts)
+	opts = opts or {}
+
+	local cwd = opts.cwd or vim.fn.getcwd()
+	local root, root_err = git.repo_root(cwd)
+	if not root then
+		return nil, root_err
+	end
+
+	local remote_url, remote_err = git.remote_url(root, "origin")
+	if not remote_url then
+		return nil, remote_err
+	end
+
+	local info, parse_err = git.parse_remote_url(remote_url)
+	if not info then
+		return nil, parse_err
+	end
+
+	if info.slug ~= repo_name then
+		return nil, string.format("origin '%s' does not match '%s'", info.slug, repo_name)
+	end
+
+	root = normalize_path(root)
+
+	if opts.require_existing ~= false and vim.fn.isdirectory(root) ~= 1 then
+		return nil, string.format("mapped path does not exist: %s", root)
+	end
+	if opts.require_git ~= false and not git.is_inside_work_tree(root) then
+		return nil, string.format("mapped path is not a git repository: %s", root)
+	end
+	return root, nil
+end
+
 ---@param pr PullRequest|nil
----@param opts {require_git: boolean|nil, require_existing: boolean|nil }
+---@param opts {require_git: boolean|nil, require_existing: boolean|nil, cwd: string|nil}
 ---@return string|nil repo_path
 ---@return string|nil err
 function M.resolve_repo_path_for_pr(pr, opts)
@@ -151,7 +189,21 @@ function M.resolve_repo_path_for_pr(pr, opts)
 
 	local pulls_cfg = (config.options.pulls or {})
 	local mapping = (pulls_cfg.repo_config or {}).paths or {}
-	return M.resolve_repo_path(mapping, repo_id, opts)
+	local path, err = M.resolve_repo_path(mapping, repo_id, opts)
+	if path then
+		return path, nil
+	end
+
+	if err and not err:find("no repo_paths mapping", 1, true) then
+		return nil, err
+	end
+
+	local cwd_path, cwd_err = M.resolve_repo_path_from_cwd(repo_id, opts)
+	if cwd_path then
+		return cwd_path, nil
+	end
+
+	return nil, cwd_err or err
 end
 
 ---@param pr PullRequest
