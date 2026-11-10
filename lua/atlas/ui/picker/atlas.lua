@@ -224,6 +224,7 @@ function M.open(request)
 				if preview_win and vim.api.nvim_win_is_valid(preview_win) then
 					vim.api.nvim_set_option_value("number", false, { win = preview_win })
 					vim.api.nvim_set_option_value("relativenumber", false, { win = preview_win })
+					vim.api.nvim_set_option_value("list", false, { win = preview_win })
 					vim.api.nvim_win_set_config(preview_win, { title = " " .. (value.title or request.title) .. " " })
 				end
 			end)
@@ -438,7 +439,8 @@ function M.open(request)
 
 	local map_opts = { buffer = main_buf, silent = true, nowait = true }
 	local function map_configured(action, callback, mode)
-		for _, key in ipairs(keymaps.resolve(action) or {}) do
+		local keymap = keymaps.resolve(action)
+		for _, key in ipairs(keymap and keymap.key or {}) do
 			vim.keymap.set(mode or "n", key, callback, map_opts)
 		end
 	end

@@ -5,8 +5,6 @@
 ---| "labels"
 ---| "open_repo"
 
-local M = {}
-
 local actions = require("atlas.issues.actions")
 local utils = require("atlas.issues.actions.utils")
 local icons = require("atlas.ui.shared.icons")
@@ -47,7 +45,6 @@ end
 
 ---@type AtlasIssueAction[]
 local ACTIONS = {}
-M.items = ACTIONS
 
 ---@param action AtlasIssueAction
 local function register(action)
@@ -113,6 +110,18 @@ local function issue_available(ctx)
 		return false, "No issue selected"
 	end
 	return true, nil
+end
+
+---@param ctx AtlasIssueActionContext
+---@return boolean, string|nil
+local function repository_available(ctx)
+	local ok, err = issue_available(ctx)
+	if not ok then
+		return ok, err
+	end
+	local issue = assert(ctx.issue)
+	---@cast issue GitHubIssue
+	return issue.repo_full_name ~= "", "Could not determine repository"
 end
 
 ---@param ctx AtlasIssueActionContext
@@ -203,12 +212,6 @@ local function labels(ctx, done)
 	---@cast issue GitHubIssue
 	local key = issue.key
 	local slug = issue.repo_full_name
-	if slug == "" then
-		local err = "Could not determine repository"
-		notify.error(err)
-		done(nil, err)
-		return
-	end
 
 	---@param current_labels IssueLabel[]
 	---@param all_labels { name: string, color: string|nil }[]
@@ -386,7 +389,7 @@ local function search_issues(repo, ctx, done)
 		end,
 		preview_item = function(item, preview_done)
 			local issue = item.value
-			return issues_api.get_issue(issue.key, function(details, err)
+			return issues_api.fetch_issue(issue, nil, function(details, err)
 				if err or details == nil then
 					preview_done({ title = issue.key, lines = { err or "Failed to load issue" } })
 					return
@@ -489,16 +492,34 @@ end
 local function toggle_subscription(ctx, done)
 	local issue = assert(ctx.issue)
 	---@cast issue GitHubIssue
-	notify.loading(issue.is_subscribed and "Unsubscribing..." or "Subscribing...")
-	issues_api.set_subscription(issue, issue.is_subscribed ~= true, function(subscribed, err)
-		if err then
-			notify.error(tostring(err))
-			done(nil, tostring(err))
+
+	---@param details IssueDetails
+	local function update(details)
+		notify.loading(details.is_subscribed and "Unsubscribing..." or "Subscribing...")
+		issues_api.set_subscription(issue, details.is_subscribed ~= true, function(subscribed, err)
+			if err then
+				notify.error(tostring(err))
+				done(nil, tostring(err))
+				return
+			end
+			details.is_subscribed = subscribed
+			notify.success(details.is_subscribed and "Subscribed" or "Unsubscribed", { timeout = 1200 })
+			done({ issue_key = issue.key }, nil)
+		end)
+	end
+
+	if ctx.details then
+		update(ctx.details)
+		return
+	end
+	issues_api.fetch_issue(issue, nil, function(details, err)
+		if details == nil then
+			local message = tostring(err or "Failed to load issue details")
+			notify.error(message)
+			done(nil, message)
 			return
 		end
-		issue.is_subscribed = subscribed
-		notify.success(issue.is_subscribed and "Subscribed" or "Unsubscribed", { timeout = 1200 })
-		done({ issue_key = issue.key }, nil)
+		update(details)
 	end)
 end
 
@@ -506,16 +527,14 @@ register({
 	id = "edit_issue",
 	label = "Edit Issue",
 	icon = icons.get("edit", "actions"),
-	is_available = function(ctx)
-		return ctx.issue ~= nil, "No issue selected"
-	end,
+	is_available = issue_available,
 	run = edit_issue,
 })
 register({ id = "create_issue", label = "Create Issue", icon = icons.get("create", "actions"), run = create_issue })
 register({
 	id = "close",
 	label = "Close Issue",
-	confirmation = true,
+	confirm = "Close this issue?",
 	icon = icons.get("close", "actions"),
 	is_available = close_available,
 	run = close,
@@ -546,7 +565,7 @@ register({
 	id = "labels",
 	label = "Edit Labels",
 	icon = icons.get("label", "actions"),
-	is_available = issue_available,
+	is_available = repository_available,
 	run = labels,
 })
 register({ id = "search", label = "Search Issues", icon = icons.get("search", "actions"), run = search })
@@ -598,15 +617,4 @@ register({
 })
 register(actions.copy_issue_url)
 
----@param id AtlasGitHubIssueActionId
----@return AtlasIssueAction|nil
-function M.find(id)
-	for _, action in ipairs(ACTIONS) do
-		if action.id == id then
-			return action
-		end
-	end
-	return nil
-end
-
-return M
+return ACTIONS

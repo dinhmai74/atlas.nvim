@@ -3,6 +3,7 @@ local M = {}
 local utils = require("atlas.ui.shared.utils")
 local markdown = require("atlas.formats.markdown")
 local icons = require("atlas.ui.shared.icons")
+local reactions = require("atlas.ui.shared.reactions")
 local spinner = require("atlas.ui.components.spinner")
 local box = require("atlas.ui.components.box")
 local table_tree = require("atlas.ui.components.table_tree")
@@ -150,18 +151,19 @@ end
 ---@param lines string[]
 ---@param spans table[]
 local function render_reviewers(width, lines, spans)
-	if state.reviewers == nil or state.reviewers == "loading" then
+	local reviewers = state.reviewers
+	if reviewers == nil or reviewers == "loading" then
 		return
 	end
 
-	if type(state.reviewers) == "string" then
-		render_error("Reviewers", state.reviewers, width, lines, spans)
+	if type(reviewers) == "string" then
+		render_error("Reviewers", reviewers, width, lines, spans)
 		return
 	end
 
 	local decisions = {}
 	local others = {}
-	for _, reviewer in ipairs(state.reviewers) do
+	for _, reviewer in ipairs(reviewers) do
 		table.insert(reviewer.role == "participant" and others or decisions, reviewer)
 	end
 	local approved_count = 0
@@ -225,16 +227,17 @@ local MAX_OVERVIEW_JOBS = 5
 ---@param spans table[]
 ---@param line_map table<integer, table>
 local function render_pipelines(_pr, width, lines, spans, line_map)
-	if detail.pipelines == nil or detail.pipelines == "loading" then
+	local pipelines = detail.pipelines
+	if pipelines == nil or pipelines == "loading" then
 		return
 	end
 
-	if type(detail.pipelines) == "string" then
-		render_error("Pipelines", detail.pipelines, width, lines, spans)
+	if type(pipelines) == "string" then
+		render_error("Pipelines", pipelines, width, lines, spans)
 		return
 	end
 
-	local entries = pipeline_utils.sort_by_state(detail.pipelines)
+	local entries = pipeline_utils.sort_by_state(pipelines)
 
 	if #entries == 0 then
 		return
@@ -249,9 +252,12 @@ local function render_pipelines(_pr, width, lines, spans, line_map)
 		end
 		local state_value = tostring(pipeline.state or "UNKNOWN"):upper()
 		local icon, status_hl = icons.get(state_value, "status")
-		local label = pipeline.name
-		local job_count = tonumber(pipeline.job_count)
-		if job_count ~= nil then
+		local label = pipeline_utils.display_name(pipeline)
+		local job_count = 0
+		for _, pipeline_stage in ipairs(pipeline.stages) do
+			job_count = job_count + #pipeline_stage.jobs
+		end
+		if job_count > 0 then
 			label = string.format("%s  %d %s", label, job_count, job_count == 1 and "job" or "jobs")
 		end
 		local row = {
@@ -263,15 +269,13 @@ local function render_pipelines(_pr, width, lines, spans, line_map)
 			url = tostring(pipeline.url or ""),
 			children = {},
 		}
+		---@type { state: PullsPipelineState, stage: PullsPipelineStage, job: PullsPipelineJob }[]
 		local unnamed_jobs = {}
-		local has_named_stage = false
 		for _, pipeline_stage in ipairs(pipeline.stages) do
 			if pipeline_stage.name == nil then
 				for _, job in ipairs(pipeline_stage.jobs) do
 					table.insert(unnamed_jobs, { state = job.state, stage = pipeline_stage, job = job })
 				end
-			else
-				has_named_stage = true
 			end
 		end
 		for _, pipeline_stage in ipairs(pipeline_utils.sort_by_state(pipeline.stages)) do
@@ -308,13 +312,9 @@ local function render_pipelines(_pr, width, lines, spans, line_map)
 				url = tostring(job.url or pipeline.url or ""),
 			})
 		end
-		local total_unnamed_jobs = #unnamed_jobs
-		if not has_named_stage then
-			total_unnamed_jobs = math.max(tonumber(pipeline.job_count) or 0, total_unnamed_jobs)
-		end
-		if total_unnamed_jobs > visible_jobs then
+		if #unnamed_jobs > visible_jobs then
 			table.insert(row.children, {
-				label = string.format("+%d more", total_unnamed_jobs - visible_jobs),
+				label = string.format("+%d more", #unnamed_jobs - visible_jobs),
 				status = "",
 				muted = true,
 			})
@@ -396,25 +396,30 @@ end
 ---@param spans table[]
 local function render_description(details, width, lines, spans)
 	local desc_text = details.description or ""
+	local truncated = false
 	if vim.trim(desc_text) == "" then
 		utils.push(lines, spans, "No description provided.", "AtlasTextMuted", PADDING_X)
+	else
+		local block = description_block(desc_text, width)
+		truncated = not state.description_expanded and #block.lines > MAX_DESCRIPTION_LINES
+		if truncated then
+			block.lines = vim.list_slice(block.lines, 1, MAX_DESCRIPTION_LINES)
+			block.highlights = vim.tbl_filter(function(span)
+				return span.line < MAX_DESCRIPTION_LINES
+			end, block.highlights)
+		end
+		utils.append_block(lines, spans, block)
+	end
+
+	local reaction_text, reaction_spans = reactions.format(details.reactions)
+	if reaction_text ~= "" then
 		table.insert(lines, "")
-		return
+		utils.append_block(lines, spans, { lines = { reaction_text }, highlights = reaction_spans }, PADDING_X)
 	end
 
-	local block = description_block(desc_text, width)
-	local truncated = not state.description_expanded and #block.lines > MAX_DESCRIPTION_LINES
 	if truncated then
-		block.lines = vim.list_slice(block.lines, 1, MAX_DESCRIPTION_LINES)
-		block.highlights = vim.tbl_filter(function(span)
-			return span.line < MAX_DESCRIPTION_LINES
-		end, block.highlights)
-	end
-	utils.append_block(lines, spans, block)
-
-	if truncated then
-		local keys = require("atlas.core.keymaps").resolve("ui.toggle_fold") or {}
-		local key = keys[1] or "za"
+		local fold = require("atlas.core.keymaps").resolve("ui.toggle_fold")
+		local key = fold and fold.key[1] or "za"
 		local prefix = "Press "
 		local suffix = " to expand"
 		local hint = prefix .. key .. suffix
@@ -480,13 +485,32 @@ local function render_merge_check_group(check, width)
 		end
 	end
 
+	local indent = "  "
 	for _, message in ipairs(check.details or {}) do
-		local indent = "  "
-		local detail_width = math.max(2, content_width - vim.api.nvim_strwidth(indent))
-		for _, detail_line in ipairs(utils.wrap_line(message, detail_width)) do
-			local text = indent .. detail_line
+		if type(message) == "string" then
+			local detail_width = math.max(2, content_width - vim.api.nvim_strwidth(indent))
+			for _, detail_line in ipairs(utils.wrap_line(message, detail_width)) do
+				local text = indent .. detail_line
+				table.insert(lines, text)
+				table.insert(spans, { line = #lines - 1, start_col = 0, end_col = #text, hl_group = "AtlasTextMuted" })
+			end
+		else
+			local prefix = indent .. message.icon .. " "
+			local text_width = math.max(2, content_width - vim.api.nvim_strwidth(prefix))
+			local text = prefix .. utils.truncate(message.text, text_width)
 			table.insert(lines, text)
-			table.insert(spans, { line = #lines - 1, start_col = 0, end_col = #text, hl_group = "AtlasTextMuted" })
+			table.insert(spans, {
+				line = #lines - 1,
+				start_col = #indent,
+				end_col = #indent + #message.icon,
+				hl_group = message.icon_hl or "AtlasTextMuted",
+			})
+			table.insert(spans, {
+				line = #lines - 1,
+				start_col = #prefix,
+				end_col = #text,
+				hl_group = message.text_hl or "AtlasTextMuted",
+			})
 		end
 	end
 

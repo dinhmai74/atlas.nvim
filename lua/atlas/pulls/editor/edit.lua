@@ -1,7 +1,7 @@
 local M = {}
 
 local form = require("atlas.ui.form")
-local keymaps = require("atlas.core.keymaps")
+local github_stack = require("atlas.pulls.providers.github.stack")
 local meta = require("atlas.pulls.editor.meta")
 local notify = require("atlas.core.notify")
 local picker = require("atlas.ui.picker")
@@ -35,6 +35,17 @@ local function sorted_values(items, key)
 	end
 	table.sort(values)
 	return values
+end
+
+---@param state PullsEditPRState
+---@return boolean
+local function is_stacked(state)
+	if state.provider.id ~= "github" then
+		return false
+	end
+	local pr = state.pr
+	---@cast pr GitHubPullRequest
+	return github_stack.is_stacked(pr.stack)
 end
 
 ---@param state PullsEditPRState
@@ -137,7 +148,12 @@ local function select_reviewers(state, editor)
 		state.loading = nil
 		if err then
 			form.render_meta(editor)
-			editor.statusline:notify("error", err)
+			editor.statusline:notify("warn", err)
+			return
+		end
+		if #items == 0 then
+			form.render_meta(editor)
+			editor.statusline:notify("warn", "No reviewer candidates available")
 			return
 		end
 		if not state.reviewer_selection then
@@ -314,7 +330,9 @@ local function submit(state, editor)
 		assignees = write.fetch_assignees and state.assignees or nil,
 	}
 	if state.pr.state == "open" or state.pr.state == "draft" then
-		opts.base = state.base.branch
+		if state.base.branch ~= state.pr.destination.branch then
+			opts.base = state.base.branch
+		end
 		opts.draft = state.draft
 		opts.reviewers = state.reviewer_selection
 	end
@@ -371,11 +389,17 @@ local function render_meta(state)
 	local reviewers = meta.people("Reviewers:", reviewer_names, "None")
 	reviewers.loading = state.loading == "reviewers"
 
+	local base = { key = "Base:", value = state.base.branch, loading = state.loading == "base" }
+	if is_stacked(state) then
+		base.value = base.value .. " (stacked)"
+		base.spans = { { start_col = #state.base.branch, end_col = #base.value, hl_group = "AtlasTextMuted" } }
+	end
+
 	local rows = {
 		{ { key = "Repo:", value = pr.repo_full_name, hl = presentation.repo_hl(pr.repo_full_name) } },
 		{
 			{ key = "Head:", value = pr.source.branch },
-			{ key = "Base:", value = state.base.branch, loading = state.loading == "base" },
+			base,
 		},
 		{
 			{
@@ -409,10 +433,9 @@ local function open_editor(state)
 	local write = state.write
 	local form_keymaps = {}
 	if state.pr.state == "open" or state.pr.state == "draft" then
-		if state.provider.capabilities.repository then
+		if state.provider.capabilities.repository and not is_stacked(state) then
 			form_keymaps[#form_keymaps + 1] = {
-				key = "gb",
-				desc = "base",
+				keymap = "editor.base",
 				action = function(editor)
 					select_base(state, editor)
 				end,
@@ -420,16 +443,14 @@ local function open_editor(state)
 		end
 		if write.fetch_reviewer_candidates then
 			form_keymaps[#form_keymaps + 1] = {
-				key = "gr",
-				desc = "reviewers",
+				keymap = "editor.reviewers",
 				action = function(editor)
 					select_reviewers(state, editor)
 				end,
 			}
 		end
 		form_keymaps[#form_keymaps + 1] = {
-			key = "gD",
-			desc = "draft",
+			keymap = "editor.draft",
 			action = function(editor)
 				if state.submitting then
 					return
@@ -441,8 +462,7 @@ local function open_editor(state)
 	end
 	if write.fetch_assignees then
 		form_keymaps[#form_keymaps + 1] = {
-			key = "ga",
-			desc = "assignees",
+			keymap = "editor.assignees",
 			action = function(editor)
 				select_assignees(state, editor)
 			end,
@@ -450,23 +470,18 @@ local function open_editor(state)
 	end
 	if write.fetch_labels then
 		form_keymaps[#form_keymaps + 1] = {
-			key = "gl",
-			desc = "labels",
+			keymap = "editor.labels",
 			action = function(editor)
 				select_labels(state, editor)
 			end,
 		}
 	end
-	local diff_keys = keymaps.resolve("pulls.open_diff")
-	if diff_keys then
-		form_keymaps[#form_keymaps + 1] = {
-			key = diff_keys,
-			desc = "diff",
-			action = function(editor)
-				preview_diff(state, editor)
-			end,
-		}
-	end
+	form_keymaps[#form_keymaps + 1] = {
+		keymap = "pulls.open_diff",
+		action = function(editor)
+			preview_diff(state, editor)
+		end,
+	}
 
 	return form.open({
 		header = "Edit PR #" .. state.pr.id,

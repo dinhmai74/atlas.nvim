@@ -1,6 +1,7 @@
 local M = {}
 
 local cli = require("atlas.providers.github.client")
+local create_remotes = require("atlas.pulls.create.remotes")
 local mapper = require("atlas.pulls.providers.github.api.mapper")
 local json = require("atlas.core.json")
 local request_scope = require("atlas.core.requests")
@@ -12,13 +13,37 @@ local function invalidate_details(repo, number)
 	cli.delete_mem(string.format("github:pr:%s:%s", repo, tostring(number)))
 end
 
+local STACK_SUMMARY_FIELDS = [[
+  stackEntry {
+    position
+    stack { size }
+  }
+]]
+
+local STACK_DETAIL_FIELDS = [[
+      stackEntry {
+        position
+        stack {
+          size
+          entries(first: 50) {
+            nodes {
+              position
+              pullRequest { number }
+            }
+          }
+        }
+      }
+]]
+
 local GET_PR_GQL = [[
 query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       viewerSubscription body
+      reactionGroups { content viewerHasReacted reactors(first: 10) { totalCount nodes { ... on User { login name } ... on Bot { login } } } }
       labels(first: 100) { nodes { name color } }
       assignees(first: 10) { nodes { id login name } }
+%s
     }
   }
 }
@@ -33,11 +58,40 @@ fragment PullRequestFields on PullRequest {
   headRefName baseRefName headRefOid baseRefOid
   totalCommentsCount
   repository { name nameWithOwner url sshUrl }
-  commits(last: 1) {
-    nodes { commit { statusCheckRollup { state } } }
-  }
+%s
+%s
 }
 ]]
+
+-- GitHub's stacked pull request API, including `stackEntry`, is available on
+-- github.com but not on GitHub Enterprise Server. Omit the fields there so the
+-- query remains valid.
+---@param detail boolean
+---@return string
+local function stack_fields(detail)
+	if cli.is_enterprise_server() then
+		return ""
+	end
+	return detail and STACK_DETAIL_FIELDS or STACK_SUMMARY_FIELDS
+end
+
+---@return string
+local function check_status_fields()
+	if cli.is_enterprise_server() then
+		return "  commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }"
+	end
+	return "  statusCheckRollup { state }"
+end
+
+---@return string
+local function get_pr_gql()
+	return string.format(GET_PR_GQL, stack_fields(true))
+end
+
+---@return string
+local function pull_request_fields_gql()
+	return string.format(PULL_REQUEST_FIELDS_GQL, check_status_fields(), stack_fields(false))
+end
 
 local SEARCH_GQL = [[
 query(
@@ -74,7 +128,12 @@ query(
     pageInfo { hasNextPage endCursor }
   }
 }
-]] .. PULL_REQUEST_FIELDS_GQL
+]]
+
+---@return string
+local function search_gql()
+	return SEARCH_GQL .. "\n" .. pull_request_fields_gql()
+end
 
 ---@param queries string[]
 ---@param opts PullsFetchOpts
@@ -102,7 +161,7 @@ function M.fetch_search(queries, opts, on_done)
 		"api",
 		"graphql",
 		"-f",
-		"query=" .. vim.trim(SEARCH_GQL),
+		"query=" .. vim.trim(search_gql()),
 		"-f",
 		"query1=" .. (queries[1] or ""),
 		"-f",
@@ -200,7 +259,7 @@ function M.fetch_by_refs(refs, _, on_done)
 		"query(%s) {\n%s\n}\n%s",
 		table.concat(variables, ", "),
 		table.concat(selections, "\n"),
-		PULL_REQUEST_FIELDS_GQL
+		pull_request_fields_gql()
 	)
 	table.insert(args, "-f")
 	table.insert(args, "query=" .. query)
@@ -225,15 +284,21 @@ function M.fetch_by_refs(refs, _, on_done)
 	})
 end
 
----@param owner string
----@param repo string
----@param number number|string
+---@param ref PullRequestRef
+---@param opts PullsFetchOpts|nil
 ---@param on_done fun(details: PullRequestDetails|nil, err: string|nil)
----@param opts { force_refresh?: boolean }|nil
 ---@return { job_id: integer, cancel: fun() }|nil
-function M.get_pr(owner, repo, number, on_done, opts)
+function M.fetch_pullrequest(ref, opts, on_done)
 	opts = opts or {}
-	local repo_slug = string.format("%s/%s", owner, repo)
+	local repo_slug = ref.repo_full_name
+	local owner, repo = repo_slug:match("^([^/]+)/(.+)$")
+	if owner == nil or repo == nil then
+		vim.schedule(function()
+			on_done(nil, "Missing repository info")
+		end)
+		return nil
+	end
+	local number = ref.id
 	local cache_key = string.format("github:pr:%s:%s", repo_slug, tostring(number))
 
 	if not opts.force_refresh then
@@ -248,7 +313,7 @@ function M.get_pr(owner, repo, number, on_done, opts)
 		"api",
 		"graphql",
 		"-f",
-		"query=" .. vim.trim(GET_PR_GQL),
+		"query=" .. vim.trim(get_pr_gql()),
 		"-f",
 		"owner=" .. owner,
 		"-f",
@@ -419,41 +484,6 @@ function M.update_assignees(pr, adds, removes, on_done)
 end
 
 ---@param pr PullRequest
----@param title string
----@param on_done fun(ok: boolean, err: string|nil)
----@return { cancel: fun() }|nil
-function M.update_title(pr, title, on_done)
-	local repo_slug = pr.repo_full_name or ""
-	if repo_slug == "" then
-		vim.schedule(function()
-			on_done(false, "Missing repo")
-		end)
-		return nil
-	end
-
-	return cli.gh({
-		"pr",
-		"edit",
-		tostring(pr.id),
-		"--repo",
-		repo_slug,
-		"--title",
-		title,
-	}, function(_, err)
-		if err then
-			on_done(false, err)
-			return
-		end
-		invalidate_details(repo_slug, pr.id)
-		on_done(true, nil)
-	end, {
-		action = "Update PR title",
-		repo = repo_slug,
-		number = pr.id,
-	})
-end
-
----@param pr PullRequest
 ---@param draft boolean
 ---@param on_done fun(ok: boolean, err: string|nil)
 ---@return { cancel: fun() }|nil
@@ -492,42 +522,6 @@ function M.set_draft(pr, draft, on_done)
 end
 
 ---@param pr PullRequest
----@param description string
----@param on_done fun(ok: boolean, err: string|nil)
----@return { cancel: fun() }|nil
-function M.update_description(pr, description, on_done)
-	local repo_slug = pr.repo_full_name or ""
-	if repo_slug == "" then
-		vim.schedule(function()
-			on_done(false, "Missing repo")
-		end)
-		return nil
-	end
-
-	return cli.gh({
-		"pr",
-		"edit",
-		tostring(pr.id),
-		"--repo",
-		repo_slug,
-		"--body",
-		description,
-	}, function(_, err)
-		if err then
-			on_done(false, err)
-			return
-		end
-		invalidate_details(repo_slug, pr.id)
-		cli.delete_mem(string.format("github:desc:%s:%s", repo_slug, tostring(pr.id)))
-		on_done(true, nil)
-	end, {
-		action = "Update PR description",
-		repo = repo_slug,
-		number = pr.id,
-	})
-end
-
----@param pr PullRequest
 ---@param on_done fun(ok: boolean, err: string|nil)
 ---@return { cancel: fun() }|nil
 function M.decline(pr, on_done)
@@ -556,6 +550,17 @@ function M.decline(pr, on_done)
 	})
 end
 
+---@param slug string
+---@param err string|nil
+---@return string|nil
+local function reviewer_candidates_error(slug, err)
+	local text = tostring(err or "")
+	if text:match("403") or text:lower():match("push access") then
+		return "Reviewer suggestions require push access to " .. slug
+	end
+	return err
+end
+
 ---@param opts { repo_slug: string, pr: PullRequest|nil }
 ---@param on_done fun(reviewers: PullsReviewerCandidate[]|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
@@ -574,7 +579,7 @@ function M.fetch_reviewer_candidates(opts, on_done)
 				{ "api", "--paginate", "--slurp", string.format("repos/%s/collaborators?per_page=100", slug) },
 				function(result, err)
 					if err or type(result) ~= "table" then
-						done(nil, err or "Failed to fetch repository collaborators")
+						done(nil, reviewer_candidates_error(slug, err) or "Failed to fetch repository collaborators")
 						return
 					end
 					done(result, nil)
@@ -833,13 +838,15 @@ function M.create_pr(opts, on_done)
 		return nil
 	end
 
+	local head = create_remotes.head_ref(slug, opts.head_repo_slug, tostring(opts.head or ""))
+
 	local args = {
 		"pr",
 		"create",
 		"--repo",
 		slug,
 		"--head",
-		opts.head,
+		head,
 		"--base",
 		opts.base,
 		"--title",

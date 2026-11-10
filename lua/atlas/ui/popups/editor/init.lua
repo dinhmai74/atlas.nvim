@@ -4,7 +4,6 @@ local completion = require("atlas.completion")
 local keymaps = require("atlas.core.keymaps")
 local notify = require("atlas.core.notify")
 local utils = require("atlas.ui.shared.utils")
-local statusline = require("atlas.ui.statusline")
 local virtual_lines = require("atlas.ui.components.virtual_lines")
 
 local preview_namespace = vim.api.nvim_create_namespace("atlas.editor.preview")
@@ -71,8 +70,8 @@ local function limit_preview(preview, max_lines)
 	end
 
 	local first, last = 1, #preview.lines
-	if preview.selection then
-		local selected = preview.selection
+	local selected = preview.selection
+	if selected then
 		local count = selected.last - selected.first + 1
 		local context = math.max(0, math.min(2, math.floor((max_lines - count) / 2)))
 		first = math.max(1, selected.first - context)
@@ -126,8 +125,10 @@ function M.open(opts)
 		return nil, nil
 	end
 	local source_win = vim.api.nvim_get_current_win()
-	local submit_keys = keymaps.resolve("ui.submit") or {}
-	local close_keys = keymaps.resolve("ui.close") or {}
+	local submit = keymaps.resolve("ui.submit")
+	local close = keymaps.resolve("ui.close")
+	local submit_keys = submit and submit.key or {}
+	local close_keys = close and close.key or {}
 
 	local buf = vim.api.nvim_create_buf(false, true)
 	vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
@@ -169,11 +170,11 @@ function M.open(opts)
 		render_preview(buf, preview, width)
 	end
 	local footer_items = {}
-	if #close_keys > 0 then
-		table.insert(footer_items, string.format("%s quit", table.concat(close_keys, " / ")))
+	if close then
+		table.insert(footer_items, string.format("%s %s", table.concat(close.key, " / "), close.label))
 	end
-	if #submit_keys > 0 then
-		table.insert(footer_items, string.format("%s save+close", table.concat(submit_keys, " / ")))
+	if submit then
+		table.insert(footer_items, string.format("%s %s", table.concat(submit.key, " / "), submit.label))
 	end
 	for _, action in ipairs(opts.actions or {}) do
 		local description = action.description
@@ -203,6 +204,7 @@ function M.open(opts)
 	)
 	vim.api.nvim_set_option_value("number", false, { win = win })
 	vim.api.nvim_set_option_value("relativenumber", false, { win = win })
+	vim.api.nvim_set_option_value("list", false, { win = win })
 	vim.api.nvim_set_option_value("diff", false, { win = win })
 	vim.api.nvim_set_option_value("scrollbind", false, { win = win })
 	vim.api.nvim_set_option_value("cursorbind", false, { win = win })
@@ -211,7 +213,6 @@ function M.open(opts)
 	if opts.completion then
 		completion.attach(buf, opts.completion)
 	end
-	statusline.inherit(win, source_win)
 	local function reveal_preview()
 		vim.api.nvim_win_call(win, function()
 			vim.fn.winrestview({ topline = 1, topfill = preview_height })

@@ -29,13 +29,18 @@ query($path: ID!, $iid: String!) {
 
 local ISSUE_DETAILS_GQL = [[
 query($path: ID!, $iid: String!) {
+  currentUser { username }
   project(fullPath: $path) {
     issue(iid: $iid) {
       title
       description
+      subscribed
       assignees(first: 100) { nodes { id username name } }
       labels(first: 100) { nodes { title color } }
       milestone { id title }
+    }
+    workItems(iids: [$iid], first: 1) {
+      nodes { features { awardEmoji { awardEmoji { nodes { name user { name username } } } } } }
     }
   }
 }
@@ -69,13 +74,13 @@ query(
     search: $search
   ) {
     nodes {
+      node_id: id
       iid
       reference(full: true)
       title
       state
       issue_type: type
       confidential
-      subscribed
       author { id username name }
       assignees(first: 1) { nodes { id username name } }
       web_url: webUrl
@@ -284,8 +289,10 @@ function M.fetch_issue(ref, opts, on_done)
 			return
 		end
 		local project = json.safe_table(data).project
-		local raw = json.safe_table(project).issue
-		local details = normalizer.to_issue_details(raw)
+		local work_items = json.safe_table(json.safe_table(project).workItems).nodes
+		local viewer = json.safe_str(json.safe_table(json.safe_table(data).currentUser).username)
+		local details =
+			normalizer.to_issue_details(json.safe_table(project).issue, json.safe_table(work_items)[1], viewer)
 		if details then
 			service.set_memory_cache(cache_key, details)
 			on_done(details, nil)

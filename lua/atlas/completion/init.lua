@@ -1,5 +1,7 @@
 local M = {}
+local keymaps = require("atlas.core.keymaps")
 local requests = require("atlas.core.requests")
+local shared = require("atlas.completion.sources")
 ---@type table<integer, AtlasCompletionState>
 local attached = {}
 local loading_ns = vim.api.nvim_create_namespace("atlas.completion.loading")
@@ -19,7 +21,7 @@ local loading_ns = vim.api.nvim_create_namespace("atlas.completion.loading")
 
 ---@class AtlasCompletionSource
 ---@field triggers string[]
----@field format_mention? fun(user: AtlasUser|PullsAuthor): string|nil
+---@field format_mention? fun(user: AtlasUser): string|nil
 ---@field match? fun(before: string, triggers: string[], context: AtlasCompletionContext): integer|nil, string|nil
 ---@field complete fun(context: AtlasCompletionContext, query: string, done: fun(items: AtlasCompletionItem[]|nil, err: string|nil)): { cancel: fun() }|nil
 
@@ -284,7 +286,7 @@ local function on_event(state, event)
 end
 
 ---@param provider IssuesProvider|PullsProvider
----@param user AtlasUser|PullsAuthor|nil
+---@param user AtlasUser|nil
 ---@return string|nil
 function M.format_mention(provider, user)
 	if not user then
@@ -312,7 +314,8 @@ function M.attach(buf, opts)
 	end
 
 	local provider = require("atlas.providers")[opts.context.provider]
-	local available = provider and provider.capabilities and provider.capabilities.completion or {}
+	local own = provider and provider.capabilities and provider.capabilities.completion or {}
+	local available = vim.tbl_extend("force", shared, own)
 	local names = opts.sources or vim.tbl_keys(available)
 	if not opts.sources then
 		table.sort(names)
@@ -341,9 +344,14 @@ function M.attach(buf, opts)
 	}
 	attached[buf] = state
 
-	vim.keymap.set("i", "<C-x><C-u>", function()
-		complete(state, true)
-	end, { buffer = buf, desc = "Complete Atlas references" })
+	local keymap = keymaps.resolve("editor.complete")
+	if keymap then
+		for _, key in ipairs(keymap.key) do
+			vim.keymap.set("i", key, function()
+				complete(state, true)
+			end, { buffer = buf, desc = keymap.desc })
+		end
+	end
 	vim.api.nvim_create_autocmd({
 		"TextChangedI",
 		"TextChangedP",

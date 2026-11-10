@@ -4,11 +4,11 @@ local service = require("atlas.providers.jira.client")
 local normalizer = require("atlas.issues.providers.jira.api.mapper")
 local json = require("atlas.core.json")
 local config = require("atlas.config")
-local users_api = require("atlas.providers.jira.users")
+local jira_mapper = require("atlas.providers.jira.mapper")
 local url_encode = require("atlas.core.utils").url_encode
 local request_scope = require("atlas.core.requests")
 
----@param story_points_field string
+---@param story_points_field string|nil
 local function search_fields(story_points_field)
 	return {
 		"summary",
@@ -20,7 +20,6 @@ local function search_fields(story_points_field)
 		"priority",
 		"issuetype",
 		"duedate",
-		"watches",
 		"created",
 		"updated",
 		"resolutiondate",
@@ -42,7 +41,8 @@ end
 ---@param extra_fields string[]
 ---@return string[]
 local function detail_fields(extra_fields)
-	local fields = { "summary", "description", "issuetype", "labels", "status", "priority", "assignee", "reporter" }
+	local fields =
+		{ "summary", "description", "issuetype", "labels", "status", "priority", "assignee", "reporter", "watches" }
 	vim.list_extend(fields, extra_fields)
 	return fields
 end
@@ -187,7 +187,7 @@ function M.fetch_issue(ref, opts, callback)
 	end
 
 	local project_key = issue_key:match("^([^-]+)-")
-	local configured = config.options.issues.jira.project_config[project_key] or {}
+	local configured = (config.options.issues.jira.project_config[project_key] or {}).fields or {}
 	local extra_fields = custom_field_ids(configured)
 	local endpoint = string.format("/issue/%s?fields=%s", issue_key, table.concat(detail_fields(extra_fields), ","))
 
@@ -206,11 +206,64 @@ function M.fetch_issue(ref, opts, callback)
 	})
 end
 
----@param issue_key string
----@param on_done fun(entries: IssueActivityEntry[]|nil, err: string|nil)
+---@param refs IssueRef[]
+---@param opts IssuesFetchOpts
+---@param on_done fun(issues: Issue[], err: string|nil)
+---@return { cancel: fun() }|nil
+function M.fetch_by_refs(refs, opts, on_done)
+	if #refs == 0 then
+		on_done({}, nil)
+		return nil
+	end
+
+	local keys = vim.tbl_map(function(ref)
+		return ref.key
+	end, refs)
+	local cache_key = "jira:issues:" .. table.concat(keys, ",")
+	if opts.force_refresh then
+		service.clear_memory_cache()
+	else
+		local cached, ok = service.get_memory_cache(cache_key)
+		if ok then
+			on_done(cached, nil)
+			return nil
+		end
+	end
+
+	local story_points_field = config.options.issues.jira.project_config.story_points_field
+	local fields = search_fields(story_points_field)
+	local endpoint = "/issue/bulkfetch"
+	local data = { issueIdsOrKeys = keys, fields = fields }
+	if service.is_server() then
+		local quoted = {}
+		for _, key in ipairs(keys) do
+			table.insert(quoted, string.format('"%s"', key:gsub('"', '\\"')))
+		end
+		endpoint = "/search"
+		data = { jql = "key in (" .. table.concat(quoted, ",") .. ")", fields = fields, maxResults = #keys }
+	end
+
+	return service.request("POST", endpoint, data, function(result, err)
+		if err or not result then
+			on_done({}, err or "Failed to fetch issues")
+			return
+		end
+
+		local items = normalizer.to_issues_list(result.issues or {}, story_points_field)
+		service.set_memory_cache(cache_key, items)
+		on_done(items, nil)
+	end, {
+		action = "Fetch issues",
+		keys = table.concat(keys, ","),
+	})
+end
+
+---@param issue Issue
 ---@param opts { force_refresh?: boolean }|nil
+---@param on_done fun(entries: IssueActivityEntry[]|nil, err: string|nil)
 ---@return { job_id: integer, cancel: fun() }|nil
-function M.get_issue_history(issue_key, on_done, opts)
+function M.fetch_activity(issue, opts, on_done)
+	local issue_key = tostring(issue.key or "")
 	if issue_key == "" then
 		on_done(nil, "Missing issue key")
 		return nil
@@ -352,7 +405,7 @@ end
 ---@param project_key string
 ---@param callback fun(issue_types: IssueType[]|nil, err: string|nil)
 ---@return AtlasRequestScope|nil
-function M.get_create_meta(project_key, callback)
+function M.get_issue_types(project_key, callback)
 	if project_key == "" then
 		callback(nil, "Missing project key")
 		return nil
@@ -368,7 +421,7 @@ function M.get_create_meta(project_key, callback)
 				string.format("%s?startAt=%d&maxResults=100", endpoint, start_at),
 				nil,
 				done,
-				{ action = "Fetch create metadata", project_key = project_key }
+				{ action = "Fetch issue types", project_key = project_key }
 			)
 		end, function(result, err)
 			if err or not result then
@@ -388,6 +441,118 @@ function M.get_create_meta(project_key, callback)
 	end
 	fetch(0)
 	return requests
+end
+
+---@param project_key string
+---@param issue_type_id string
+---@param callback fun(fields: table<string, JiraMetaField>|nil, err: string|nil)
+---@return AtlasRequestScope|nil
+function M.get_create_fields(project_key, issue_type_id, callback)
+	local endpoint =
+		string.format("/issue/createmeta/%s/issuetypes/%s", url_encode(project_key), url_encode(issue_type_id))
+	local requests = request_scope.new()
+	local fields = {}
+	local function fetch(start_at)
+		requests.run(function(done)
+			return service.request(
+				"GET",
+				string.format("%s?startAt=%d&maxResults=100", endpoint, start_at),
+				nil,
+				done,
+				{ action = "Fetch create fields", project_key = project_key, issue_type_id = issue_type_id }
+			)
+		end, function(result, err)
+			if err or not result then
+				callback(nil, err or "Empty response")
+				return
+			end
+
+			local raw_fields = (service.is_server() and result.values or result.fields) or {}
+			for _, raw in ipairs(raw_fields) do
+				fields[raw.fieldId] = normalizer.to_meta_field(raw, raw.defaultValue)
+			end
+			local next_start = start_at + #raw_fields
+			if #raw_fields > 0 and result.isLast ~= true and next_start < result.total then
+				fetch(next_start)
+			else
+				callback(fields, nil)
+			end
+		end)
+	end
+	fetch(0)
+	return requests
+end
+
+---@param project_key string
+---@param callback fun(sprints: { id: string, name: string }[]|nil, err: string|nil)
+---@return AtlasRequestScope
+function M.get_sprints(project_key, callback)
+	local requests = request_scope.new()
+	requests.run(function(done)
+		return service.request(
+			"GET",
+			"/rest/agile/1.0/board?type=scrum,simple&projectKeyOrId=" .. url_encode(project_key),
+			nil,
+			done,
+			{ action = "Fetch boards", project_key = project_key }
+		)
+	end, function(boards, err)
+		-- Just the first board for now. Company-managed projects could have more I guess, but one has been enough so far (for me :))
+		local board = boards and (boards.values or {})[1]
+		if err or not boards then
+			callback(nil, err or "Empty response")
+			return
+		elseif not board then
+			callback({}, nil)
+			return
+		end
+
+		requests.run(function(done)
+			return service.request(
+				"GET",
+				string.format("/rest/agile/1.0/board/%s/sprint?state=active,future", board.id),
+				nil,
+				done,
+				{ action = "Fetch sprints", board_id = board.id }
+			)
+		end, function(sprints, sprints_err)
+			if sprints_err or not sprints then
+				callback(nil, sprints_err or "Empty response")
+				return
+			end
+			callback(
+				vim.tbl_map(function(sprint)
+					return { id = tostring(sprint.id), name = tostring(sprint.name) }
+				end, sprints.values or {}),
+				nil
+			)
+		end)
+	end)
+	return requests
+end
+
+---@param issue_key string
+---@param callback fun(fields: table<string, JiraMetaField>|nil, err: string|nil)
+---@return { job_id: integer, cancel: fun() }|nil
+function M.get_edit_fields(issue_key, callback)
+	local endpoint = string.format("/issue/%s?expand=editmeta&fields=*all", issue_key)
+
+	return service.request("GET", endpoint, nil, function(result, err)
+		if err or not result then
+			callback(nil, err or "Empty response")
+			return
+		end
+
+		local values = result.fields or {}
+		local fields = {}
+		for field_id, raw in pairs((result.editmeta or {}).fields or {}) do
+			fields[field_id] = normalizer.to_meta_field(raw, values[field_id])
+		end
+		callback(fields, nil)
+	end, {
+		action = "Fetch edit fields",
+		issue_key = issue_key,
+	})
 end
 
 ---@param opts { project: string|nil, issue_key: string|nil }
@@ -429,7 +594,7 @@ function M.get_assignable_users(opts, query, callback)
 
 		local users = {}
 		for _, raw in ipairs(result) do
-			local user = users_api.to_user(raw)
+			local user = jira_mapper.to_user(raw)
 			if user then
 				table.insert(users, user)
 			end
@@ -441,88 +606,6 @@ function M.get_assignable_users(opts, query, callback)
 		issue_key = issue_key,
 		project = project,
 		query = q,
-	})
-end
-
----@param opts { permissions?: string[]|nil, project_ids?: integer[]|nil, issue_ids?: integer[]|nil, account_id?: string|nil }
----@param callback fun(permissions: table<string, table<number, boolean>>|nil, err: string|nil)
----@return { job_id: integer, cancel: fun() }|nil
-function M.get_permissions_bulk(opts, callback)
-	opts = opts or {}
-
-	local permissions_list = {}
-	for _, key in ipairs(opts.permissions or {}) do
-		local value = vim.trim(key)
-		if value ~= "" then
-			table.insert(permissions_list, value)
-		end
-	end
-
-	if #permissions_list == 0 then
-		callback(nil, "Missing permissions")
-		return nil
-	end
-
-	local project_ids = opts.project_ids or {}
-	local issue_ids = opts.issue_ids or {}
-
-	local payload = {
-		projectPermissions = {
-			{
-				permissions = permissions_list,
-				projects = project_ids,
-				issues = issue_ids,
-			},
-		},
-	}
-
-	if opts.account_id and opts.account_id ~= "" then
-		payload.accountId = opts.account_id
-	end
-
-	return service.request("POST", "/permissions/check", payload, function(result, err)
-		if err ~= nil then
-			-- Handle 404 as a fallback since Jira server API don't have bulk permissions endpoint
-			if err and err:find("HTTP 404", 1, true) == 1 then
-				local fallback = {}
-				for _, key in ipairs(permissions_list) do
-					fallback[key] = {}
-					for _, pid in ipairs(project_ids) do
-						fallback[key][pid] = true
-					end
-					for _, iid in ipairs(issue_ids) do
-						fallback[key][iid] = true
-					end
-				end
-				callback(fallback, nil)
-				return
-			end
-			callback(nil, err or "Empty response")
-			return
-		end
-
-		---@type table<string, table<number, boolean>>
-		local permissions = {}
-		for _, entry in ipairs(result.projectPermissions or {}) do
-			local permission_key = type(entry.permission) == "string" and entry.permission or ""
-			if permission_key ~= "" then
-				permissions[permission_key] = permissions[permission_key] or {}
-				for _, project_id in ipairs(entry.projects or {}) do
-					local id_num = tonumber(project_id)
-					if id_num ~= nil then
-						permissions[permission_key][id_num] = true
-					end
-				end
-			end
-		end
-
-		callback(permissions, nil)
-	end, {
-		action = "Fetch bulk permissions",
-		permissions = permissions_list,
-		project_count = #project_ids,
-		issue_count = #issue_ids,
-		account_id = opts.account_id,
 	})
 end
 

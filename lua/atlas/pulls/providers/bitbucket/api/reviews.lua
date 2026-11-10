@@ -10,7 +10,7 @@ local service = require("atlas.providers.bitbucket.client")
 local tasks = require("atlas.pulls.providers.bitbucket.api.tasks")
 
 ---@param user table|nil
----@return PullsAuthor|nil
+---@return AtlasUser|nil
 local function review_author(user)
 	if not user then
 		return nil
@@ -24,7 +24,6 @@ local function review_author(user)
 		id = tostring(user.account_id or user.uuid or user.id or ""),
 		name = name ~= "" and name or username,
 		username = username,
-		nickname = username ~= "" and username or nil,
 	}
 end
 
@@ -92,6 +91,7 @@ local function fetch_thread_comments(pr, opts, on_done)
 	local sep = pr.links.comments:find("?") and "&" or "?"
 	local fields = "%2Bvalues.resolution.user%2C%2Bvalues.resolution.created_on%2C%2Bvalues.inline.*"
 		.. "%2C-values.inline.src_rev%2C-values.inline.dest_rev%2C-values.inline.base_rev"
+		.. "%2C-values.pullrequest%2C-values.user.links%2C-values.links.self%2C-values.links.code"
 	local url = string.format("%s%spagelen=100&fields=%s", pr.links.comments, sep, fields)
 	local key = "bitbucket:pr:threads:" .. url
 	if not (opts or {}).force_refresh then
@@ -108,7 +108,7 @@ local function fetch_thread_comments(pr, opts, on_done)
 		end
 		local items = {}
 		for _, raw in ipairs(result.values) do
-			local comment = mapper.to_comment(raw)
+			local comment = mapper.to_comment(raw, pr.author.id)
 			if comment then
 				local inline = json.safe_table(raw.inline)
 				comment.hunk = diff_parser.parse_hunk(json.safe_str(inline.context_lines) or "")

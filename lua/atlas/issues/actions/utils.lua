@@ -2,6 +2,7 @@ local M = {}
 
 local config = require("atlas.config")
 local console = require("atlas.ui.console")
+local icons = require("atlas.ui.shared.icons")
 local logger = require("atlas.core.logger")
 local notify = require("atlas.core.notify")
 
@@ -15,7 +16,7 @@ function M.issue_preview(issue, details)
 	local label_names = vim.tbl_map(function(label)
 		return label.name
 	end, details.labels)
-	local author = issue.reporter and issue.reporter.name or "Unknown"
+	local author = issue.reporter and ("@" .. (issue.reporter.username or issue.reporter.name)) or "Unknown"
 	local lines = {
 		"**Status:** " .. tostring(issue.status or "Open"),
 		"**Author:** " .. author,
@@ -66,11 +67,14 @@ end
 ---@param item AtlasIssuesCustomAction
 ---@return AtlasIssueAction
 local function custom_action(item)
+	local confirm = item.confirm
 	return {
 		id = item.id,
 		label = item.label,
 		icon = item.icon,
-		confirmation = item.confirmation,
+		confirm = type(confirm) == "function" and function(context)
+			return confirm(assert(context.issue))
+		end or confirm,
 		is_available = has_issue,
 		run = function(context, done)
 			notify.loading(string.format("Running %s...", item.label))
@@ -152,16 +156,6 @@ function M.custom_actions()
 	return actions
 end
 
----@param id string
----@return AtlasIssueAction|nil
-function M.find_custom_action(id)
-	for _, action in ipairs(M.custom_actions()) do
-		if action.id == id then
-			return action
-		end
-	end
-end
-
 M.browse_issue = {
 	id = "browse_issue",
 	label = "Open Issue In Browser",
@@ -197,7 +191,7 @@ M.copy_issue_key = {
 M.copy_issue_url = {
 	id = "copy_issue_url",
 	label = "Copy Issue URL",
-	hidden = true,
+	icon = icons.get("link"),
 	is_available = has_issue,
 	run = function(context, done)
 		local url = tostring(context.issue and context.issue.url or "")
@@ -208,7 +202,7 @@ M.copy_issue_url = {
 		end
 		vim.fn.setreg("+", url)
 		vim.fn.setreg('"', url)
-		notify.success("Copied issue URL", { timeout = 1200 })
+		notify.success("Copied URL", { timeout = 1200 })
 		done(nil, nil)
 	end,
 }

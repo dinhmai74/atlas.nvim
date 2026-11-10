@@ -1,0 +1,79 @@
+local resolver = require("atlas.core.keymaps")
+local help = require("atlas.ui.popups.help")
+
+local M = {}
+
+---@param buf integer
+---@param actions table[]
+---@return table<string, AtlasHelpKeyItem[]>
+local function register(buf, actions)
+	local groups = { General = {}, Filters = {} }
+	for _, action in ipairs(actions) do
+		if action.keymap then
+			table.insert(groups[action.group or "General"], {
+				key = action.keymap.key,
+				desc = action.keymap.desc,
+				index = action.index,
+				callback = action.callback,
+				opts = { silent = true, nowait = true },
+			})
+		end
+	end
+
+	help.register("General", groups.General, { buffer = buf, index = 1 })
+	help.register("Filters", groups.Filters, { buffer = buf, index = 2 })
+	return groups
+end
+
+---@param state RepositoryBuilds
+---@param callbacks table<string, function>
+function M.setup(state, callbacks)
+	local actions = {
+		{
+			keymap = resolver.resolve({ "ui.refresh", "ui.refresh_view" }),
+			callback = function()
+				callbacks.load(state)
+			end,
+			index = 80,
+		},
+		{
+			-- TODO: add to config
+			keymap = { key = { "b" }, desc = "Change build branch", label = "branch" },
+			group = "Filters",
+			callback = function()
+				callbacks.change_branch(state)
+			end,
+			index = 1,
+		},
+	}
+
+	state.keymaps = register(state.sidebar_buf, actions)
+	register(
+		state.buf,
+		vim.list_extend(actions, {
+			{
+				keymap = resolver.resolve("ui.select"),
+				callback = function()
+					callbacks.open_build(state)
+				end,
+				index = 1,
+			},
+			{
+				keymap = resolver.resolve("ui.open_in_browser"),
+				callback = function()
+					callbacks.open_in_browser(state)
+				end,
+				index = 4,
+			},
+			{
+				keymap = resolver.resolve("ui.copy_url"),
+				callback = function()
+					callbacks.copy_url(state)
+				end,
+				index = 9,
+			},
+		})
+	)
+end
+
+return M

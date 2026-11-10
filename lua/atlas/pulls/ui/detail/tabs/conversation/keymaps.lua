@@ -43,15 +43,16 @@ local function dispatch_with_entry(refresh, fn)
 	fn(pr, entry, refresh)
 end
 
----@param action_id AtlasKeymapActionId|string
+---@param action_id AtlasKeymapActionId
 ---@param map_item table
 ---@return table|nil
 local function from_action(action_id, map_item)
-	local keys = resolver.resolve(action_id)
-	if keys == nil then
+	local keymap = resolver.resolve(action_id)
+	if keymap == nil then
 		return nil
 	end
-	map_item.key = #keys == 1 and keys[1] or keys
+	map_item.key = keymap.key
+	map_item.desc = keymap.desc
 	return map_item
 end
 
@@ -93,11 +94,11 @@ function M.setup(buf, refresh)
 	local provider = detail.provider
 	local tasks = provider and provider.capabilities.tasks
 	local has_tasks = tasks and tasks.edit_task ~= nil
+	local can_react = provider and provider.capabilities.comments and provider.capabilities.comments.reactions ~= nil
 	local items = {}
 	utils.insert_if(
 		items,
 		from_action("ui.comments.add", {
-			desc = "Add comment",
 			index = 20,
 			opts = { nowait = true, silent = true },
 			callback = function()
@@ -108,7 +109,6 @@ function M.setup(buf, refresh)
 	utils.insert_if(
 		items,
 		from_action("ui.comments.reply", {
-			desc = "Reply to comment",
 			index = 21,
 			opts = { nowait = true, silent = true },
 			callback = function()
@@ -119,7 +119,6 @@ function M.setup(buf, refresh)
 	utils.insert_if(
 		items,
 		from_action("ui.comments.edit", {
-			desc = has_tasks and "Edit comment / task" or "Edit comment",
 			index = 30,
 			opts = { nowait = true, silent = true },
 			callback = function()
@@ -130,7 +129,6 @@ function M.setup(buf, refresh)
 	utils.insert_if(
 		items,
 		from_action("ui.delete", {
-			desc = has_tasks and "Delete comment / task" or "Delete comment",
 			index = 41,
 			opts = { nowait = true, silent = true },
 			callback = function()
@@ -138,20 +136,20 @@ function M.setup(buf, refresh)
 			end,
 		})
 	)
-	utils.insert_if(
-		items,
-		from_action("ui.comments.react", {
-			desc = "Add reaction",
-			index = 22,
-			opts = { nowait = true, silent = true },
-			callback = function()
-				dispatch_with_entry(refresh, actions.react)
-			end,
-		})
-	)
+	if can_react then
+		utils.insert_if(
+			items,
+			from_action("ui.comments.react", {
+				index = 22,
+				opts = { nowait = true, silent = true },
+				callback = function()
+					dispatch_with_entry(refresh, actions.react)
+				end,
+			})
+		)
+	end
 	if has_tasks then
 		local toggle_task = from_action("pulls.review.toggle_resolved", {
-			desc = "Toggle task",
 			index = 40,
 			opts = { nowait = true, silent = true },
 			callback = function()
@@ -162,20 +160,17 @@ function M.setup(buf, refresh)
 			table.insert(items, toggle_task)
 		end
 	end
-	local fold_keys = resolver.resolve("ui.toggle_fold")
-	if fold_keys ~= nil then
-		table.insert(items, {
-			key = fold_keys,
-			desc = "Expand / collapse comment or thread",
-			index = 10,
-			opts = { nowait = true, silent = true },
-			callback = function()
-				toggle_fold(refresh)
-			end,
-		})
+	local fold = from_action("ui.toggle_fold", {
+		index = 10,
+		opts = { nowait = true, silent = true },
+		callback = function()
+			toggle_fold(refresh)
+		end,
+	})
+	if fold then
+		table.insert(items, fold)
 	end
 	local toggle_all = from_action("ui.toggle_all_folds", {
-		desc = "Expand / collapse all comments and threads",
 		index = 11,
 		opts = { nowait = true, silent = true },
 		callback = function()

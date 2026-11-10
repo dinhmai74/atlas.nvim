@@ -3,11 +3,10 @@ local state = require("atlas.issues.state")
 local header = require("atlas.ui.components.header")
 local navbar = require("atlas.ui.components.navbar")
 local utils = require("atlas.ui.shared.utils")
-local statusline = require("atlas.ui.statusline")
 local icons = require("atlas.ui.shared.icons")
 local bookmarks = require("atlas.ui.shared.bookmarks")
-local issue_list = require("atlas.issues.ui.components.issue_list")
-local notif_state = require("atlas.ui.notifications.state")
+local layouts = require("atlas.issues.ui.layouts")
+local notifications = require("atlas.ui.notifications")
 
 local M = {}
 
@@ -20,11 +19,11 @@ local function view_id(view)
 	return view.key or view.name or ""
 end
 
----@param action_id AtlasKeymapActionId|string
+---@param action_id AtlasKeymapActionId
 ---@return string|nil
 local function key_label(action_id)
-	local keys = resolver.resolve(action_id)
-	return keys and keys[1] or nil
+	local keymap = resolver.resolve(action_id)
+	return keymap and keymap.key[1] or nil
 end
 
 ---@param lines string[]
@@ -48,35 +47,7 @@ function M.render(opts)
 	local provider_icon = provider and provider.icon or icons.get("fallback")
 	local provider_name = provider and provider.name or "Issues"
 	local provider_hl = provider and provider.hl_group or "Title"
-	local issue_count = #state.issues
-	local statusline_items = {
-		{ text = string.format("%d issues", issue_count), hl_group = "AtlasFooterText" },
-	}
-	local page = state.page_history[state.current_page]
-	if page == nil and state.is_loading then
-		page = state.page_history[state.current_page - 1]
-	end
-	if page ~= nil and (state.current_page > 1 or page.next_cursor ~= nil) then
-		local page_number = tostring(state.current_page)
-		if page.total_pages ~= nil then
-			page_number = page_number .. "/" .. page.total_pages
-		end
-		statusline_items[#statusline_items + 1] = { text = "Page", hl_group = "AtlasFooterText" }
-		statusline_items[#statusline_items + 1] = {
-			text = page_number,
-			hl_group = "AtlasFooterActive",
-		}
-	end
-	local user_name = (state.current_user and state.current_user.name) or ""
-	if user_name ~= "" then
-		statusline_items[#statusline_items + 1] = {
-			text = "| @" .. user_name,
-			hl_group = "AtlasFooterText",
-			priority = 50,
-			min_width = 8,
-		}
-	end
-	statusline.set_items(statusline_items)
+	local page = state.loaded_page()
 
 	local views = bookmarks.views(state.views, state.bookmarks, state.starred_items)
 	local view = state.view
@@ -106,7 +77,7 @@ function M.render(opts)
 	local actions = {}
 
 	if provider and provider.capabilities.notifications then
-		local count = notif_state.unread_count
+		local count = notifications.unread_count(provider)
 		local bell_icon, bell_hl
 		if count > 0 then
 			bell_icon, bell_hl = icons.get("bell_unread")
@@ -177,33 +148,31 @@ function M.render(opts)
 		})
 	else
 		local issue_groups = state.issue_tree
-		local compact = search_view == nil or search_view.layout == "compact"
+		local layout = state.view_layout(search_view)
 		local issues = state.issues
 		if search_view ~= nil then
 			append_search_text(lines, spans, state.query)
 		end
 
 		local has_rows = #issue_groups > 0
-		if compact then
+		if layout == "compact" or layout == "board" then
 			has_rows = #issues > 0
 		end
-		if state.is_loading ~= true and not has_rows then
+		if state.is_loading ~= true and not has_rows and layout ~= "board" then
 			table.insert(lines, "No issues found.")
 		else
-			local list_opts = {
-				width = opts.width,
+			local tbl_lines, tbl_map, tbl_spans = layouts.render({
+				layout = layout,
 				provider_id = provider and provider.id,
+				groups = issue_groups,
+				width = opts.width,
 				loading = state.is_loading,
 				reloading = state.reloading_issue_keys,
 				spinner = state.reload_spinner_frame,
 				collapsed = state.collapsed_issue_keys,
-			}
-			local tbl_lines, tbl_spans, tbl_map
-			if compact then
-				tbl_lines, tbl_map, tbl_spans = issue_list.render_compact(list_opts, issues)
-			else
-				tbl_lines, tbl_map, tbl_spans = issue_list.render_plain(list_opts, issue_groups)
-			end
+				statuses = page and page.statuses,
+				first_column = state.board_column,
+			}, issues)
 
 			local table_base = #lines
 			utils.append_block(lines, spans, { lines = tbl_lines, highlights = tbl_spans })

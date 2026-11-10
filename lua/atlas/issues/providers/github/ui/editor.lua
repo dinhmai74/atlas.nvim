@@ -65,6 +65,14 @@ end
 
 ---@param state GitHubIssueEditorState
 ---@param editor AtlasForm
+---@return boolean
+local function content_modified(state, editor)
+	local current = values(state, editor)
+	return current.title ~= state.initial.title or current.body ~= state.initial.body
+end
+
+---@param state GitHubIssueEditorState
+---@param editor AtlasForm
 local function load_reporter(state, editor)
 	local statusline = editor.statusline
 	state.loading.reporter = true
@@ -264,7 +272,7 @@ local function render_meta(state)
 				labels.value = labels.value .. " "
 			end
 			local text = " " .. label.name .. " "
-			local hl = highlights.chip(label.color)
+			local hl = highlights.label(label.color)
 			table.insert(labels.spans, { start_col = #labels.value, end_col = #labels.value + #text, hl_group = hl })
 			labels.value = labels.value .. text
 		end
@@ -403,7 +411,7 @@ end
 local function close(state, editor)
 	if state.submitting then
 		return
-	elseif not is_modified(state, editor) then
+	elseif not content_modified(state, editor) then
 		form.close(editor)
 	else
 		vim.ui.input({ prompt = "Discard issue changes? [y/N]: " }, function(answer)
@@ -452,8 +460,8 @@ local function open_editor(repo_slug, issue, details, on_done)
 		completion = {
 			context = { provider = "github", repository = repo_slug, issue = issue and { key = issue.key } },
 		},
-		is_modified = issue and function(editor)
-			return is_modified(state, editor)
+		is_modified = function(editor)
+			return content_modified(state, editor)
 		end,
 		meta = function()
 			return render_meta(state)
@@ -472,22 +480,19 @@ local function open_editor(repo_slug, issue, details, on_done)
 		end,
 		keymaps = {
 			{
-				key = "ga",
-				desc = "assignees",
+				keymap = "editor.assignees",
 				action = function(editor)
 					select_assignees(state, editor)
 				end,
 			},
 			{
-				key = "gl",
-				desc = "labels",
+				keymap = "editor.labels",
 				action = function(editor)
 					select_labels(state, editor)
 				end,
 			},
 			{
-				key = "gm",
-				desc = "milestone",
+				keymap = "editor.milestone",
 				action = function(editor)
 					select_milestone(state, editor)
 				end,
@@ -513,7 +518,7 @@ end
 ---@return { cancel: fun() }|nil
 function M.edit(issue, on_done)
 	notify.loading("Loading " .. issue.key .. "...")
-	return issues.get_issue(issue.key, function(details, err)
+	return issues.fetch_issue(issue, { force_refresh = true }, function(details, err)
 		if not details then
 			err = err or "Unable to load issue"
 			notify.error(err)
@@ -524,7 +529,7 @@ function M.edit(issue, on_done)
 		end
 		notify.clear()
 		open_editor(issue.repo_full_name, issue, details, on_done)
-	end, { force_refresh = true })
+	end)
 end
 
 return M

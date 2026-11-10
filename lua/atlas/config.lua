@@ -6,7 +6,7 @@
 
 ---@alias AtlasGitTransport "https"|"ssh"
 ---@alias AtlasPullsViewLayout "compact"|"grouped"|"plain"
----@alias AtlasIssuesViewLayout "compact"|"plain"
+---@alias AtlasIssuesViewLayout "compact"|"plain"|"board"
 
 ---@class AtlasPullsViewConfig
 ---@field name string
@@ -41,12 +41,16 @@
 ---@class AtlasPullsDiffExplorerConfig
 ---@field grouped boolean|nil
 ---@field hidden boolean|nil
----@field show_commits boolean|nil
+---@field commits AtlasPullsDiffCommitsConfig|nil
 ---@field width integer|nil
 ---@field initial_focus "explorer"|"diff"|nil
 ---@field preview boolean|nil
 ---@field focus_on_select boolean|nil
 ---@field ignore string[]|nil
+
+---@class AtlasPullsDiffCommitsConfig
+---@field hidden boolean|nil
+---@field height integer|nil Percent of the explorer column.
 
 ---@class AtlasPullsDiffReviewPanelConfig
 ---@field hidden boolean|nil
@@ -90,7 +94,7 @@
 ---@field id string
 ---@field label string
 ---@field icon string|nil
----@field confirmation boolean|nil
+---@field confirm string|(fun(pr: PullRequest): string)|nil
 ---@field run fun(pr: PullRequest, ctx: AtlasPullsCustomActionContext, done: fun(ok: boolean|nil, message: string|nil))
 
 -- Configs
@@ -124,7 +128,7 @@
 ---@field id string
 ---@field label string
 ---@field icon string|nil
----@field confirmation boolean|nil
+---@field confirm string|(fun(issue: Issue): string)|nil
 ---@field run fun(issue: Issue, ctx: AtlasIssuesCustomActionContext, done: fun(ok: boolean|nil, message: string|nil))
 
 ---@class AtlasIssuesConfig
@@ -137,8 +141,9 @@
 -- Config
 
 ---@class AtlasUIStatuslineConfig
----@field atlas? boolean Show the statusline in Atlas's main UI (default: true)
----@field diff? boolean Show the statusline in Atlas-owned diff/review sessions (default: true)
+---@field enable? boolean|fun(buf: integer, win: integer): boolean Predicate for where Atlas's statusline is shown (default: true)
+---@field layout? fun(buf: integer, win: integer, ctx: AtlasStatuslineContext): AtlasStatuslineLayout|nil
+---@field show_hints? boolean
 
 ---@class AtlasUIConfig
 ---@field statusline AtlasUIStatuslineConfig|nil
@@ -157,7 +162,11 @@ local M = {}
 ---@type AtlasConfig
 local defaults = {
 	ui = {
-		statusline = { atlas = true, diff = true },
+		statusline = {
+			enable = true,
+			layout = nil,
+			show_hints = false,
+		},
 		picker = "auto",
 		listed_buffer = false,
 	},
@@ -204,7 +213,10 @@ local defaults = {
 			explorer = {
 				grouped = true,
 				hidden = false,
-				show_commits = false,
+				commits = {
+					hidden = true,
+					height = 35,
+				},
 				width = 40,
 				initial_focus = "explorer",
 				preview = false,
@@ -237,6 +249,8 @@ local defaults = {
 		ui = {
 			next_item = "j",
 			previous_item = "k",
+			previous_column = "h",
+			next_column = "l",
 			first_item = "gg",
 			last_item = "G",
 			select = "<CR>",
@@ -249,8 +263,10 @@ local defaults = {
 				reply = "c",
 				edit = "e",
 				react = "gr",
+				upvote = "gu",
 			},
 			toggle_panel = "p",
+			cycle_layout = "t",
 			toggle_fold = "za",
 			toggle_all_folds = "zA",
 			toggle_description_mode = "<leader>m",
@@ -271,7 +287,7 @@ local defaults = {
 			open_in_browser = "gx",
 			open_references = "gl",
 			copy_id = "y",
-			copy_url = "Y",
+			copy_url = "gy",
 			show_details = "K",
 			search = "?",
 			edit_search = "i",
@@ -288,25 +304,35 @@ local defaults = {
 			checkout = "gc",
 			open_repository = "o",
 			edit_pr = "ge",
+			stack = {
+				next = "]s",
+				prev = "[s",
+			},
 			pipelines = {
 				next_job = { "]j", "<Tab>" },
 				previous_job = { "[j", "<S-Tab>" },
 				show_history = "gH",
 				toggle_raw_logs = "gL",
 				toggle_auto_refresh = "gR",
+				toggle_config = "gC",
 			},
 			review = {
 				show_details = "K", -- File/commit details.
 				toggle_file_reviewed = "-",
 				next_comment = "]c",
 				prev_comment = "[c",
+				next_unresolved = "]x",
+				prev_unresolved = "[x",
 				next_note = "]n",
 				prev_note = "[n",
+				next_commit = "]r",
+				prev_commit = "[r",
 				add_comment = "c",
 				submit_comment = "C",
 				add_suggestion = "s",
 				submit_suggestion = "S",
 				add_note = "<leader>n",
+				note_type = "!",
 				toggle_resolved = "x",
 				approve = "<leader>ga",
 				request_changes = "<leader>gr",
@@ -324,6 +350,9 @@ local defaults = {
 					next_unreviewed_file = "]u",
 					prev_unreviewed_file = "[u",
 					find_file = "<leader>f",
+				},
+				panel = {
+					cycle_filter = "f",
 				},
 				-- Built-in navigation; external viewers use their own keys.
 				atlas = {
@@ -344,6 +373,10 @@ local defaults = {
 				merged = "gpm",
 				declined = "gpd",
 			},
+			merge = {
+				method = "gm",
+				delete_branch = "gd",
+			},
 		},
 		issues = {
 			transition_issue = "gs",
@@ -352,16 +385,35 @@ local defaults = {
 			edit_issue = "ge",
 			create_issue = "c",
 		},
+		editor = {
+			assignees = "ga",
+			labels = "gl",
+			milestone = "gm",
+			reporter = "gR",
+			reviewers = "gr",
+			base = "gb",
+			draft = "gD",
+			issue_type = "gt",
+			fields = "gf",
+			templates = "gT",
+			delete_template = "<C-d>",
+			complete = "<C-x><C-u>",
+		},
 	},
 }
 
 ---@type AtlasConfig
 M.options = vim.deepcopy(defaults)
 
----@param context "atlas"|"diff"
+---@param buf integer
+---@param win integer
 ---@return boolean
-function M.statusline_enabled(context)
-	return M.options.ui.statusline[context] ~= false
+function M.statusline_enabled(buf, win)
+	local enable = M.options.ui.statusline.enable
+	if type(enable) ~= "function" then
+		return enable ~= false
+	end
+	return enable(buf, win) == true
 end
 
 ---@return string
@@ -401,17 +453,22 @@ end
 ---@param opts AtlasConfig|table|nil
 function M.setup(opts)
 	local resolved = vim.deepcopy(opts or {})
-	local project = vim.tbl_get(resolved, "issues", "jira", "project_config")
-	if project and project.issue_types then
-		local issue_types = {}
-		for name, style in pairs(project.issue_types) do
-			issue_types[name:lower()] = style
-		end
-		project.issue_types = issue_types
-	end
 	M.options = vim.tbl_deep_extend("force", vim.deepcopy(defaults), resolved)
-	if M.statusline_enabled("atlas") or M.statusline_enabled("diff") then
+	if M.options.ui.statusline.enable ~= false then
 		vim.opt.laststatus = 3
+	end
+
+	-- " example.atlassian.net/ " -> https://example.atlassian.net
+	for _, id in ipairs({ "gitlab", "jira" }) do
+		local options = M.provider_options(id) or {}
+		if type(options.base_url) == "string" then
+			local base_url = vim.trim(options.base_url):gsub("/+$", "")
+			if base_url ~= "" and not base_url:match("^%a+://") then
+				base_url = "https://" .. base_url
+			end
+
+			options.base_url = base_url
+		end
 	end
 end
 

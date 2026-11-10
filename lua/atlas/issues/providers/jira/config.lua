@@ -18,7 +18,7 @@
 --         -- Global Jira display settings and per-project custom fields
 --         project_config = {
 --           story_points_field = "customfield_10016",
---           -- Override issue type styles by name (case-insensitive).
+--           -- Override issue type styles by name (lowercase).
 --           issue_types = {
 --             bug = { icon = "" },
 --             maintenance = { icon = "", hl_group = "AtlasTextWarning" },
@@ -33,11 +33,21 @@
 --           },
 --           -- Custom fields to display per project; replace KAN with your project key.
 --           KAN = {
---             customfield_10038 = {
---               name    = "Team",
---               format  = function(v) return type(v) == "table" and v.value or nil end,
---               hl_group = "AtlasChipActive",
---               display  = "chip", -- "chip" | "table"
+--             fields = {
+--               customfield_10038 = {
+--                 name    = "Team",
+--                 format  = function(v) return type(v) == "table" and v.value or nil end,
+--                 hl_group = "AtlasChipActive",
+--                 display  = "chip", -- "chip" | "table"
+--               },
+--             },
+--             defaults = {
+--               issue_type = "Story",
+--               fields = {
+--                 priority = "High",
+--                 labels = { "backend" },
+--                 customfield_10038 = "Platform",
+--               },
 --             },
 --           },
 --         },
@@ -45,12 +55,12 @@
 --           {
 --             name = "Open",
 --             key = "1",
---             layout = "plain", -- "compact" | "plain"
+--             layout = "plain", -- "compact" | "plain" | "board"
 --             jql = "assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC",
 --           },
 --           { name = "Reported",   key = "2", jql = "reporter = currentUser() AND resolution = Unresolved ORDER BY updated DESC" },
 --           { name = "Watching",   key = "3", jql = "watcher = currentUser() AND resolution = Unresolved ORDER BY updated DESC" },
---           { name = "Sprint",     key = "4", jql = "sprint in openSprints() AND assignee = currentUser() ORDER BY rank" },
+--           { name = "Sprint",     key = "4", layout = "board", jql = "sprint in openSprints() AND assignee = currentUser() ORDER BY rank" },
 --         },
 --         bookmarks = {
 --           -- key   = "J",   -- default
@@ -84,11 +94,19 @@
 
 ---@alias AtlasJiraProjectFieldsConfig table<string, AtlasJiraCustomFieldConfig>
 
+---@class AtlasJiraProjectDefaultsConfig
+---@field issue_type string|nil
+---@field fields table<string, any>|nil
+
+---@class AtlasJiraProjectOptions
+---@field fields AtlasJiraProjectFieldsConfig|nil
+---@field defaults AtlasJiraProjectDefaultsConfig|nil
+
 ---@class AtlasJiraProjectConfig
 ---@field story_points_field string|nil
 ---@field issue_types AtlasJiraIssueTypesConfig|nil
----@field status_icons table<string, string>|nil
----@field [string] AtlasJiraProjectFieldsConfig
+---@field status_icons table<string, string>|nil Icons by status name or category (new, indeterminate, done).
+---@field [string] AtlasJiraProjectOptions
 
 ---@class AtlasJiraBookmarkConfig : AtlasIssuesBookmarkConfig
 ---@field jql string

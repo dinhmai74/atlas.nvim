@@ -15,8 +15,8 @@ local PADDING_X = 1
 ---@param action AtlasKeymapActionId
 ---@return string|nil
 local function action_key(action)
-	local keys = keymaps.resolve(action)
-	return keys and keys[1]
+	local keymap = keymaps.resolve(action)
+	return keymap and keymap.key[1]
 end
 
 ---@param comment PullsComment
@@ -35,30 +35,15 @@ local function comment_location(comment)
 	return first == line and (side .. line) or string.format("%s%d-%s%d", side, first, side, line)
 end
 
----@param tasks PullsComment[]
----@return string
-local function task_heading(tasks)
-	local label = vim.trim(tostring(tasks[1] and tasks[1].task_label or "Task"))
-	if label == "" then
-		label = "Task"
-	end
-	return label:sub(-1):lower() == "s" and label or (label .. "s")
-end
-
 ---@param lines string[]
 ---@param spans table[]
 ---@param line_map table<integer, table>
 ---@param task PullsComment
 ---@param width integer
 local function emit_task(lines, spans, line_map, task, width)
-	local task_lines, task_spans, task_map = comment_threads.render_task_compact(
-		{ comment = task, children = {} },
-		width,
-		{
-			padding_x = PADDING_X,
-			show_task_label = false,
-		}
-	)
+	local task_lines, task_spans, task_map = comment_threads.render({ { comment = task, children = {} } }, width, {
+		padding_x = PADDING_X,
+	})
 	local offset = #lines
 	utils.append_block(lines, spans, { lines = task_lines, highlights = task_spans })
 	for line, entry in pairs(task_map) do
@@ -73,8 +58,9 @@ end
 ---@param width integer
 local function emit_comments(lines, spans, line_map, nodes, width)
 	local provider = detail.provider
-	local comments = provider and provider.capabilities.comments
-	local tasks = provider and provider.capabilities.tasks
+	local capabilities = provider and provider.capabilities
+	local tasks = capabilities and capabilities.tasks
+	local can_react = capabilities and capabilities.comments and capabilities.comments.reactions ~= nil
 	local thread_lines, thread_spans, thread_map = comment_threads.render(nodes, math.max(1, width - 4), {
 		expanded = function(root)
 			return state.is_thread_expanded(root)
@@ -86,9 +72,9 @@ local function emit_comments(lines, spans, line_map, nodes, width)
 			edit = action_key("ui.comments.edit"),
 			delete = action_key("ui.delete"),
 			add_task = tasks and tasks.add_task and action_key("pulls.review.add_task") or nil,
+			react = can_react and action_key("ui.comments.react") or nil,
 			toggle_resolved = action_key("pulls.review.toggle_resolved"),
 		},
-		reaction_options = comments and comments.reaction_options,
 	})
 	local result = box.render({ { lines = thread_lines, spans = thread_spans, line_map = thread_map } }, {
 		width = width,
@@ -101,9 +87,9 @@ local function emit_comments(lines, spans, line_map, nodes, width)
 	end
 end
 
----@param hunk DiffHunk
+---@param hunk DiffHunkLines
 ---@param position PullsInlineCommentPosition
----@return DiffHunk|nil
+---@return DiffHunkLines|nil
 local function surrounding_hunk(hunk, position)
 	local line_field = position.to and "new_line" or "old_line"
 	local end_line = position.to or position.from
@@ -166,11 +152,11 @@ function M.render(width, comments, tasks)
 	if tasks and #tasks > 0 then
 		local sorted_tasks = vim.list_extend({}, tasks)
 		table.sort(sorted_tasks, function(left, right)
-			local left_date = tostring(left.created_on or "")
-			local right_date = tostring(right.created_on or "")
+			local left_date = tostring(left.created_at or "")
+			local right_date = tostring(right.created_at or "")
 			return left_date == right_date and tostring(left.id) < tostring(right.id) or left_date < right_date
 		end)
-		utils.push(lines, spans, task_heading(sorted_tasks), "AtlasColumnHeader", PADDING_X)
+		utils.push(lines, spans, "Tasks", "AtlasColumnHeader", PADDING_X)
 		for _, task in ipairs(sorted_tasks) do
 			emit_task(lines, spans, line_map, task, max_width)
 		end

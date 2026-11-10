@@ -1,59 +1,14 @@
 local header = require("atlas.ui.components.header")
 local icons = require("atlas.ui.shared.icons")
 local navbar = require("atlas.ui.components.navbar")
-local notif_state = require("atlas.ui.notifications.state")
-local pull_list = require("atlas.pulls.ui.components.pull_list")
+local notifications = require("atlas.ui.notifications")
+local layouts = require("atlas.pulls.ui.layouts")
 local state = require("atlas.pulls.state")
-local statusline = require("atlas.ui.statusline")
 local bookmarks = require("atlas.ui.shared.bookmarks")
 local ui_utils = require("atlas.ui.utils")
 local utils = require("atlas.ui.shared.utils")
 
 local M = {}
-
-local PR_ICON = icons.get("pr")
-
----@param pulls PullRequest[]
----@return table[]
-local function statusline_items(pulls)
-	local items = {
-		{
-			text = string.format("%s %d PR%s", PR_ICON, #pulls, #pulls == 1 and "" or "s"),
-			hl_group = "AtlasFooterInfo",
-		},
-	}
-	local page = state.page_history[state.current_page]
-	if page == nil and state.is_loading then
-		page = state.page_history[state.current_page - 1]
-	end
-	if page ~= nil and (state.current_page > 1 or page.next_cursor ~= nil) then
-		local page_number = tostring(state.current_page)
-		if page.total_pages ~= nil then
-			page_number = page_number .. "/" .. page.total_pages
-		end
-		table.insert(items, {
-			text = "Page",
-			hl_group = "AtlasFooterText",
-		})
-		table.insert(items, {
-			text = page_number,
-			hl_group = "AtlasFooterActive",
-		})
-	end
-	local user = state.current_user
-	if user ~= nil then
-		local user_name = tostring(user.username or user.name or "")
-		if user_name ~= "" then
-			table.insert(items, {
-				text = string.format("%s @%s", icons.get("user"), user_name),
-				hl_group = "AtlasFooterText",
-				priority = 50,
-				min_width = 8,
-			})
-		end
-	end
-	return items
-end
 
 ---@param lines string[]
 ---@param text string
@@ -136,7 +91,7 @@ local function render_header(lines, spans, width)
 		if #actions > 0 then
 			table.insert(actions, { label = "|", hl_group = "AtlasTextMuted" })
 		end
-		local count = notif_state.unread_count
+		local count = notifications.unread_count(state.provider)
 		local bell, bell_hl = icons.get(count > 0 and "bell_unread" or "bell")
 		table.insert(actions, {
 			label = count > 0 and string.format("%s %d", bell, count) or bell,
@@ -161,7 +116,6 @@ function M.render(opts)
 	local lines, spans, line_map = {}, {}, {}
 	local pulls = state.pulls
 	local loading = string.format("%s Loading...", state.reload_spinner_frame)
-	statusline.set_items(statusline_items(pulls))
 
 	table.insert(lines, "")
 	render_header(lines, spans, opts.width)
@@ -188,8 +142,8 @@ function M.render(opts)
 		append_centered_loading(lines, loading, opts.width, opts.height)
 	else
 		local search_view = state.search_view()
-		local layout = search_view and search_view.layout or "compact"
-		local body_lines, body_map, body_spans = pull_list.render({
+		local layout = state.layout or (search_view and search_view.layout) or "compact"
+		local body_lines, body_map, body_spans = layouts.render({
 			width = opts.width,
 			provider_id = state.provider and state.provider.id,
 			layout = layout,

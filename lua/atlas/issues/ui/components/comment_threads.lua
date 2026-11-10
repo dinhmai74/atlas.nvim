@@ -1,52 +1,51 @@
 local M = {}
 
 local threads = require("atlas.ui.components.threads")
-local emojis = require("atlas.ui.shared.emojis")
 local helper = require("atlas.issues.ui.presentation")
 local icons = require("atlas.ui.shared.icons")
 local utils = require("atlas.ui.shared.utils")
 
 ---@param comment IssueComment
----@param reaction_options IssueReactionOption[]|nil
 ---@return AtlasThreadItem
-local function comment_item(comment, reaction_options)
+local function comment_item(comment)
 	local deleted = comment.deleted == true
 	local content = deleted and "(deleted comment)" or (comment.body or "")
 	if content == "" then
 		content = "(empty comment)"
 	end
 
-	local footer_items = {}
-	local reactions, reaction_highlights = emojis.format(comment.reactions, reaction_options)
-	if reactions ~= "" then
-		table.insert(footer_items, { text = reactions, highlights = reaction_highlights })
-	end
-
 	local author = helper.person_name(comment.author)
 	local author_hl = helper.person_hl(author)
 	local user_icon = icons.get("user")
-	return {
+	local item = {
 		icon = user_icon,
 		icon_hl = author_hl,
 		author = author,
 		author_hl = author_hl,
-		additional = { { utils.relative_time(comment.created), "AtlasTextMuted" } },
+		additional = { { table.concat(comment.author_roles or {}, " "), "AtlasTextMuted" } },
+		right_text = { { utils.relative_time(comment.created_at), "AtlasTextMuted" } },
 		content = content,
 		markdown = not deleted,
-		footer_items = footer_items,
+		footer_items = {},
 		children = {},
 		line_map = { comment = comment, entity_kind = "comment" },
 		meta = { deleted = deleted },
 	}
+
+	if not deleted then
+		item.reactions = comment.reactions
+	end
+	return item
 end
 
 ---@param padding_x integer
----@param max_lines integer|fun(comment: IssueComment): integer|nil
+---@param max_lines integer|(fun(comment: IssueComment): integer|nil)|nil
 ---@param truncated_key string|nil
 ---@return AtlasThreadRenderOpts
 local function render_options(padding_x, max_lines, truncated_key)
 	if type(max_lines) == "function" then
 		local callback = max_lines
+		---@param item AtlasThreadItem
 		max_lines = function(item)
 			local comment = item.line_map and item.line_map.comment
 			return comment and callback(comment) or nil
@@ -92,8 +91,8 @@ function M.group_comments(comments)
 
 	local function sort_tree(items)
 		table.sort(items, function(left, right)
-			local left_date = tostring(left.comment.created or "")
-			local right_date = tostring(right.comment.created or "")
+			local left_date = tostring(left.comment.created_at or "")
+			local right_date = tostring(right.comment.created_at or "")
 			if left_date ~= right_date then
 				return left_date < right_date
 			end
@@ -124,7 +123,7 @@ end
 ---@return AtlasThreadItem
 local function build_item(node, opts, root)
 	root = root or node.comment
-	local item = comment_item(node.comment, opts.reaction_options)
+	local item = comment_item(node.comment)
 	item.line_map.thread_root = root
 	item.line_map.thread_has_replies = node.comment ~= root or #node.children > 0
 
@@ -146,8 +145,7 @@ end
 ---@class IssuesCommentThreadRenderOptions
 ---@field expanded fun(root: IssueComment): boolean
 ---@field padding_x integer|nil
----@field reaction_options IssueReactionOption[]|nil
----@field content_max_lines integer|fun(comment: IssueComment): integer|nil
+---@field content_max_lines integer|(fun(comment: IssueComment): integer|nil)|nil
 ---@field content_truncated_key string|nil
 
 ---@param nodes IssuesCommentThreadNode[]
@@ -170,7 +168,7 @@ end
 ---@param width integer
 ---@return AtlasEditorPreview
 function M.render_comment(comment, width)
-	local lines, highlights = threads.render({ comment_item(comment, nil) }, width, render_options(1, nil, nil))
+	local lines, highlights = threads.render({ comment_item(comment) }, width, render_options(1, nil, nil))
 	return { lines = lines, highlights = highlights }
 end
 

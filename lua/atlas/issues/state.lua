@@ -1,5 +1,6 @@
 ---@class IssuesState
 ---@field view IssuesViewConfig|nil
+---@field layout AtlasIssuesViewLayout|nil
 ---@field bookmarks AtlasBookmarksState|nil
 ---@field query string
 ---@field is_loading boolean
@@ -10,6 +11,7 @@
 ---@field page_history IssuesPage[]
 ---@field issue_tree IssuesGroup[]
 ---@field collapsed_issue_keys table<string, boolean>
+---@field board_column integer
 ---@field provider IssuesProvider|nil
 ---@field views IssuesViewConfig[]
 ---@field starred_items AtlasStarredItem[]
@@ -17,6 +19,7 @@
 ---@field reload_spinner_frame string
 local M = {
 	view = nil,
+	layout = nil,
 	bookmarks = nil,
 	query = "",
 	is_loading = false,
@@ -27,6 +30,7 @@ local M = {
 	page_history = {},
 	issue_tree = {},
 	collapsed_issue_keys = {},
+	board_column = 1,
 	provider = nil,
 	views = {},
 	starred_items = {},
@@ -87,6 +91,21 @@ function M.search_view()
 		return view
 	end
 	return M.view
+end
+
+---@param view IssuesViewConfig|nil
+---@return AtlasIssuesViewLayout
+function M.view_layout(view)
+	local layout = M.layout or (view == nil and "compact" or view.layout)
+	return require("atlas.issues.ui.layouts").resolve(layout, M.provider and M.provider.id)
+end
+
+---@return IssuesPage|nil
+function M.loaded_page()
+	if M.page_history[M.current_page] == nil and M.is_loading then
+		return M.page_history[M.current_page - 1]
+	end
+	return M.page_history[M.current_page]
 end
 
 ---@param issues Issue[]

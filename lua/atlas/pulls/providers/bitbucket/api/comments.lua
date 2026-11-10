@@ -52,6 +52,7 @@ local function fetch_comments(pr, opts, query, on_done)
 	local fields = "%2Bvalues.resolution.user%2C%2Bvalues.resolution.created_on"
 		.. "%2C%2Bvalues.inline.*%2C-values.inline.context_lines"
 		.. "%2C-values.inline.src_rev%2C-values.inline.dest_rev%2C-values.inline.base_rev"
+		.. "%2C-values.pullrequest%2C-values.user.links%2C-values.links.self%2C-values.links.code"
 	local filter = query and "&q=" .. query or ""
 	local url = string.format("%s%spagelen=%d&fields=%s%s", comments_url, sep, 100, fields, filter)
 	local key = "bitbucket:pr:comments:" .. url
@@ -68,7 +69,7 @@ local function fetch_comments(pr, opts, query, on_done)
 			on_done(nil, err)
 			return
 		end
-		local comments = mapper.to_comments_list(result)
+		local comments = mapper.to_comments_list(result, pr.author.id)
 		service.set_cache(key, comments)
 		on_done(comments, nil)
 	end, { action = "Fetch PR comments", repo = pr.repo_full_name, id = pr.id })
@@ -116,7 +117,7 @@ function M.add_comment(pr, content, opts, on_done)
 			return
 		end
 		service.clear_cache()
-		local comment = mapper.to_comment(result)
+		local comment = mapper.to_comment(result, pr.author.id)
 		if comment == nil then
 			on_done(nil, "Bitbucket did not return the created comment")
 			return
@@ -127,9 +128,10 @@ end
 
 ---@param pr PullRequest
 ---@param comment PullsComment
+---@param content string
 ---@param on_done fun(comment: PullsComment|nil, err: string|nil)
 ---@return { cancel: fun() }|nil
-function M.edit_comment(pr, comment, on_done)
+function M.edit_comment(pr, comment, content, on_done)
 	---@cast pr BitbucketPullRequest
 	local comments_url = tostring(pr.links.comments or "")
 	if comments_url == "" then
@@ -138,20 +140,20 @@ function M.edit_comment(pr, comment, on_done)
 	end
 
 	local url = comments_url .. "/" .. tostring(comment.id)
-	local body = encode_comment_payload(comment.content_raw)
+	local body = encode_comment_payload(content)
 	return service.request("PUT", url, nil, body, function(result, err)
 		if err then
 			on_done(nil, err)
 			return
 		end
 		service.clear_cache()
-		local updated = mapper.to_comment(result)
+		local updated = mapper.to_comment(result, pr.author.id)
 		if updated == nil then
 			on_done(nil, "Bitbucket did not return the updated comment")
 			return
 		end
 		local merged = vim.tbl_extend("force", {}, comment, updated)
-		merged.content_display = updated.content_display
+		merged.body_display = updated.body_display
 		on_done(merged, nil)
 	end, { action = "Edit PR comment", repo = pr.repo_full_name, id = pr.id, comment_id = comment.id })
 end

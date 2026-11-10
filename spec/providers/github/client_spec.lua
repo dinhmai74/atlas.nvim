@@ -54,6 +54,7 @@ describe("GitHub client host routing", function()
 			assert.are.equal('{"ok":true}', value)
 			return { ok = true }
 		end
+		---@diagnostic disable-next-line: redundant-parameter
 		vim.system = function(cmd, opts, on_exit)
 			local call = { cmd = cmd, opts = opts, on_exit = on_exit }
 			table.insert(calls, call)
@@ -90,6 +91,17 @@ describe("GitHub client host routing", function()
 		assert.are.equal(4, #args)
 		options.hostname = "github.com"
 		assert.is_false(client.is_enterprise_server())
+	end)
+
+	it("strips the protocol and path from the hostname", function()
+		for _, hostname in ipairs({
+			"https://github.company.com",
+			"HTTPS://GitHub.Company.com/",
+			" github.company.com/owner/repo ",
+		}) do
+			options.hostname = hostname
+			assert.are.equal("github.company.com", client.hostname())
+		end
 	end)
 
 	it("uses GH_HOST when no hostname is configured", function()

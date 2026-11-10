@@ -4,18 +4,19 @@ local config = require("atlas.config")
 local notify = require("atlas.core.notify")
 local status_spinner = require("atlas.ui.components.spinner")
 local state = require("atlas.issues.state")
-local dashboard_host = require("atlas.ui.dashboard")
-local navigation = require("atlas.ui.navigation")
+local navigation = require("atlas.issues.ui.dashboard.navigation")
+local window = require("atlas.issues.ui.dashboard.window")
 local info_popup = require("atlas.ui.popups.info")
 local requests = require("atlas.core.requests")
 local starred = require("atlas.core.starred")
+local detail = require("atlas.issues.ui.detail")
 
 local active_requests = requests.new()
 local issue_reload_requests = requests.new()
 
 local function render_if_active()
 	local provider = state.provider
-	if provider == nil or not dashboard_host.is_active("issues", provider.id) then
+	if provider == nil or not window.is_active() then
 		return
 	end
 
@@ -90,7 +91,7 @@ end
 ---@param view IssuesViewConfig
 ---@return boolean
 local function relationships_enabled(view)
-	return view.layout ~= "compact" and config.options.issues.with_relationships
+	return state.view_layout(view) == "plain" and config.options.issues.with_relationships == true
 end
 
 ---@param issues Issue[]
@@ -233,7 +234,8 @@ local function load_page(view, page_number, cursor, force_refresh, on_done)
 	end
 
 	load_requests.run(function(done)
-		return provider.capabilities.core.fetch_issues(view, {
+		local fetch_view = vim.tbl_extend("force", view, { layout = state.view_layout(view) })
+		return provider.capabilities.core.fetch_issues(fetch_view, {
 			force_refresh = force_refresh,
 			pagelen = 50,
 			cursor = cursor,
@@ -291,7 +293,6 @@ local function load_starred(on_done)
 	elseif #saved == 0 then
 		state.starred_items = {}
 		state.bookmarks.selection = nil
-		local detail = require("atlas.issues.ui.detail")
 		if detail.is_open() then
 			detail.close()
 		end
@@ -428,22 +429,21 @@ end
 function M.refresh_view()
 	local selected = navigation.current_item()
 	local selected_bookmark = selected and (selected.kind == "bookmark" or selected.kind == "starred")
-	local selected_key = selected and selected.kind == "issue" and selected._issue and selected._issue.key or nil
+	local selected_key = selected and selected.issue and selected.issue.key
 	local function finish()
 		local focused = false
 		if selected_key then
 			focused = navigation.focus_item(function(item)
-				return item.kind == "issue" and item._issue and item._issue.key == selected_key
+				return item.issue ~= nil and item.issue.key == selected_key
 			end)
 		end
 		if not focused and not selected_bookmark then
 			navigation.focus_first_item()
 		end
 		local item = navigation.current_item()
-		local detail = require("atlas.issues.ui.detail")
 		if detail.is_open() then
-			if not (selected_key and not focused) and item and item.kind == "issue" and item._issue then
-				detail.select(item._issue, { force_refresh = true })
+			if not (selected_key and not focused) and item and item.issue then
+				detail.select(item.issue, { force_refresh = true })
 			else
 				detail.close()
 			end
@@ -453,9 +453,29 @@ function M.refresh_view()
 	load_view(true, finish)
 end
 
+function M.cycle_layout()
+	local view = state.search_view()
+	if view == nil and #state.issues == 0 then
+		return
+	end
+
+	state.layout = require("atlas.issues.ui.layouts").next(state.view_layout(view), state.provider.id)
+
+	if view then
+		load_view(false, function()
+			navigation.focus_first_item()
+		end)
+	else
+		render_if_active()
+		navigation.focus_first_item()
+	end
+end
+
 ---@param view IssuesViewConfig|nil
 function M.switch_view(view)
 	state.view = view
+	state.layout = nil
+	navigation.reset()
 	state.bookmarks.selection = nil
 	load_view(false, function()
 		navigation.focus_first_item()
@@ -464,6 +484,7 @@ end
 
 ---@param bookmark AtlasBookmarkSelection
 function M.select_bookmark(bookmark)
+	state.layout = nil
 	state.bookmarks.selection = bookmark
 	load_view(false)
 end
@@ -497,14 +518,9 @@ end
 ---@param source_buf integer|nil
 function M.show_issue_details(source_buf)
 	local node = navigation.current_item()
-	if type(node) ~= "table" or node.kind ~= "issue" then
+	local issue = node and node.issue
+	if not issue then
 		notify.warn("No issue selected")
-		return
-	end
-
-	local issue = type(node._issue) == "table" and node._issue or nil
-	if issue == nil then
-		notify.warn("Issue payload missing on line")
 		return
 	end
 
@@ -538,7 +554,6 @@ local function refresh_issue(issue)
 
 	---@type IssueRef
 	local ref = issue
-	local detail = require("atlas.issues.ui.detail")
 	if detail.is_open() then
 		detail.refresh(issue)
 	end
@@ -601,16 +616,19 @@ function M.update_issue(issue)
 end
 
 function M.toggle_current_issue_collapsed()
-	local node = navigation.current_item()
-	if type(node) ~= "table" or node.kind ~= "issue" or type(node._issue) ~= "table" then
+	if state.view_layout(state.search_view()) == "board" then
 		return
 	end
-	if state.toggle_issue_collapsed(node._issue.key) then
+	local node = navigation.current_item()
+	if node and node.issue and state.toggle_issue_collapsed(node.issue.key) then
 		render_if_active()
 	end
 end
 
 function M.toggle_all_issues_collapsed()
+	if state.view_layout(state.search_view()) == "board" then
+		return
+	end
 	if state.toggle_all_issues_collapsed() then
 		render_if_active()
 	end
@@ -618,14 +636,9 @@ end
 
 function M.refresh_current_issue()
 	local node = navigation.current_item()
-	if type(node) ~= "table" or node.kind ~= "issue" then
+	local issue = node and node.issue
+	if not issue then
 		notify.warn("No issue selected")
-		return
-	end
-
-	local issue = type(node._issue) == "table" and node._issue or nil
-	if issue == nil then
-		notify.warn("Issue payload missing on line")
 		return
 	end
 	refresh_issue(issue)
