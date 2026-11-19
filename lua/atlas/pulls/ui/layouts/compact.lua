@@ -80,7 +80,7 @@ M.gitlab = {
 
 		return {
 			repo_pr = icon .. " " .. utils.title(pr, "!"),
-			conversation = tostring(pr.comments_count),
+			conversation = tostring(pr.unresolved_comments_count or pr.comments_count),
 			ci = ci,
 			ci_hl = ci_hl,
 			author = utils.author(pr),

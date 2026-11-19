@@ -8,6 +8,7 @@
 ---@field detailed_merge_status string|nil
 ---@field diff_refs GitLabPullRequestDiffRefs|nil
 ---@field node_id string|nil
+---@field unresolved_comments_count integer|nil
 
 ---@class GitLabPullsLabel : PullsLabel
 ---@field text_color string|nil

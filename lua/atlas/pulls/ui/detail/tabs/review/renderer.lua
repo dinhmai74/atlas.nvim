@@ -181,7 +181,7 @@ function M.render(width, comments, tasks)
 	local roots = review_actions.group_comments(comments, tasks)
 	local groups, by_path = {}, {}
 	for _, thread in ipairs(roots) do
-		if not thread.comment.is_task then
+		if not thread.comment.is_task and thread.comment.state ~= "RESOLVED" then
 			local position = thread.comment.file or thread.comment.inline
 			local path = position and position.path or ""
 			if not by_path[path] then
@@ -193,7 +193,7 @@ function M.render(width, comments, tasks)
 		end
 	end
 	if #groups == 0 then
-		utils.push(lines, spans, "No comments yet.", "AtlasTextMuted", PADDING_X)
+		utils.push(lines, spans, "No unresolved comments.", "AtlasTextMuted", PADDING_X)
 		return lines, spans, line_map
 	end
 	for _, group in ipairs(groups) do

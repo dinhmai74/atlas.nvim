@@ -35,6 +35,8 @@ fragment MergeRequestFields on MergeRequest {
   target_branch:targetBranch
   diff_refs:diffRefs{base_sha:baseSha start_sha:startSha head_sha:headSha}
   user_notes_count:userNotesCount
+  resolvable_discussions_count:resolvableDiscussionsCount
+  resolved_discussions_count:resolvedDiscussionsCount
   created_at:createdAt
   updated_at:updatedAt
   web_url:webUrl

@@ -129,6 +129,11 @@ function M.to_pull_request(raw)
 	local diff_refs = json.nilify(raw.diff_refs)
 	local head_sha = type(diff_refs) == "table" and json.safe_str(diff_refs.head_sha) or nil
 	local base_sha = type(diff_refs) == "table" and json.safe_str(diff_refs.base_sha) or nil
+	local resolvable = tonumber(raw.resolvable_discussions_count)
+	local unresolved
+	if resolvable then
+		unresolved = math.max(0, resolvable - (tonumber(raw.resolved_discussions_count) or 0))
+	end
 
 	---@type GitLabPullRequest
 	return {
@@ -144,6 +149,7 @@ function M.to_pull_request(raw)
 		},
 		destination = { branch = target_branch, commit_hash = base_sha or "" },
 		comments_count = tonumber(raw.user_notes_count) or 0,
+		unresolved_comments_count = unresolved,
 		created_on = json.safe_str(raw.created_at) or "",
 		updated_on = json.safe_str(raw.updated_at) or "",
 		link = { html = web_url },
